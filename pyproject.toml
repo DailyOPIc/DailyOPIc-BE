@@ -1,0 +1,35 @@
+[project]
+name = "dailyopic-server"
+version = "0.1.0"
+description = "FastAPI backend for DailyOPIc AI practice and mock exams"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "pydantic-settings>=2.7,<3",
+  "python-multipart>=0.0.20,<1",
+  "openai>=1.75,<2",
+  "firebase-admin>=6.7,<8",
+  "google-cloud-firestore>=2.20,<3",
+  "httpx>=0.28,<1",
+  "cryptography>=44,<46",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "httpx>=0.28,<1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
