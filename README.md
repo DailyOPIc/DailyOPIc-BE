@@ -43,7 +43,7 @@ Firestore TTL은 `aiRequests`, `adRewardIntents`의 `expiresAt` 필드에 설정
 - `adRewardIntents`: SSV transaction replay 방지 sentinel 포함
 - `aiRequests`
 
-## 컨테이너와 Cloud Run
+## 컨테이너와 Cloud Run 사용
 
 기존 100문항 패턴을 이미지에 포함하기 위해 워크스페이스 루트에서 빌드합니다.
 
