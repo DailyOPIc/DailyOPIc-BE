@@ -4,10 +4,7 @@
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): 브랜치, 커밋, 이슈, PR 작성 방식만 정리한 간단 협업 가이드
 - [README_COLLABORATION.md](README_COLLABORATION.md): 코드 구조, 보안, 테스트, 배포까지 포함한 상세 협업 컨벤션
-- [.github/ISSUE_TEMPLATE/backend-task.md](.github/ISSUE_TEMPLATE/backend-task.md): GitHub 이슈 템플릿
-- [.github/pull_request_template.md](.github/pull_request_template.md): GitHub PR 템플릿
 
-DailyOPIc의 FastAPI 백엔드입니다. 사용자 학습 기록은 iOS 기기의 SwiftData에 저장하고, 백엔드는 문제 생성/평가, 사용량 제한, 리워드 광고 검증, 중복 요청 방지만 담당합니다.
 
 ## 로컬 개발
 
@@ -46,7 +43,7 @@ Firestore TTL은 `aiRequests`, `adRewardIntents`의 `expiresAt` 필드에 설정
 - `adRewardIntents`: SSV transaction replay 방지 sentinel 포함
 - `aiRequests`
 
-## 컨테이너와 Cloud Run
+## 컨테이너와 Cloud Run 사용
 
 기존 100문항 패턴을 이미지에 포함하기 위해 워크스페이스 루트에서 빌드합니다.
 
