@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.models.api import AudioMetrics, BackgroundProfile, OPIcLevel
-from app.services.ai import AIService
+from app.services.ai import AIService, AIServiceConfigurationError
 from app.services.questions import QuestionPatternRepository
 
 
@@ -36,3 +36,9 @@ async def test_target_level_does_not_anchor_fallback_grade() -> None:
         metrics=metrics,
     )
     assert low_target.predicted_level == high_target.predicted_level
+
+
+def test_real_ai_requires_api_key() -> None:
+    repository = QuestionPatternRepository(Path("../opic_mobile/questions.json"))
+    with pytest.raises(AIServiceConfigurationError):
+        AIService(api_key=None, model="test-model", mock=False, repository=repository)

@@ -29,6 +29,8 @@ class VerifiedReward:
 
 class AdMobSSVVerifier:
     def __init__(self, *, required: bool, expected_ad_unit: str | None) -> None:
+        if required and not expected_ad_unit:
+            raise ValueError("ADMOB_REWARDED_AD_UNIT_ID is required when AdMob SSV is enabled")
         self._required = required
         self._expected_ad_unit = expected_ad_unit
         self._keys: dict[int, str] = {}

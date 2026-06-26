@@ -31,6 +31,18 @@ DISCLAIMER = "이 결과는 학습용 AI 예상치이며 실제 OPIc 공식 등�
 LEVELS = list(OPIcLevel)
 
 
+class AIServiceError(RuntimeError):
+    pass
+
+
+class AIServiceConfigurationError(AIServiceError):
+    pass
+
+
+class AIServiceUnavailable(AIServiceError):
+    pass
+
+
 class GeneratedQuestionsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[GeneratedQuestion]
@@ -79,8 +91,10 @@ class AIService:
         repository: QuestionPatternRepository,
     ) -> None:
         self.model = model
-        self._mock = mock or not api_key
-        self._client = AsyncOpenAI(api_key=api_key) if api_key else None
+        self._mock = mock
+        if not mock and not api_key:
+            raise AIServiceConfigurationError("OPENAI_API_KEY is required when MOCK_AI is false")
+        self._client = AsyncOpenAI(api_key=api_key) if not mock and api_key else None
         self._repository = repository
         self._fallback = FallbackQuestionGenerator(repository)
 
@@ -88,25 +102,30 @@ class AIService:
         self, *, instructions: str, input_text: str, schema: type[BaseModel]
     ) -> BaseModel:
         if not self._client:
-            raise RuntimeError("OpenAI client is not configured")
-        response = await self._client.responses.create(
-            model=self.model,
-            store=False,
-            reasoning={"effort": "low"},
-            instructions=instructions,
-            input=input_text,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": schema.__name__,
-                    "strict": True,
-                    "schema": schema.model_json_schema(),
-                }
-            },
-        )
-        if not response.output_text:
-            raise RuntimeError("OpenAI returned no structured output")
-        return schema.model_validate_json(response.output_text)
+            raise AIServiceConfigurationError("OpenAI client is not configured")
+        try:
+            response = await self._client.responses.create(
+                model=self.model,
+                store=False,
+                reasoning={"effort": "low"},
+                instructions=instructions,
+                input=input_text,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema.__name__,
+                        "strict": True,
+                        "schema": schema.model_json_schema(),
+                    }
+                },
+            )
+            if not response.output_text:
+                raise ValueError("OpenAI returned no structured output")
+            return schema.model_validate_json(response.output_text)
+        except AIServiceError:
+            raise
+        except Exception as error:
+            raise AIServiceUnavailable("AI service is temporarily unavailable") from error
 
     async def generate_practice(
         self, target: OPIcLevel, background: BackgroundProfile

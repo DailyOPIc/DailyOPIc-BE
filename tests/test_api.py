@@ -15,6 +15,10 @@ def _headers(request_id: str | None = None) -> dict[str, str]:
 
 def test_practice_quota_and_reward_flow() -> None:
     with TestClient(app) as client:
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["status"] == "ok"
+
         question_set = client.post(
             "/v1/question-sets/practice",
             headers=_headers(),
@@ -81,3 +85,76 @@ def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
         )
         assert response.status_code == 200, response.text
         assert len(response.json()["perQuestion"]) == 15
+
+
+def test_daily_reward_intent_quota_returns_402() -> None:
+    with TestClient(app) as client:
+        for _ in range(3):
+            response = client.post(
+                "/v1/ad-rewards/intents",
+                headers=_headers(),
+                json={"purpose": "practice_credits"},
+            )
+            assert response.status_code == 200, response.text
+
+        blocked = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "practice_credits"},
+        )
+
+    assert blocked.status_code == 402
+    assert blocked.json()["detail"]["code"] == "reward_quota_exhausted"
+
+
+def test_client_reward_completion_when_ssv_is_disabled() -> None:
+    with TestClient(app) as client:
+        settings = client.app.state.settings
+        original_auto_verify = settings.debug_reward_auto_verify
+        original_ssv_required = settings.admob_ssv_required
+        settings.debug_reward_auto_verify = False
+        settings.admob_ssv_required = False
+        try:
+            reward = client.post(
+                "/v1/ad-rewards/intents",
+                headers=_headers(),
+                json={"purpose": "practice_credits"},
+            )
+            assert reward.status_code == 200, reward.text
+            nonce = reward.json()["nonce"]
+            assert reward.json()["status"] == "pending"
+
+            complete = client.post(f"/v1/ad-rewards/{nonce}/client-complete", headers=_headers())
+            assert complete.status_code == 200, complete.text
+            assert complete.json()["status"] == "verified"
+            usage = client.get("/v1/usage", headers=_headers()).json()
+            assert usage["bonusRemaining"] == 3
+        finally:
+            settings.debug_reward_auto_verify = original_auto_verify
+            settings.admob_ssv_required = original_ssv_required
+
+
+def test_client_reward_completion_is_rejected_when_ssv_is_required() -> None:
+    with TestClient(app) as client:
+        settings = client.app.state.settings
+        original_auto_verify = settings.debug_reward_auto_verify
+        original_ssv_required = settings.admob_ssv_required
+        settings.debug_reward_auto_verify = False
+        settings.admob_ssv_required = True
+        try:
+            reward = client.post(
+                "/v1/ad-rewards/intents",
+                headers=_headers(),
+                json={"purpose": "practice_credits"},
+            )
+            assert reward.status_code == 200, reward.text
+
+            blocked = client.post(
+                f"/v1/ad-rewards/{reward.json()['nonce']}/client-complete",
+                headers=_headers(),
+            )
+            assert blocked.status_code == 409
+            assert blocked.json()["detail"]["code"] == "ssv_required"
+        finally:
+            settings.debug_reward_auto_verify = original_auto_verify
+            settings.admob_ssv_required = original_ssv_required

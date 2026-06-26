@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import TypeAdapter
 
 from app.api.routes import router
@@ -52,4 +53,19 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+middleware_settings = get_settings()
+if middleware_settings.cors_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=middleware_settings.cors_allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "X-Debug-User-ID",
+            "X-Firebase-AppCheck",
+        ],
+    )
 app.include_router(router)

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import firebase_admin
 from fastapi import Header, HTTPException, Request, status
 from firebase_admin import app_check, auth
 
 from app.config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +35,11 @@ class AuthService:
         debug_uid: str | None,
     ) -> CurrentUser:
         if self._settings.auth_disabled:
+            logger.info("Auth bypass enabled for development user")
             return CurrentUser(uid=debug_uid or "dailyopic-demo-user")
 
         if not authorization or not authorization.startswith("Bearer "):
+            logger.warning("Firebase Auth failed: missing bearer token")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"code": "missing_auth", "message": "Firebase ID token is required."},
@@ -41,6 +47,7 @@ class AuthService:
         try:
             decoded = auth.verify_id_token(authorization.removeprefix("Bearer ").strip())
         except Exception as error:
+            logger.warning("Firebase Auth failed: invalid ID token")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"code": "invalid_auth", "message": "Firebase ID token is invalid."},
@@ -48,17 +55,21 @@ class AuthService:
 
         if self._settings.app_check_required:
             if not app_check_token:
+                logger.warning("Firebase App Check failed: missing token")
                 raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    status_code=status.HTTP_403_FORBIDDEN,
                     detail={"code": "missing_app_check", "message": "App Check token is required."},
                 )
             try:
                 app_check.verify_token(app_check_token)
             except Exception as error:
+                logger.warning("Firebase App Check failed: invalid token")
                 raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    status_code=status.HTTP_403_FORBIDDEN,
                     detail={"code": "invalid_app_check", "message": "App Check token is invalid."},
                 ) from error
+            logger.info("Firebase App Check verified")
+        logger.info("Firebase Auth verified")
         return CurrentUser(uid=str(decoded["uid"]))
 
 

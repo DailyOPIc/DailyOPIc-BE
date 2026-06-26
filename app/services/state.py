@@ -68,6 +68,7 @@ class StateStore(ABC):
         expires_at: datetime,
         auto_verify: bool,
         practice_credit_amount: int,
+        max_daily_reward_count: int,
     ) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -84,7 +85,7 @@ class StateStore(ABC):
 
 
 def _usage_defaults() -> dict[str, int]:
-    return {"freeUsed": 0, "bonusRemaining": 0}
+    return {"freeUsed": 0, "bonusRemaining": 0, "rewardCount": 0}
 
 
 class InMemoryStateStore(StateStore):
@@ -211,8 +212,13 @@ class InMemoryStateStore(StateStore):
         expires_at: datetime,
         auto_verify: bool,
         practice_credit_amount: int,
+        max_daily_reward_count: int,
     ) -> dict[str, Any]:
         async with self._lock:
+            usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
+            if usage["rewardCount"] >= max_daily_reward_count:
+                raise UsageLimitExceeded("daily reward quota exhausted")
+            usage["rewardCount"] += 1
             reward = {
                 "nonce": nonce,
                 "uid": uid,
@@ -226,7 +232,6 @@ class InMemoryStateStore(StateStore):
             }
             self._rewards[nonce] = reward
             if auto_verify and purpose is RewardPurpose.PRACTICE_CREDITS:
-                usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
                 usage["bonusRemaining"] += practice_credit_amount
                 reward["credited"] = True
             return deepcopy(reward)
@@ -438,6 +443,7 @@ class FirestoreStateStore(StateStore):
         expires_at: datetime,
         auto_verify: bool,
         practice_credit_amount: int,
+        max_daily_reward_count: int,
     ) -> dict[str, Any]:
         def run() -> dict[str, Any]:
             transaction = self._client.transaction()
@@ -448,6 +454,11 @@ class FirestoreStateStore(StateStore):
 
             @firestore.transactional
             def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                usage_snapshot = usage_ref.get(transaction=transaction)
+                usage = {**_usage_defaults(), **(usage_snapshot.to_dict() or {})}
+                if usage["rewardCount"] >= max_daily_reward_count:
+                    raise UsageLimitExceeded("daily reward quota exhausted")
+                usage["rewardCount"] += 1
                 reward = {
                     "nonce": nonce,
                     "uid": uid,
@@ -460,11 +471,13 @@ class FirestoreStateStore(StateStore):
                     "createdAt": datetime.now(UTC),
                 }
                 if auto_verify and purpose is RewardPurpose.PRACTICE_CREDITS:
-                    usage_snapshot = usage_ref.get(transaction=transaction)
-                    usage = {**_usage_defaults(), **(usage_snapshot.to_dict() or {})}
                     usage["bonusRemaining"] += practice_credit_amount
-                    transaction.set(usage_ref, usage, merge=True)
                     reward["credited"] = True
+                transaction.set(
+                    usage_ref,
+                    {**usage, "uid": uid, "dateKey": date_key, "updatedAt": datetime.now(UTC)},
+                    merge=True,
+                )
                 transaction.set(reward_ref, reward)
                 return reward
 

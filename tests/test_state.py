@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from app.models.api import RewardPurpose
@@ -20,10 +22,10 @@ async def test_three_free_then_bonus_credits() -> None:
         purpose=RewardPurpose.PRACTICE_CREDITS,
         session_hash=None,
         date_key="20260622",
-        expires_at=__import__("datetime").datetime.now(__import__("datetime").UTC)
-        + __import__("datetime").timedelta(minutes=30),
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
         auto_verify=True,
         practice_credit_amount=3,
+        max_daily_reward_count=3,
     )
     usage = await store.get_usage("u1", "20260622")
     assert usage["bonusRemaining"] == 3
@@ -33,8 +35,6 @@ async def test_three_free_then_bonus_credits() -> None:
 
 @pytest.mark.asyncio
 async def test_mock_reward_is_bound_and_single_use() -> None:
-    from datetime import UTC, datetime, timedelta
-
     store = InMemoryStateStore()
     await store.create_reward_intent(
         nonce="mock-nonce-123456789",
@@ -45,7 +45,66 @@ async def test_mock_reward_is_bound_and_single_use() -> None:
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
         auto_verify=True,
         practice_credit_amount=3,
+        max_daily_reward_count=3,
     )
     await store.reserve_mock("u1", "mock-request-1", "mock-nonce-123456789", "hash-1")
     with pytest.raises(RewardNotVerified):
         await store.reserve_mock("u1", "mock-request-2", "mock-nonce-123456789", "hash-1")
+
+
+@pytest.mark.asyncio
+async def test_daily_reward_intents_are_limited() -> None:
+    store = InMemoryStateStore()
+    for index in range(3):
+        await store.create_reward_intent(
+            nonce=f"reward-nonce-{index}",
+            uid="u1",
+            purpose=RewardPurpose.PRACTICE_CREDITS,
+            session_hash=None,
+            date_key="20260622",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            auto_verify=False,
+            practice_credit_amount=3,
+            max_daily_reward_count=3,
+        )
+
+    with pytest.raises(UsageLimitExceeded):
+        await store.create_reward_intent(
+            nonce="reward-nonce-over-limit",
+            uid="u1",
+            purpose=RewardPurpose.PRACTICE_CREDITS,
+            session_hash=None,
+            date_key="20260622",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+            auto_verify=False,
+            practice_credit_amount=3,
+            max_daily_reward_count=3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reward_transaction_replay_is_rejected() -> None:
+    store = InMemoryStateStore()
+    await store.create_reward_intent(
+        nonce="reward-nonce-replay",
+        uid="u1",
+        purpose=RewardPurpose.PRACTICE_CREDITS,
+        session_hash=None,
+        date_key="20260622",
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        auto_verify=False,
+        practice_credit_amount=3,
+        max_daily_reward_count=3,
+    )
+
+    await store.verify_reward(
+        nonce="reward-nonce-replay",
+        transaction_id="tx-1",
+        practice_credit_amount=3,
+    )
+    with pytest.raises(RewardNotVerified):
+        await store.verify_reward(
+            nonce="reward-nonce-replay",
+            transaction_id="tx-1",
+            practice_credit_amount=3,
+        )

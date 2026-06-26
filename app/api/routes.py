@@ -37,6 +37,7 @@ from app.models.api import (
     UsageResponse,
 )
 from app.services.admob import SSVVerificationError
+from app.services.ai import AIServiceError
 from app.services.audio import AudioValidationError
 from app.services.auth import CurrentUser, current_user
 from app.services.state import (
@@ -77,6 +78,20 @@ def _parse_questions(raw: str) -> list[GeneratedQuestion]:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "invalid_questions", "message": str(error)},
         ) from error
+
+
+def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentResponse:
+    purpose = reward["purpose"]
+    if isinstance(purpose, str):
+        purpose = RewardPurpose(purpose)
+    return RewardIntentResponse(
+        nonce=str(reward["nonce"]),
+        purpose=purpose,
+        status=str(reward["status"]),
+        userIdentifier=user_uid,
+        customData=str(reward["nonce"]),
+        expiresAt=reward["expiresAt"],
+    )
 
 
 @router.get("/health")
@@ -168,16 +183,23 @@ async def create_reward_intent(
     nonce = secrets.token_urlsafe(32)
     expires_at = datetime.now(UTC) + timedelta(minutes=30)
     auto_verify = settings.debug_reward_auto_verify and not settings.is_production
-    reward = await request.app.state.state_store.create_reward_intent(
-        nonce=nonce,
-        uid=user.uid,
-        purpose=payload.purpose,
-        session_hash=payload.session_hash,
-        date_key=_date_key(),
-        expires_at=expires_at,
-        auto_verify=auto_verify,
-        practice_credit_amount=settings.reward_practice_credits,
-    )
+    try:
+        reward = await request.app.state.state_store.create_reward_intent(
+            nonce=nonce,
+            uid=user.uid,
+            purpose=payload.purpose,
+            session_hash=payload.session_hash,
+            date_key=_date_key(),
+            expires_at=expires_at,
+            auto_verify=auto_verify,
+            practice_credit_amount=settings.reward_practice_credits,
+            max_daily_reward_count=settings.max_daily_reward_count,
+        )
+    except UsageLimitExceeded as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "reward_quota_exhausted", "message": str(error)},
+        ) from error
     return RewardIntentResponse(
         nonce=nonce,
         purpose=payload.purpose,
@@ -197,17 +219,39 @@ async def reward_status(
     reward = await request.app.state.state_store.get_reward_intent(nonce, user.uid)
     if not reward:
         raise HTTPException(status_code=404, detail={"code": "reward_not_found"})
-    purpose = reward["purpose"]
-    if isinstance(purpose, str):
-        purpose = RewardPurpose(purpose)
-    return RewardIntentResponse(
-        nonce=nonce,
-        purpose=purpose,
-        status=str(reward["status"]),
-        userIdentifier=user.uid,
-        customData=nonce,
-        expiresAt=reward["expiresAt"],
-    )
+    return _reward_response(reward, user.uid)
+
+
+@router.post("/v1/ad-rewards/{nonce}/client-complete", response_model=RewardIntentResponse)
+async def complete_reward_from_client(
+    nonce: str,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> RewardIntentResponse:
+    settings = request.app.state.settings
+    if settings.admob_ssv_required:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "ssv_required",
+                "message": "Reward must be verified by AdMob server-side verification.",
+            },
+        )
+
+    reward = await request.app.state.state_store.get_reward_intent(nonce, user.uid)
+    if not reward:
+        raise HTTPException(status_code=404, detail={"code": "reward_not_found"})
+    if reward["status"] == "verified":
+        return _reward_response(reward, user.uid)
+    try:
+        verified = await request.app.state.state_store.verify_reward(
+            nonce=nonce,
+            transaction_id=f"client:{nonce}",
+            practice_credit_amount=settings.reward_practice_credits,
+        )
+    except RewardNotVerified as error:
+        raise HTTPException(status_code=400, detail={"code": "reward_not_verified"}) from error
+    return _reward_response(verified, user.uid)
 
 
 @router.get("/v1/admob/ssv", response_class=PlainTextResponse)
@@ -288,6 +332,15 @@ async def evaluate_practice(
     except AudioValidationError as error:
         await request.app.state.state_store.fail_request(request_id)
         raise HTTPException(status_code=422, detail={"code": "invalid_audio", "message": str(error)}) from error
+    except AIServiceError as error:
+        await request.app.state.state_store.fail_request(request_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_unavailable",
+                "message": "AI feedback is temporarily unavailable. Please try again.",
+            },
+        ) from error
     except Exception:
         await request.app.state.state_store.fail_request(request_id)
         raise
@@ -370,6 +423,15 @@ async def evaluate_mock(
     except AudioValidationError as error:
         await request.app.state.state_store.fail_request(request_id)
         raise HTTPException(status_code=422, detail={"code": "invalid_audio", "message": str(error)}) from error
+    except AIServiceError as error:
+        await request.app.state.state_store.fail_request(request_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_unavailable",
+                "message": "AI feedback is temporarily unavailable. Please try again.",
+            },
+        ) from error
     except Exception:
         await request.app.state.state_store.fail_request(request_id)
         raise
