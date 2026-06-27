@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from typing import Any
+from typing import Annotated, Any
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -29,6 +30,10 @@ from app.services.questions import (
 PROMPT_VERSION = "opic-rubric-2026-06-22-v1"
 DISCLAIMER = "이 결과는 학습용 AI 예상치이며 실제 OPIc 공식 등급과 다를 수 있습니다."
 LEVELS = list(OPIcLevel)
+logger = logging.getLogger(__name__)
+
+BriefKorean = Annotated[str, Field(min_length=1, max_length=140)]
+ShortKorean = Annotated[str, Field(min_length=1, max_length=260)]
 
 
 class AIServiceError(RuntimeError):
@@ -53,11 +58,11 @@ class AIPracticeResult(BaseModel):
     predicted_level: OPIcLevel = Field(alias="predictedLevel")
     confidence: ConfidenceBand
     scores: EvaluationScores
-    strengths: list[str] = Field(min_length=1, max_length=5)
-    improvements: list[str] = Field(min_length=1, max_length=5)
-    corrected_answer: str = Field(alias="correctedAnswer")
-    target_gap: str = Field(alias="targetGap")
-    sample_answer: str = Field(alias="sampleAnswer")
+    strengths: list[BriefKorean] = Field(min_length=1, max_length=3)
+    improvements: list[BriefKorean] = Field(min_length=1, max_length=3)
+    corrected_answer: str = Field(alias="correctedAnswer", min_length=1, max_length=900)
+    target_gap: ShortKorean = Field(alias="targetGap")
+    sample_answer: str = Field(alias="sampleAnswer", min_length=1, max_length=900)
 
 
 class AIMockResult(BaseModel):
@@ -65,10 +70,10 @@ class AIMockResult(BaseModel):
     predicted_level: OPIcLevel = Field(alias="predictedLevel")
     confidence: ConfidenceBand
     scores: EvaluationScores
-    strengths: list[str] = Field(min_length=1, max_length=6)
-    improvements: list[str] = Field(min_length=1, max_length=6)
-    target_gap: str = Field(alias="targetGap")
-    overall_feedback: str = Field(alias="overallFeedback")
+    strengths: list[BriefKorean] = Field(min_length=1, max_length=4)
+    improvements: list[BriefKorean] = Field(min_length=1, max_length=4)
+    target_gap: ShortKorean = Field(alias="targetGap")
+    overall_feedback: str = Field(alias="overallFeedback", min_length=1, max_length=450)
     per_question: list[PerQuestionFeedback] = Field(alias="perQuestion")
 
     @field_validator("per_question")
@@ -119,6 +124,7 @@ class AIService:
                     }
                 },
             )
+            self._log_usage(response, schema.__name__)
             if not response.output_text:
                 raise ValueError("OpenAI returned no structured output")
             return schema.model_validate_json(response.output_text)
@@ -126,6 +132,43 @@ class AIService:
             raise
         except Exception as error:
             raise AIServiceUnavailable("AI service is temporarily unavailable") from error
+
+    def _log_usage(self, response: Any, schema_name: str) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        input_tokens = self._usage_metric(usage, "input_tokens")
+        output_tokens = self._usage_metric(usage, "output_tokens")
+        total_tokens = self._usage_metric(usage, "total_tokens")
+        cached_tokens = self._usage_metric(usage, "input_tokens_details", "cached_tokens")
+        reasoning_tokens = self._usage_metric(
+            usage, "output_tokens_details", "reasoning_tokens"
+        )
+        logger.info(
+            "OpenAI usage recorded. model=%s schema=%s inputTokens=%s "
+            "cachedInputTokens=%s outputTokens=%s reasoningTokens=%s totalTokens=%s",
+            self.model,
+            schema_name,
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        )
+
+    @staticmethod
+    def _usage_metric(value: Any, *path: str) -> int | None:
+        current = value
+        for key in path:
+            if hasattr(current, "model_dump"):
+                current = current.model_dump()
+            if isinstance(current, dict):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+            if current is None:
+                return None
+        return int(current) if isinstance(current, (int, float)) else None
 
     async def generate_practice(
         self, target: OPIcLevel, background: BackgroundProfile
@@ -252,7 +295,7 @@ class AIService:
                 scores=scores,
                 strengths=["질문에 맞춰 영어로 답변을 완성했습니다."],
                 improvements=["구체적인 이유와 예시를 한두 문장 더 연결해 보세요."],
-                correctedAnswer=transcript.strip(),
+                correctedAnswer=transcript.strip()[:900],
                 targetGap=f"현재 예상 {level.value}에서 목표 {target.value}에 맞는 세부 묘사를 보강하세요.",
                 sampleAnswer=(
                     f"For this {question.topic} question, I would begin with a clear answer, "
@@ -270,7 +313,8 @@ class AIService:
                 instructions=(
                     "Act as a conservative OPIc practice evaluator. Grade the answer independently of the target level. "
                     "Use targetLevel only for targetGap and sampleAnswer. Do not claim phoneme-level pronunciation analysis. "
-                    "Give concise actionable feedback in Korean; correctedAnswer and sampleAnswer must be English."
+                    "Give concise actionable feedback in Korean. Return at most three short strengths and improvements. "
+                    "correctedAnswer and sampleAnswer must be English and no longer than five sentences each."
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIPracticeResult,
@@ -337,7 +381,8 @@ class AIService:
                 instructions=(
                     "Evaluate this complete 15-answer OPIc-style mock exam conservatively and holistically. "
                     "Determine predictedLevel before considering the target level. Use audio metrics only for delivery and fluency, "
-                    "not pronunciation. Return concise Korean feedback and one natural English target-level sample per question."
+                    "not pronunciation. Return compact Korean feedback. Each perQuestion feedback must be one short sentence, "
+                    "and each English sampleAnswer must be one or two sentences."
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIMockResult,

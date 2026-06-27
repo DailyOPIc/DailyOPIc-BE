@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     debug_reward_auto_verify: bool = True
     question_patterns_path: Path = Path("../opic_mobile/questions.json")
     free_practice_limit: int = 3
-    reward_practice_credits: int = 3
+    reward_practice_credits: int = 1
     max_daily_reward_count: int = 3
     request_result_ttl_hours: int = 24
     audio_max_seconds: int = 180

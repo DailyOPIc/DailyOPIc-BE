@@ -24,13 +24,15 @@ async def test_three_free_then_bonus_credits() -> None:
         date_key="20260622",
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
         auto_verify=True,
-        practice_credit_amount=3,
+        practice_credit_amount=1,
         max_daily_reward_count=3,
     )
     usage = await store.get_usage("u1", "20260622")
-    assert usage["bonusRemaining"] == 3
+    assert usage["bonusRemaining"] == 1
     reservation = await store.reserve_practice("u1", "20260622", "request-5", 3)
     assert reservation.source == "bonus"
+    usage = await store.get_usage("u1", "20260622")
+    assert usage["bonusRemaining"] == 0
 
 
 @pytest.mark.asyncio
@@ -44,7 +46,7 @@ async def test_mock_reward_is_bound_and_single_use() -> None:
         date_key="20260622",
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
         auto_verify=True,
-        practice_credit_amount=3,
+        practice_credit_amount=1,
         max_daily_reward_count=3,
     )
     await store.reserve_mock("u1", "mock-request-1", "mock-nonce-123456789", "hash-1")
@@ -64,7 +66,7 @@ async def test_daily_reward_intents_are_limited() -> None:
             date_key="20260622",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
             auto_verify=False,
-            practice_credit_amount=3,
+            practice_credit_amount=1,
             max_daily_reward_count=3,
         )
 
@@ -77,7 +79,7 @@ async def test_daily_reward_intents_are_limited() -> None:
             date_key="20260622",
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
             auto_verify=False,
-            practice_credit_amount=3,
+            practice_credit_amount=1,
             max_daily_reward_count=3,
         )
 
@@ -93,18 +95,18 @@ async def test_reward_transaction_replay_is_rejected() -> None:
         date_key="20260622",
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
         auto_verify=False,
-        practice_credit_amount=3,
+        practice_credit_amount=1,
         max_daily_reward_count=3,
     )
 
     await store.verify_reward(
         nonce="reward-nonce-replay",
         transaction_id="tx-1",
-        practice_credit_amount=3,
+        practice_credit_amount=1,
     )
     with pytest.raises(RewardNotVerified):
         await store.verify_reward(
             nonce="reward-nonce-replay",
             transaction_id="tx-1",
-            practice_credit_amount=3,
+            practice_credit_amount=1,
         )

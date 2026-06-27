@@ -7,5 +7,8 @@ os.environ.update(
         "MOCK_AI": "true",
         "DEBUG_REWARD_AUTO_VERIFY": "true",
         "QUESTION_PATTERNS_PATH": "../opic_mobile/questions.json",
+        "FREE_PRACTICE_LIMIT": "3",
+        "REWARD_PRACTICE_CREDITS": "1",
+        "MAX_DAILY_REWARD_COUNT": "3",
     }
 )

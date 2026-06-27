@@ -768,7 +768,7 @@ Practice credit reward:
 
 ```text
 pending -> verified
-verified 시 bonusRemaining += 3
+verified 시 bonusRemaining += REWARD_PRACTICE_CREDITS (기본값 1)
 ```
 
 Mock result reward:
@@ -1248,4 +1248,3 @@ P3 네이밍/스타일/문서 개선
 - README 또는 docs가 필요한 경우 업데이트됨
 - 로그에 민감정보가 남지 않음
 - iOS와 맞물리는 요청/응답이 깨지지 않음
-

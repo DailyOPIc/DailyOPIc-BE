@@ -148,8 +148,8 @@ class PerQuestionFeedback(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     number: int = Field(ge=1, le=15)
-    feedback: str
-    sample_answer: str = Field(alias="sampleAnswer")
+    feedback: str = Field(min_length=1, max_length=180)
+    sample_answer: str = Field(alias="sampleAnswer", min_length=1, max_length=350)
 
 
 class MockEvaluation(BaseModel):

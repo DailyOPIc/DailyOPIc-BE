@@ -49,7 +49,7 @@ async def test_firestore_reward_intents_respect_daily_limit() -> None:
             date_key=date_key,
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
             auto_verify=False,
-            practice_credit_amount=3,
+            practice_credit_amount=1,
             max_daily_reward_count=3,
         )
 
@@ -62,6 +62,6 @@ async def test_firestore_reward_intents_respect_daily_limit() -> None:
             date_key=date_key,
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
             auto_verify=False,
-            practice_credit_amount=3,
+            practice_credit_amount=1,
             max_daily_reward_count=3,
         )

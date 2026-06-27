@@ -52,7 +52,16 @@ def test_practice_quota_and_reward_flow() -> None:
         )
         assert reward.status_code == 200
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["bonusRemaining"] == 3
+        assert usage["bonusRemaining"] == 1
+
+        response = client.post(
+            "/v1/evaluations/practice",
+            headers=_headers(str(uuid.uuid4())),
+            data=form,
+        )
+        assert response.status_code == 200, response.text
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["bonusRemaining"] == 0
 
 
 def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
@@ -128,7 +137,7 @@ def test_client_reward_completion_when_ssv_is_disabled() -> None:
             assert complete.status_code == 200, complete.text
             assert complete.json()["status"] == "verified"
             usage = client.get("/v1/usage", headers=_headers()).json()
-            assert usage["bonusRemaining"] == 3
+            assert usage["bonusRemaining"] == 1
         finally:
             settings.debug_reward_auto_verify = original_auto_verify
             settings.admob_ssv_required = original_ssv_required

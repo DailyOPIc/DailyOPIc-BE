@@ -28,7 +28,7 @@ FIRESTORE_ENABLED=false
 ADMOB_SSV_REQUIRED=false
 DEBUG_REWARD_AUTO_VERIFY=true
 FREE_PRACTICE_LIMIT=3
-REWARD_PRACTICE_CREDITS=3
+REWARD_PRACTICE_CREDITS=1
 MAX_DAILY_REWARD_COUNT=3
 ```
 
@@ -61,7 +61,7 @@ ADMOB_REWARDED_AD_UNIT_ID=ca-app-pub-5460686409666356/7091483531
 DEBUG_REWARD_AUTO_VERIFY=false
 QUESTION_PATTERNS_PATH=/app/data/question_patterns.json
 FREE_PRACTICE_LIMIT=3
-REWARD_PRACTICE_CREDITS=3
+REWARD_PRACTICE_CREDITS=1
 MAX_DAILY_REWARD_COUNT=3
 ALLOWED_ORIGINS=
 ```
@@ -141,8 +141,10 @@ OpenAPI 문서는 `/docs`에서 확인할 수 있습니다. 인증이 필요한 
 v1에서는 문제 생성 횟수는 제한하지 않고, AI 피드백/평가 호출만 quota를 사용합니다. 날짜 기준은 KST `YYYYMMDD`입니다.
 
 - 기본 무료 피드백: `FREE_PRACTICE_LIMIT=3`
-- 리워드 광고 1회 시 추가 피드백: `REWARD_PRACTICE_CREDITS=3`
+- 리워드 광고 1회 시 추가 피드백: `REWARD_PRACTICE_CREDITS=1`
 - 하루 최대 리워드 intent 수: `MAX_DAILY_REWARD_COUNT=3`
+
+운영 손익은 AdMob 리워드 광고 1회 실수익이 Practice 분석 1회 평균 AI 비용보다 충분히 높아야 합니다. 서버는 OpenAI 응답 usage를 로그로 남기므로, 출시 후 `inputTokens`, `outputTokens`, `reasoningTokens`를 집계해 실제 비용을 주 단위로 확인합니다.
 
 ## CI 검증
 
