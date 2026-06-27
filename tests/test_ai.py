@@ -9,7 +9,7 @@ from app.services.questions import QuestionPatternRepository
 
 @pytest.mark.asyncio
 async def test_target_level_does_not_anchor_fallback_grade() -> None:
-    repository = QuestionPatternRepository(Path("../opic_mobile/questions.json"))
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
     service = AIService(api_key=None, model="test-model", mock=True, repository=repository)
     question = (await service.generate_practice(OPIcLevel.IM2, BackgroundProfile()))[0][0]
     transcript = (
@@ -39,6 +39,6 @@ async def test_target_level_does_not_anchor_fallback_grade() -> None:
 
 
 def test_real_ai_requires_api_key() -> None:
-    repository = QuestionPatternRepository(Path("../opic_mobile/questions.json"))
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
     with pytest.raises(AIServiceConfigurationError):
         AIService(api_key=None, model="test-model", mock=False, repository=repository)

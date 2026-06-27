@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     admob_ssv_required: bool = False
     admob_rewarded_ad_unit_id: str | None = None
     debug_reward_auto_verify: bool = True
-    question_patterns_path: Path = Path("../opic_mobile/questions.json")
+    question_patterns_path: Path = Path("app/data/question_patterns.json")
     free_practice_limit: int = 3
     reward_practice_credits: int = 1
     max_daily_reward_count: int = 3

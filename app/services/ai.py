@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.models.api import (
     AudioMetrics,
     BackgroundProfile,
+    BackgroundSurvey,
     ConfidenceBand,
     EvaluationScores,
     GeneratedQuestion,
@@ -204,34 +205,35 @@ class AIService:
             return self._fallback.practice(target, background), True
 
     async def generate_mock(
-        self, target: OPIcLevel, background: BackgroundProfile
+        self,
+        target: OPIcLevel,
+        background: BackgroundProfile,
+        survey: BackgroundSurvey | None = None,
     ) -> tuple[list[GeneratedQuestion], bool]:
+        base_questions = self._fallback.mock(target, background, survey=survey)
         if self._mock:
-            return self._fallback.mock(target, background), True
-        references = self._repository.references(
-            target_level=target, background=background, limit=24
-        )
+            return base_questions, True
         input_payload = {
             "targetLevel": target.value,
-            "backgroundSurvey": background.model_dump(mode="json"),
-            "referencePatterns": references,
-            "blueprint": {
-                "1": "introduction",
-                "2-4": "survey comboId survey-a",
-                "5-7": "survey comboId survey-b",
-                "8-10": "unexpected comboId unexpected",
-                "11-13": "roleplay comboId roleplay",
-                "14": "comparison",
-                "15": "advanced",
-            },
+            "legacyBackground": background.model_dump(mode="json"),
+            "backgroundSurvey": survey.model_dump(mode="json") if survey else None,
+            "baseQuestions": [
+                item.model_dump(by_alias=True, mode="json") for item in base_questions
+            ],
+            "constraints": [
+                "Create original English speaking prompts only; do not copy official OPIc wording.",
+                "Keep number, type, comboId, topicId, category, questionType, difficulty, and estimatedLevel unchanged.",
+                "Only polish prompt and followUpPrompt for naturalness and target-level fit.",
+                "Do not add tags to the response.",
+            ],
         }
         for _ in range(2):
             try:
                 output = await self._structured(
                     instructions=(
-                        "Create one coherent 15-question OPIc-style mock exam in English. "
-                        "Respect the exact numbered blueprint and combo IDs. Use reference questions only "
-                        "as non-verbatim style anchors. Adjust response complexity to targetLevel."
+                        "Refine a catalog-based 15-question OPIc-style practice mock exam. "
+                        "Preserve every structural field exactly and change only the visible prompt text. "
+                        "The result must be original practice content, not official test questions."
                     ),
                     input_text=json.dumps(input_payload, ensure_ascii=False),
                     schema=GeneratedQuestionsPayload,
@@ -241,7 +243,7 @@ class AIService:
                 return questions, False
             except Exception:
                 continue
-        return self._fallback.mock(target, background), True
+        return base_questions, True
 
     @staticmethod
     def _fallback_score(transcript: str, metrics: AudioMetrics) -> tuple[OPIcLevel, EvaluationScores]:

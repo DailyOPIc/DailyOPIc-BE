@@ -15,7 +15,6 @@ WORKDIR /app
 # docker build -f DailyOPIc-BE/Dockerfile -t dailyopic-api .
 COPY DailyOPIc-BE/pyproject.toml /app/pyproject.toml
 COPY DailyOPIc-BE/app /app/app
-COPY opic_mobile/questions.json /app/data/question_patterns.json
 
 RUN pip install --no-cache-dir .
 

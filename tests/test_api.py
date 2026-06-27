@@ -69,8 +69,26 @@ def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
         question_set = client.post(
             "/v1/mock-exams",
             headers=_headers(),
-            json={"targetLevel": "IM2", "background": {"travel": ["domestic"]}},
+            json={
+                "targetLevel": "IM2",
+                "background": {"travel": ["domestic"]},
+                "survey": {
+                    "status": "student",
+                    "residence": "family",
+                    "leisure": ["movies", "music", "cafes"],
+                    "hobbies": [],
+                    "sports": [],
+                    "travel": ["domestic_travel"],
+                },
+            },
         ).json()
+        assert len(question_set["questions"]) == 15
+        assert "tags" not in question_set["questions"][1]
+        assert {item["topicId"] for item in question_set["questions"][1:10]} >= {
+            "movies",
+            "music",
+            "cafes",
+        }
         answers = [
             {"number": number, "transcript": f"This is my complete answer number {number}. I explain a reason and an example."}
             for number in range(1, 16)

@@ -28,6 +28,16 @@ class QuestionType(StrEnum):
     PRACTICE = "practice"
 
 
+class SurveyQuestionType(StrEnum):
+    DESCRIPTION = "description"
+    ROUTINE = "routine"
+    PAST_EXPERIENCE = "past_experience"
+    COMPARISON = "comparison"
+    ROLEPLAY = "roleplay"
+    PROBLEM_SOLVING = "problem_solving"
+    OPINION = "opinion"
+
+
 class ConfidenceBand(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
@@ -45,6 +55,48 @@ class BackgroundProfile(BaseModel):
     travel: list[str] = Field(default_factory=list, max_length=8)
 
 
+class SurveyOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    topic_id: str = Field(alias="topicId", min_length=2, max_length=80)
+    label: str = Field(min_length=1, max_length=80)
+    category: str = Field(min_length=2, max_length=80)
+
+
+class BackgroundSurvey(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(min_length=2, max_length=80)
+    residence: str = Field(min_length=2, max_length=80)
+    leisure: list[str] = Field(default_factory=list, max_length=6)
+    hobbies: list[str] = Field(default_factory=list, max_length=6)
+    sports: list[str] = Field(default_factory=list, max_length=6)
+    travel: list[str] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "BackgroundSurvey":
+        selected = self.leisure + self.hobbies + self.sports + self.travel
+        if len(selected) < 3:
+            raise ValueError("at least 3 survey topics are required")
+        return self
+
+    def topic_ids(self) -> list[str]:
+        values = [
+            self.status,
+            self.residence,
+            *self.leisure,
+            *self.hobbies,
+            *self.sports,
+            *self.travel,
+        ]
+        result: list[str] = []
+        for value in values:
+            normalized = value.strip()
+            if normalized and normalized not in result:
+                result.append(normalized)
+        return result
+
+
 class GeneratedQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -55,6 +107,11 @@ class GeneratedQuestion(BaseModel):
     prompt: str = Field(min_length=8, max_length=700)
     difficulty: OPIcLevel
     rubric_focus: list[str] = Field(alias="rubricFocus", min_length=1, max_length=6)
+    question_type: SurveyQuestionType | None = Field(default=None, alias="questionType")
+    follow_up_prompt: str | None = Field(default=None, alias="followUpPrompt", max_length=500)
+    topic_id: str | None = Field(default=None, alias="topicId", max_length=80)
+    category: str | None = Field(default=None, max_length=80)
+    estimated_level: OPIcLevel | None = Field(default=None, alias="estimatedLevel")
 
 
 class PracticeSetRequest(BaseModel):
@@ -68,7 +125,7 @@ class PracticeSetRequest(BaseModel):
 
 
 class MockExamRequest(PracticeSetRequest):
-    pass
+    survey: BackgroundSurvey | None = None
 
 
 class QuestionSetResponse(BaseModel):

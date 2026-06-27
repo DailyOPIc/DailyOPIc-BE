@@ -112,7 +112,7 @@ async def _create_question_set(
 ) -> QuestionSetResponse:
     if mode == "mock":
         questions, fallback = await request.app.state.ai_service.generate_mock(
-            payload.target_level, payload.background
+            payload.target_level, payload.background, getattr(payload, "survey", None)
         )
     else:
         questions, fallback = await request.app.state.ai_service.generate_practice(
