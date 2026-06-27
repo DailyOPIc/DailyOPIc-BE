@@ -328,6 +328,65 @@ class FallbackQuestionGenerator:
             SurveyQuestionType.OPINION,
         ]
 
+    @staticmethod
+    def _practice_sequence(target_level: OPIcLevel) -> list[SurveyQuestionType]:
+        if target_level in {OPIcLevel.IL, OPIcLevel.IM1}:
+            return [
+                SurveyQuestionType.DESCRIPTION,
+                SurveyQuestionType.ROUTINE,
+                SurveyQuestionType.DESCRIPTION,
+                SurveyQuestionType.PAST_EXPERIENCE,
+                SurveyQuestionType.ROUTINE,
+                SurveyQuestionType.PAST_EXPERIENCE,
+                SurveyQuestionType.DESCRIPTION,
+                SurveyQuestionType.COMPARISON,
+                SurveyQuestionType.ROLEPLAY,
+                SurveyQuestionType.OPINION,
+            ]
+        if target_level in {OPIcLevel.IM2, OPIcLevel.IM3}:
+            return [
+                SurveyQuestionType.DESCRIPTION,
+                SurveyQuestionType.PAST_EXPERIENCE,
+                SurveyQuestionType.COMPARISON,
+                SurveyQuestionType.ROUTINE,
+                SurveyQuestionType.DESCRIPTION,
+                SurveyQuestionType.PROBLEM_SOLVING,
+                SurveyQuestionType.PAST_EXPERIENCE,
+                SurveyQuestionType.COMPARISON,
+                SurveyQuestionType.ROLEPLAY,
+                SurveyQuestionType.OPINION,
+            ]
+        return [
+            SurveyQuestionType.DESCRIPTION,
+            SurveyQuestionType.COMPARISON,
+            SurveyQuestionType.PROBLEM_SOLVING,
+            SurveyQuestionType.OPINION,
+            SurveyQuestionType.PAST_EXPERIENCE,
+            SurveyQuestionType.COMPARISON,
+            SurveyQuestionType.PROBLEM_SOLVING,
+            SurveyQuestionType.ROLEPLAY,
+            SurveyQuestionType.OPINION,
+            SurveyQuestionType.DESCRIPTION,
+        ]
+
+    def _practice_topic(
+        self, question_type: SurveyQuestionType, offset: int
+    ) -> tuple[str, str]:
+        candidates: list[tuple[str, str]] = []
+        for item in self._repository.patterns:
+            if item.get("questionType") != question_type.value:
+                continue
+            category = str(item.get("category") or "")
+            topic_id = str(item.get("topicId") or "")
+            if category == "introduction" or not topic_id:
+                continue
+            candidate = (topic_id, category)
+            if candidate not in candidates:
+                candidates.append(candidate)
+        if not candidates:
+            return "unexpected_daily", "unexpected"
+        return candidates[offset % len(candidates)]
+
     def _survey_topics(self, survey: BackgroundSurvey) -> list[str]:
         primary = [
             *survey.leisure,
@@ -392,35 +451,29 @@ class FallbackQuestionGenerator:
     def practice(
         self, target_level: OPIcLevel, background: BackgroundProfile, count: int = 10
     ) -> list[GeneratedQuestion]:
-        references = self._repository.references(
-            target_level=target_level, background=background, limit=max(count, 10)
-        )
-        if not references:
-            references = [
-                {
-                    "prompt": "Describe a memorable experience from your daily life.",
-                    "category": "daily_life",
-                    "tags": ["experience"],
-                    "questionType": SurveyQuestionType.PAST_EXPERIENCE.value,
-                }
-            ]
-        return [
-            GeneratedQuestion(
-                number=index + 1,
-                type=QuestionType.PRACTICE,
-                comboId=None,
-                topic=str(reference.get("category", "personal")),
-                prompt=self._prompt(reference, "Tell me about your daily routine."),
-                difficulty=target_level,
-                rubricFocus=["task fulfillment", "detail", "coherence"],
-                questionType=self._question_type(reference, SurveyQuestionType.DESCRIPTION),
-                followUpPrompt=self._follow_up(reference),
-                topicId=str(reference.get("topicId") or reference.get("category") or "practice"),
-                category=str(reference.get("category") or "practice"),
-                estimatedLevel=self._estimated_level(reference, target_level),
+        sequence = self._practice_sequence(target_level)
+        used_ids: set[str] = set()
+        questions: list[GeneratedQuestion] = []
+        for index in range(count):
+            question_type = sequence[index % len(sequence)]
+            topic_id, category = self._practice_topic(question_type, index)
+            topic_label = self._topic_label(topic_id)
+            questions.append(
+                self._catalog_question(
+                    number=index + 1,
+                    broad_type=QuestionType.PRACTICE,
+                    combo_id=None,
+                    target_level=target_level,
+                    topic_id=topic_id,
+                    category=category,
+                    question_types=[question_type],
+                    fallback_prompt=(
+                        f"Talk about {topic_label}. Give clear details and one specific example."
+                    ),
+                    used_ids=used_ids,
+                )
             )
-            for index, reference in enumerate((references * count)[:count])
-        ]
+        return questions
 
     def mock(
         self,

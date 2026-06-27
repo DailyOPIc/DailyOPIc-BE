@@ -2,7 +2,13 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from app.models.api import BackgroundProfile, BackgroundSurvey, OPIcLevel, QuestionType
+from app.models.api import (
+    BackgroundProfile,
+    BackgroundSurvey,
+    OPIcLevel,
+    QuestionType,
+    SurveyQuestionType,
+)
 from app.services.questions import (
     FallbackQuestionGenerator,
     QuestionPatternRepository,
@@ -46,6 +52,27 @@ def test_practice_set_contains_ten_numbered_questions() -> None:
     )
     assert [item.number for item in questions] == list(range(1, 11))
     assert all(item.type is QuestionType.PRACTICE for item in questions)
+    assert all(item.question_type for item in questions)
+    assert all(item.follow_up_prompt for item in questions)
+    assert all(item.topic_id for item in questions)
+    assert all(item.category for item in questions)
+    assert all(item.estimated_level for item in questions)
+    assert SurveyQuestionType.PROBLEM_SOLVING in {item.question_type for item in questions}
+
+
+def test_practice_set_uses_target_level_instead_of_background_profile() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    generator = FallbackQuestionGenerator(repository)
+    first = generator.practice(
+        OPIcLevel.IH,
+        BackgroundProfile(interests=["music"], sports=["gym"], travel=["domestic"]),
+    )
+    second = generator.practice(
+        OPIcLevel.IH,
+        BackgroundProfile(interests=["gaming"], sports=["swimming"], travel=["overseas"]),
+    )
+    assert [item.topic_id for item in first] == [item.topic_id for item in second]
+    assert [item.question_type for item in first] == [item.question_type for item in second]
 
 
 def test_background_survey_requires_three_multi_select_topics() -> None:

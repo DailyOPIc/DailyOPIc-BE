@@ -174,25 +174,29 @@ class AIService:
     async def generate_practice(
         self, target: OPIcLevel, background: BackgroundProfile
     ) -> tuple[list[GeneratedQuestion], bool]:
+        base_questions = self._fallback.practice(target, background)
         if self._mock:
-            return self._fallback.practice(target, background), True
-        references = self._repository.references(
-            target_level=target, background=background, limit=20
-        )
-        prompt = {
+            return base_questions, True
+        input_payload = {
             "targetLevel": target.value,
-            "backgroundSurvey": background.model_dump(mode="json"),
-            "referencePatterns": references,
-            "count": 10,
+            "baseQuestions": [
+                item.model_dump(by_alias=True, mode="json") for item in base_questions
+            ],
+            "constraints": [
+                "Create original English speaking prompts only; do not copy official OPIc wording.",
+                "Keep number, type, comboId, topicId, category, questionType, difficulty, and estimatedLevel unchanged.",
+                "Only polish prompt and followUpPrompt for naturalness and target-level fit.",
+                "Do not add tags to the response.",
+            ],
         }
         try:
             output = await self._structured(
                 instructions=(
-                    "Create ten original OPIc-style English speaking practice questions. "
-                    "Use references only as style patterns; do not copy them verbatim. "
-                    "Return numbers 1-10, type=practice, no comboId, target difficulty, and concise rubricFocus."
+                    "Refine a catalog-based 10-question OPIc-style daily practice set. "
+                    "Preserve every structural field exactly and change only visible prompt text. "
+                    "The result must be original practice content, not official test questions."
                 ),
-                input_text=json.dumps(prompt, ensure_ascii=False),
+                input_text=json.dumps(input_payload, ensure_ascii=False),
                 schema=GeneratedQuestionsPayload,
             )
             questions = output.questions  # type: ignore[attr-defined]
@@ -200,9 +204,20 @@ class AIService:
                 raise ValueError("practice question numbering is invalid")
             if any(item.type is not QuestionType.PRACTICE for item in questions):
                 raise ValueError("practice question type is invalid")
+            for base, refined in zip(base_questions, questions, strict=True):
+                if (
+                    base.combo_id != refined.combo_id
+                    or base.difficulty != refined.difficulty
+                    or base.question_type != refined.question_type
+                    or base.topic_id != refined.topic_id
+                    or base.category != refined.category
+                    or base.estimated_level != refined.estimated_level
+                ):
+                    raise ValueError("practice question structural fields changed")
             return questions, False
-        except Exception:
-            return self._fallback.practice(target, background), True
+        except Exception as error:
+            logger.warning("practice question refinement failed; using catalog fallback: %s", error)
+            return base_questions, True
 
     async def generate_mock(
         self,
