@@ -139,6 +139,24 @@ class QuestionSetResponse(BaseModel):
     fallback_used: bool = Field(default=False, alias="fallbackUsed")
 
 
+class TargetLevelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    reward_nonce: str | None = Field(default=None, alias="rewardNonce", min_length=16)
+
+
+class TargetLevelResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    previous_target_level: OPIcLevel | None = Field(
+        default=None, alias="previousTargetLevel"
+    )
+    changed: bool
+    reward_consumed: bool = Field(alias="rewardConsumed")
+
+
 class EvaluationScores(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -239,6 +257,7 @@ class UsageResponse(BaseModel):
 class RewardPurpose(StrEnum):
     PRACTICE_CREDITS = "practice_credits"
     MOCK_RESULT = "mock_result"
+    TARGET_LEVEL_CHANGE = "target_level_change"
 
 
 class RewardIntentRequest(BaseModel):

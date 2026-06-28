@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import secrets
 import uuid
@@ -33,6 +34,8 @@ from app.models.api import (
     RewardIntentRequest,
     RewardIntentResponse,
     RewardPurpose,
+    TargetLevelRequest,
+    TargetLevelResponse,
     UsageResponse,
 )
 from app.services.admob import SSVVerificationError
@@ -47,6 +50,7 @@ from app.services.state import (
 )
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 KST = ZoneInfo("Asia/Seoul")
 QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
@@ -83,6 +87,33 @@ def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentRe
     )
 
 
+def _target_level_change_required(message: str) -> None:
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={"code": "target_level_change_reward_required", "message": message},
+    )
+
+
+async def _ensure_target_level(
+    request: Request, user: CurrentUser, target_level: str
+) -> None:
+    current = await request.app.state.state_store.get_target_level(user.uid)
+    if current is None:
+        try:
+            await request.app.state.state_store.set_target_level(
+                uid=user.uid,
+                target_level=target_level,
+                reward_nonce=None,
+            )
+        except RewardNotVerified as error:
+            _target_level_change_required(str(error))
+        return
+    if current != target_level:
+        _target_level_change_required(
+            "목표 등급을 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
+        )
+
+
 @router.get("/health")
 async def health(request: Request) -> dict[str, str | bool]:
     return {
@@ -98,6 +129,7 @@ async def _create_question_set(
     *,
     mode: str,
 ) -> QuestionSetResponse:
+    await _ensure_target_level(request, user, payload.target_level.value)
     if mode == "mock":
         questions, fallback = await request.app.state.ai_service.generate_mock(
             payload.target_level, payload.background, getattr(payload, "survey", None)
@@ -126,6 +158,28 @@ async def _create_question_set(
         modelVersion=request.app.state.ai_service.model,
         generatedAt=datetime.now(UTC),
         fallbackUsed=fallback,
+    )
+
+
+@router.put("/v1/users/me/target-level", response_model=TargetLevelResponse)
+async def update_target_level(
+    payload: TargetLevelRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> TargetLevelResponse:
+    try:
+        result = await request.app.state.state_store.set_target_level(
+            uid=user.uid,
+            target_level=payload.target_level.value,
+            reward_nonce=payload.reward_nonce,
+        )
+    except RewardNotVerified as error:
+        _target_level_change_required(str(error))
+    return TargetLevelResponse(
+        targetLevel=result["targetLevel"],
+        previousTargetLevel=result["previousTargetLevel"],
+        changed=result["changed"],
+        rewardConsumed=result["rewardConsumed"],
     )
 
 
@@ -212,6 +266,9 @@ async def reward_status(
 
 @router.get("/v1/admob/ssv", response_class=PlainTextResponse)
 async def admob_ssv(request: Request) -> PlainTextResponse:
+    query_keys = sorted(request.query_params.keys())
+    client_host = request.client.host if request.client else "unknown"
+    logger.info("admob ssv callback received client=%s keys=%s", client_host, query_keys)
     try:
         verified = await request.app.state.ssv_verifier.verify(request.url.query)
         if not verified.user_id:
@@ -226,7 +283,20 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
             transaction_id=verified.transaction_id,
             practice_credit_amount=request.app.state.settings.reward_practice_credits,
         )
+        logger.info(
+            "admob ssv verified nonce=%s transactionId=%s user=%s purpose=%s",
+            verified.nonce,
+            verified.transaction_id,
+            verified.user_id,
+            reward.get("purpose"),
+        )
     except (SSVVerificationError, RewardNotVerified) as error:
+        logger.warning(
+            "admob ssv verification failed client=%s keys=%s error=%s",
+            client_host,
+            query_keys,
+            error,
+        )
         raise HTTPException(status_code=400, detail=str(error)) from error
     return PlainTextResponse("OK")
 

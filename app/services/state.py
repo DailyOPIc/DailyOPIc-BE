@@ -57,6 +57,14 @@ class StateStore(ABC):
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]: ...
 
     @abstractmethod
+    async def get_target_level(self, uid: str) -> str | None: ...
+
+    @abstractmethod
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
     ) -> Reservation: ...
@@ -106,6 +114,14 @@ def _usage_defaults() -> dict[str, int]:
     return {"freeUsed": 0, "bonusRemaining": 0, "rewardCount": 0}
 
 
+def _reward_purpose_matches(value: object, purpose: RewardPurpose) -> bool:
+    return value == purpose or value == purpose.value
+
+
+def _counts_toward_daily_reward_quota(purpose: RewardPurpose) -> bool:
+    return purpose is not RewardPurpose.TARGET_LEVEL_CHANGE
+
+
 class InMemoryStateStore(StateStore):
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -114,6 +130,7 @@ class InMemoryStateStore(StateStore):
         self._rewards: dict[str, dict[str, Any]] = {}
         self._transactions: set[str] = set()
         self._question_sets: dict[str, dict[str, Any]] = {}
+        self._profiles: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _usage_id(uid: str, date_key: str) -> str:
@@ -159,6 +176,50 @@ class InMemoryStateStore(StateStore):
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         async with self._lock:
             return deepcopy(self._usage.get(self._usage_id(uid, date_key), _usage_defaults()))
+
+    async def get_target_level(self, uid: str) -> str | None:
+        async with self._lock:
+            profile = self._profiles.get(uid)
+            return str(profile["targetLevel"]) if profile else None
+
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        async with self._lock:
+            now = datetime.now(UTC)
+            profile = self._profiles.get(uid)
+            previous = str(profile["targetLevel"]) if profile else None
+            reward_consumed = False
+            if previous and previous != target_level:
+                reward = self._rewards.get(reward_nonce or "")
+                if (
+                    not reward
+                    or reward["uid"] != uid
+                    or not _reward_purpose_matches(
+                        reward["purpose"], RewardPurpose.TARGET_LEVEL_CHANGE
+                    )
+                    or reward["status"] != "verified"
+                    or reward.get("consumed", False)
+                    or reward["expiresAt"] < now
+                ):
+                    raise RewardNotVerified("verified target level change reward is required")
+                reward["consumed"] = True
+                reward["consumedAt"] = now
+                reward["consumedFor"] = "target_level_change"
+                reward_consumed = True
+            created_at = profile["createdAt"] if profile else now
+            self._profiles[uid] = {
+                "uid": uid,
+                "targetLevel": target_level,
+                "createdAt": created_at,
+                "updatedAt": now,
+            }
+            return {
+                "targetLevel": target_level,
+                "previousTargetLevel": previous,
+                "changed": previous != target_level,
+                "rewardConsumed": reward_consumed,
+            }
 
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
@@ -210,7 +271,7 @@ class InMemoryStateStore(StateStore):
             if (
                 not reward
                 or reward["uid"] != uid
-                or reward["purpose"] != RewardPurpose.MOCK_RESULT
+                or not _reward_purpose_matches(reward["purpose"], RewardPurpose.MOCK_RESULT)
                 or reward["sessionHash"] != session_hash
                 or reward["status"] != "verified"
                 or reward.get("consumed", False)
@@ -272,9 +333,10 @@ class InMemoryStateStore(StateStore):
     ) -> dict[str, Any]:
         async with self._lock:
             usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
-            if usage["rewardCount"] >= max_daily_reward_count:
-                raise UsageLimitExceeded("daily reward quota exhausted")
-            usage["rewardCount"] += 1
+            if _counts_toward_daily_reward_quota(purpose):
+                if usage["rewardCount"] >= max_daily_reward_count:
+                    raise UsageLimitExceeded("daily reward quota exhausted")
+                usage["rewardCount"] += 1
             reward = {
                 "nonce": nonce,
                 "uid": uid,
@@ -384,6 +446,88 @@ class FirestoreStateStore(StateStore):
             return {**_usage_defaults(), **(snapshot.to_dict() or {})}
 
         return await asyncio.to_thread(read)
+
+    async def get_target_level(self, uid: str) -> str | None:
+        def read() -> str | None:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            value = snapshot.to_dict() if snapshot.exists else None
+            return str(value["targetLevel"]) if value and value.get("targetLevel") else None
+
+        return await asyncio.to_thread(read)
+
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        def run() -> dict[str, Any]:
+            transaction = self._client.transaction()
+            profile_ref = self._client.collection("userProfiles").document(uid)
+            reward_ref = (
+                self._client.collection("adRewardIntents").document(reward_nonce)
+                if reward_nonce
+                else None
+            )
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                now = datetime.now(UTC)
+                profile_snapshot = profile_ref.get(transaction=transaction)
+                profile = profile_snapshot.to_dict() if profile_snapshot.exists else {}
+                previous = (
+                    str(profile["targetLevel"]) if profile and profile.get("targetLevel") else None
+                )
+                reward_consumed = False
+                if previous and previous != target_level:
+                    if reward_ref is None:
+                        raise RewardNotVerified(
+                            "verified target level change reward is required"
+                        )
+                    reward_snapshot = reward_ref.get(transaction=transaction)
+                    reward = reward_snapshot.to_dict() or {}
+                    if (
+                        not reward_snapshot.exists
+                        or reward.get("uid") != uid
+                        or not _reward_purpose_matches(
+                            reward.get("purpose"), RewardPurpose.TARGET_LEVEL_CHANGE
+                        )
+                        or reward.get("status") != "verified"
+                        or reward.get("consumed", False)
+                        or not reward.get("expiresAt")
+                        or reward.get("expiresAt") < now
+                    ):
+                        raise RewardNotVerified(
+                            "verified target level change reward is required"
+                        )
+                    reward_consumed = True
+
+                transaction.set(
+                    profile_ref,
+                    {
+                        "uid": uid,
+                        "targetLevel": target_level,
+                        "createdAt": profile.get("createdAt", now),
+                        "updatedAt": now,
+                    },
+                    merge=True,
+                )
+                if reward_ref is not None and reward_consumed:
+                    transaction.update(
+                        reward_ref,
+                        {
+                            "consumed": True,
+                            "consumedAt": now,
+                            "consumedFor": "target_level_change",
+                        },
+                    )
+                return {
+                    "targetLevel": target_level,
+                    "previousTargetLevel": previous,
+                    "changed": previous != target_level,
+                    "rewardConsumed": reward_consumed,
+                }
+
+            return apply(transaction)
+
+        return await asyncio.to_thread(run)
 
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
@@ -554,9 +698,10 @@ class FirestoreStateStore(StateStore):
             def apply(transaction: firestore.Transaction) -> dict[str, Any]:
                 usage_snapshot = usage_ref.get(transaction=transaction)
                 usage = {**_usage_defaults(), **(usage_snapshot.to_dict() or {})}
-                if usage["rewardCount"] >= max_daily_reward_count:
-                    raise UsageLimitExceeded("daily reward quota exhausted")
-                usage["rewardCount"] += 1
+                if _counts_toward_daily_reward_quota(purpose):
+                    if usage["rewardCount"] >= max_daily_reward_count:
+                        raise UsageLimitExceeded("daily reward quota exhausted")
+                    usage["rewardCount"] += 1
                 reward = {
                     "nonce": nonce,
                     "uid": uid,

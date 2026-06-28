@@ -15,6 +15,7 @@
 - 사용자 식별은 iOS Keychain에 저장된 UUID를 `X-DailyOPIc-User-ID` 헤더로 전달합니다.
 - AdMob 보상은 Server-side verification callback으로만 지급합니다.
 - 질문 세트는 Firestore `questionSets`에 저장하고 `setId`로 조회합니다.
+- 목표 등급은 Firestore `userProfiles`에 저장하며, 최초 설정은 무료이고 변경은 보상형 광고 검증 후 허용합니다.
 
 ## 로컬 개발
 
@@ -45,6 +46,7 @@ MAX_DAILY_REWARD_COUNT=3
 실제 iPhone에서 Mac의 로컬 서버를 테스트할 때 iOS 앱의 Debug API URL은 `http://<Mac의_핫스팟_IP>:8000` 형태여야 합니다. iPhone에서 `127.0.0.1`은 Mac이 아니라 iPhone 자기 자신입니다.
 
 실제 OpenAI 호출을 확인하려면 `.env`에 `MOCK_AI=false`, `OPENAI_API_KEY=<local shell secret>`을 설정합니다. API Key는 로그나 문서, 예시 env 파일에 기록하지 않습니다.
+`MOCK_AI=true`에서는 OpenAI를 호출하지 않고 catalog fallback 질문을 반환하므로 응답의 `fallbackUsed`가 `true`입니다.
 
 ## 운영 설정
 
@@ -62,9 +64,10 @@ MAX_DAILY_REWARD_COUNT=3
 
 iOS 번들 ID `com.mark.opicmobile`에 대해 Firebase App Check/App Attest를 활성화해야 합니다. Cloud Run 서비스 계정에는 Firestore 접근 권한이 필요합니다. 서비스 계정 JSON 파일은 레포지토리에 저장하지 않습니다.
 
-Firestore TTL은 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt` 필드에 설정합니다. 사용하는 컬렉션은 아래 네 개입니다.
+Firestore TTL은 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt` 필드에 설정합니다. 사용하는 컬렉션은 아래 다섯 개입니다.
 
 - `dailyUsage`
+- `userProfiles`
 - `questionSets`
 - `adRewardIntents`: SSV transaction replay 방지 sentinel 포함
 - `aiRequests`
@@ -85,7 +88,20 @@ AdMob 리워드 광고의 Server-side verification callback은 아래 주소로 
 https://<cloud-run-host>/v1/admob/ssv
 ```
 
-iOS 앱은 서버에서 받은 `userIdentifier`와 `customData`를 AdMob rewarded ad options에 전달합니다. 서버는 Google SSV callback의 nonce, transaction id, user id, rewarded ad unit id, signature를 검증한 뒤에만 보상을 지급합니다.
+Cloudflare Tunnel로 로컬 uvicorn을 검증할 때는 예를 들어 아래처럼 설정합니다.
+
+```text
+https://steve-immigration-amy-does.trycloudflare.com/v1/admob/ssv
+```
+
+이 callback은 iOS 앱이 호출하는 API URL과 별개입니다. iPhone에서 `http://172.20.x.x:8000`
+로컬 서버를 호출할 수 있어도 Google AdMob 서버는 그 사설 IP로 callback을 보낼 수 없습니다.
+로컬 앱에서 리워드 광고까지 end-to-end로 테스트하려면 Cloud Run 개발 배포 URL 또는
+ngrok/cloudflared 같은 public HTTPS 터널의 `https://<public-host>/v1/admob/ssv`를
+AdMob Console의 SSV callback URL로 등록합니다. callback이 정상 수신되면 서버 로그에
+`admob ssv callback received`와 `admob ssv verified`가 출력됩니다.
+
+iOS 앱은 서버에서 받은 `userIdentifier`와 `customData`를 AdMob rewarded ad options에 전달합니다. 서버는 Google SSV callback의 nonce, transaction id, user id, rewarded ad unit id, signature를 검증한 뒤에만 보상을 지급하거나 목표 등급 변경 권한을 소비합니다.
 
 ## API
 
@@ -95,15 +111,19 @@ OpenAPI 문서는 `/docs`에서 확인할 수 있습니다. 보호되는 endpoin
 - `X-Firebase-AppCheck: <App Check token>`
 - 평가 요청에는 `Idempotency-Key` 필요
 
+목표 등급은 `PUT /v1/users/me/target-level`로 저장합니다. `targetLevel`만 보내면 최초 설정 또는 같은 등급 재확정만 허용됩니다. 기존 등급에서 다른 등급으로 바꿀 때는 `target_level_change` reward intent를 만들고 SSV 검증이 끝난 뒤 `rewardNonce`를 함께 보내야 합니다.
+
 오디오는 요청 처리 중 임시 파일로만 분석하며 OpenAI로 보내지 않습니다. 요청 처리가 끝나면 임시 오디오는 삭제됩니다.
 
 ## 사용량 정책
 
-v1에서는 문제 생성 횟수는 제한하지 않고, AI 피드백/평가 호출만 quota를 사용합니다. 날짜 기준은 KST `YYYYMMDD`입니다.
+v1에서는 일반 문제 생성 횟수는 제한하지 않고, AI 피드백/평가 호출만 quota를 사용합니다. 다만 목표 등급 변경은 새 문제 재생성을 유발하므로 보상형 광고 검증 후 허용합니다. 날짜 기준은 KST `YYYYMMDD`입니다.
 
 - 기본 무료 피드백: `FREE_PRACTICE_LIMIT=3`
 - 리워드 광고 1회 시 추가 피드백: `REWARD_PRACTICE_CREDITS=1`
 - 하루 최대 리워드 intent 수: `MAX_DAILY_REWARD_COUNT=3`
+- `MAX_DAILY_REWARD_COUNT`는 피드백 credit/모의고사 결과용 리워드 남용 방지 제한입니다.
+- 목표 등급 변경용 리워드는 피드백 credit을 지급하지 않고 변경 권한만 1회 소비하며, 위 practice reward quota로 차단하지 않습니다.
 
 운영 손익은 AdMob 리워드 광고 1회 실수익이 Practice 분석 1회 평균 AI 비용보다 충분히 높아야 합니다. 서버는 OpenAI 응답 usage를 로그로 남기므로, 출시 후 `inputTokens`, `outputTokens`, `reasoningTokens`를 집계해 실제 비용을 주 단위로 확인합니다.
 
@@ -131,6 +151,6 @@ firebase emulators:exec --only firestore \
 - Cloud Run 서비스 계정에 Firestore 접근 권한이 있는지 확인
 - `OPENAI_API_KEY`를 Secret Manager로 연결
 - 서버에는 `ADMOB_REWARDED_AD_UNIT_ID=ca-app-pub-5460686409666356/7091483531`만 설정
-- AdMob SSV callback URL은 Cloud Run 배포 후 `https://<cloud-run-host>/v1/admob/ssv`로 설정
+- AdMob SSV callback URL은 public HTTPS `https://<cloud-run-host>/v1/admob/ssv` 또는 개발용 HTTPS 터널로 설정
 - Firestore TTL을 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt`에 설정
 - `pytest`와 `docker build -f DailyOPIc-BE/Dockerfile -t dailyopic-api .` 통과 확인

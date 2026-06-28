@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.models.api import RewardPurpose
-from app.services.state import FirestoreStateStore, UsageLimitExceeded
+from app.services.state import FirestoreStateStore, RewardNotVerified, UsageLimitExceeded
 
 
 pytestmark = pytest.mark.skipif(
@@ -89,3 +89,42 @@ async def test_firestore_reward_intents_respect_daily_limit() -> None:
             practice_credit_amount=1,
             max_daily_reward_count=3,
         )
+
+
+@pytest.mark.asyncio
+async def test_firestore_target_level_change_consumes_verified_reward() -> None:
+    uid = f"target-level-{uuid.uuid4()}"
+    date_key = "20260622"
+    nonce = f"{uid}-target-change"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+
+    initial = await store.set_target_level(uid=uid, target_level="IH", reward_nonce=None)
+    assert initial["targetLevel"] == "IH"
+    assert initial["rewardConsumed"] is False
+
+    with pytest.raises(RewardNotVerified):
+        await store.set_target_level(uid=uid, target_level="AL", reward_nonce=None)
+
+    await store.create_reward_intent(
+        nonce=nonce,
+        uid=uid,
+        purpose=RewardPurpose.TARGET_LEVEL_CHANGE,
+        session_hash=None,
+        date_key=date_key,
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        auto_verify=True,
+        practice_credit_amount=1,
+        max_daily_reward_count=3,
+    )
+    usage = await store.get_usage(uid, date_key)
+    assert usage["bonusRemaining"] == 0
+
+    changed = await store.set_target_level(
+        uid=uid, target_level="AL", reward_nonce=nonce
+    )
+    assert changed["previousTargetLevel"] == "IH"
+    assert changed["targetLevel"] == "AL"
+    assert changed["rewardConsumed"] is True
+
+    with pytest.raises(RewardNotVerified):
+        await store.set_target_level(uid=uid, target_level="IM3", reward_nonce=nonce)

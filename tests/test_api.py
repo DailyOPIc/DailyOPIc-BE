@@ -100,6 +100,82 @@ def test_practice_quota_and_reward_flow() -> None:
         assert usage["bonusRemaining"] == 0
 
 
+def test_target_level_change_requires_reward_and_controls_question_sets() -> None:
+    with TestClient(app) as client:
+        initial = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"targetLevel": "IH"},
+        )
+        assert initial.status_code == 200, initial.text
+        assert initial.json()["targetLevel"] == "IH"
+        assert initial.json()["changed"] is True
+        assert initial.json()["rewardConsumed"] is False
+
+        same = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"targetLevel": "IH"},
+        )
+        assert same.status_code == 200, same.text
+        assert same.json()["changed"] is False
+
+        blocked = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"targetLevel": "AL"},
+        )
+        assert blocked.status_code == 402
+        assert blocked.json()["detail"]["code"] == "target_level_change_reward_required"
+
+        rejected_questions = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"targetLevel": "AL", "background": {"interests": ["news"]}},
+        )
+        assert rejected_questions.status_code == 402
+        assert (
+            rejected_questions.json()["detail"]["code"]
+            == "target_level_change_reward_required"
+        )
+
+        reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "target_level_change"},
+        )
+        assert reward.status_code == 200, reward.text
+        _verify_reward(client, reward.json()["nonce"])
+
+        changed = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"targetLevel": "AL", "rewardNonce": reward.json()["nonce"]},
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["targetLevel"] == "AL"
+        assert changed.json()["previousTargetLevel"] == "IH"
+        assert changed.json()["rewardConsumed"] is True
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["bonusRemaining"] == 0
+
+        reused = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"targetLevel": "IM3", "rewardNonce": reward.json()["nonce"]},
+        )
+        assert reused.status_code == 402
+        assert reused.json()["detail"]["code"] == "target_level_change_reward_required"
+
+        accepted_questions = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"targetLevel": "AL", "background": {"interests": ["news"]}},
+        )
+        assert accepted_questions.status_code == 200, accepted_questions.text
+        assert accepted_questions.json()["questions"][0]["difficulty"] == "AL"
+
+
 def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
     with TestClient(app) as client:
         question_set = client.post(
@@ -176,6 +252,27 @@ def test_daily_reward_intent_quota_returns_402() -> None:
 
     assert blocked.status_code == 402
     assert blocked.json()["detail"]["code"] == "reward_quota_exhausted"
+
+
+def test_target_level_change_intent_is_not_blocked_by_practice_reward_quota() -> None:
+    with TestClient(app) as client:
+        for _ in range(3):
+            response = client.post(
+                "/v1/ad-rewards/intents",
+                headers=_headers(),
+                json={"purpose": "practice_credits"},
+            )
+            assert response.status_code == 200, response.text
+
+        response = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "target_level_change"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["purpose"] == "target_level_change"
+    assert response.json()["status"] == "pending"
 
 
 def test_mock_evaluation_rejects_unverified_reward() -> None:
