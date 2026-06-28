@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, unquote_plus
@@ -13,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 
 KEYS_URL = "https://www.gstatic.com/admob/reward/verifier-keys.json"
+logger = logging.getLogger(__name__)
 
 
 class SSVVerificationError(ValueError):
@@ -31,7 +33,11 @@ class AdMobSSVVerifier:
     def __init__(self, *, expected_ad_unit: str) -> None:
         if not expected_ad_unit:
             raise ValueError("ADMOB_REWARDED_AD_UNIT_ID is required")
-        self._expected_ad_unit = expected_ad_unit
+        self._expected_ad_unit = expected_ad_unit.strip()
+        self._allowed_ad_units = {
+            self._expected_ad_unit,
+            self._expected_ad_unit.rsplit("/", maxsplit=1)[-1],
+        }
         self._keys: dict[int, str] = {}
         self._keys_expire_at = 0.0
         self._lock = asyncio.Lock()
@@ -53,6 +59,12 @@ class AdMobSSVVerifier:
 
     async def verify(self, raw_query: str) -> VerifiedReward:
         params = parse_qs(raw_query, keep_blank_values=True)
+        required = ["signature", "key_id", "transaction_id", "custom_data"]
+        missing = [name for name in required if not params.get(name)]
+        if missing:
+            raise SSVVerificationError(
+                f"required SSV parameters are missing: {', '.join(missing)}"
+            )
         try:
             signature_text = params["signature"][0]
             key_id = int(params["key_id"][0])
@@ -78,8 +90,16 @@ class AdMobSSVVerifier:
             raise SSVVerificationError("invalid AdMob SSV signature") from error
 
         ad_unit = params.get("ad_unit", [None])[0]
-        if ad_unit != self._expected_ad_unit:
-            raise SSVVerificationError("unexpected rewarded ad unit")
+        ad_unit_matches = ad_unit in self._allowed_ad_units
+        logger.info(
+            "[SSV] ad_unit comparison expected=%s allowed=%s received=%s matched=%s",
+            self._expected_ad_unit,
+            sorted(self._allowed_ad_units),
+            ad_unit,
+            ad_unit_matches,
+        )
+        if not ad_unit_matches:
+            raise SSVVerificationError(f"unexpected rewarded ad unit: {ad_unit}")
         return VerifiedReward(
             nonce=nonce,
             transaction_id=transaction_id,

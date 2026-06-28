@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,11 +22,18 @@ QUESTION_PATTERN_FILE = Path("app/data/question_patterns.json")
 REQUEST_RESULT_TTL_HOURS = 24
 AUDIO_MAX_SECONDS = 180
 AUDIO_MAX_BYTES = 4 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    logger.info(
+        "DailyOPIc AI settings loaded. mockAI=%s openaiModel=%s openaiKeyPresent=%s",
+        settings.mock_ai,
+        settings.openai_model,
+        bool(settings.openai_api_key),
+    )
     repository = QuestionPatternRepository(QUESTION_PATTERN_FILE)
     app.state.settings = settings
     app.state.request_result_ttl_hours = REQUEST_RESULT_TTL_HOURS

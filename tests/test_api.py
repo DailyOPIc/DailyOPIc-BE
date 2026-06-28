@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.admob import VerifiedReward
+from app.services.ai import AIQuestionGenerationError
 
 
 USER_ID = "11111111-1111-4111-8111-111111111111"
@@ -24,6 +25,13 @@ class FakeSSVVerifier:
         )
 
 
+class FailingQuestionAIService:
+    model = "test-model"
+
+    async def generate_practice(self, *args: object, **kwargs: object) -> object:
+        raise AIQuestionGenerationError("forced failure")
+
+
 def _headers(request_id: str | None = None) -> dict[str, str]:
     value = {
         "X-DailyOPIc-User-ID": USER_ID,
@@ -36,7 +44,7 @@ def _headers(request_id: str | None = None) -> dict[str, str]:
 
 def _verify_reward(client: TestClient, nonce: str) -> None:
     client.app.state.ssv_verifier = FakeSSVVerifier(nonce=nonce)
-    response = client.get("/v1/admob/ssv?fake=1")
+    response = client.get(f"/v1/admob/ssv?custom_data={nonce}&fake=1")
     assert response.status_code == 200, response.text
 
 
@@ -45,6 +53,36 @@ def _mock_audio_files() -> list[tuple[str, tuple[str, bytes, str]]]:
         ("audioFiles", (f"answer-{number}.m4a", b"not-real-audio", "audio/mp4"))
         for number in range(1, 16)
     ]
+
+
+def test_admob_ssv_url_verification_without_query_returns_200() -> None:
+    with TestClient(app) as client:
+        response = client.get("/v1/admob/ssv")
+
+    assert response.status_code == 200
+    assert response.text == "OK"
+
+
+def test_admob_ssv_url_verification_without_custom_data_returns_200() -> None:
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/admob/ssv"
+            "?ad_unit=ca-app-pub-5460686409666356/7091483531"
+            "&transaction_id=url-check"
+            "&key_id=123"
+            "&signature=placeholder"
+        )
+
+    assert response.status_code == 200
+    assert response.text == "OK"
+
+
+def test_admob_ssv_with_custom_data_still_requires_signed_parameters() -> None:
+    with TestClient(app) as client:
+        response = client.get("/v1/admob/ssv?custom_data=nonce-only")
+
+    assert response.status_code == 400
+    assert "required SSV parameters are missing" in response.text
 
 
 def test_practice_quota_and_reward_flow() -> None:
@@ -98,6 +136,19 @@ def test_practice_quota_and_reward_flow() -> None:
         assert response.status_code == 200, response.text
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["bonusRemaining"] == 0
+
+
+def test_question_generation_failure_returns_503_without_fallback() -> None:
+    with TestClient(app) as client:
+        client.app.state.ai_service = FailingQuestionAIService()
+        response = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"targetLevel": "IH", "background": {"interests": ["news"]}},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "ai_question_generation_failed"
 
 
 def test_target_level_change_requires_reward_and_controls_question_sets() -> None:

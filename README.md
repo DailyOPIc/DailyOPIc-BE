@@ -99,9 +99,9 @@ https://steve-immigration-amy-does.trycloudflare.com/v1/admob/ssv
 로컬 앱에서 리워드 광고까지 end-to-end로 테스트하려면 Cloud Run 개발 배포 URL 또는
 ngrok/cloudflared 같은 public HTTPS 터널의 `https://<public-host>/v1/admob/ssv`를
 AdMob Console의 SSV callback URL로 등록합니다. callback이 정상 수신되면 서버 로그에
-`admob ssv callback received`와 `admob ssv verified`가 출력됩니다.
+`[SSV] callback received`, `[SSV] reward verified`, `[SSV] reward completed`가 출력됩니다.
 
-iOS 앱은 서버에서 받은 `userIdentifier`와 `customData`를 AdMob rewarded ad options에 전달합니다. 서버는 Google SSV callback의 nonce, transaction id, user id, rewarded ad unit id, signature를 검증한 뒤에만 보상을 지급하거나 목표 등급 변경 권한을 소비합니다.
+iOS 앱은 서버에서 받은 `userIdentifier`와 `customData`를 AdMob rewarded ad options에 전달합니다. 서버는 Google SSV callback의 nonce, transaction id, user id, rewarded ad unit id, signature를 검증한 뒤에만 보상을 지급하거나 목표 등급 변경 권한을 소비합니다. AdMob SSV의 `ad_unit`은 전체 광고 단위 ID 대신 뒤쪽 숫자 ID만 보낼 수 있으므로 서버는 `ADMOB_REWARDED_AD_UNIT_ID` 전체 값과 `/` 뒤 숫자 ID를 모두 허용합니다.
 
 ## API
 

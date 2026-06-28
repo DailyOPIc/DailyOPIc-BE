@@ -13,6 +13,7 @@ from firebase_admin import firestore as admin_firestore
 from google.cloud import firestore
 
 from app.models.api import RewardPurpose
+from app.services.questions import prompt_hash
 
 
 class UsageLimitExceeded(RuntimeError):
@@ -52,6 +53,19 @@ class StateStore(ABC):
     async def get_question_set(
         self, *, uid: str, set_id: str, mode: str
     ) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]: ...
+
+    @abstractmethod
+    async def record_question_history(
+        self,
+        *,
+        uid: str,
+        mode: str,
+        set_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> None: ...
 
     @abstractmethod
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]: ...
@@ -114,6 +128,45 @@ def _usage_defaults() -> dict[str, int]:
     return {"freeUsed": 0, "bonusRemaining": 0, "rewardCount": 0}
 
 
+def _question_history_defaults() -> dict[str, list[str]]:
+    return {"setHashes": [], "topicIds": [], "promptHashes": []}
+
+
+def _trim_recent(values: list[str], limit: int = 80) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        if value in result:
+            result.remove(value)
+        result.append(value)
+    return result[-limit:]
+
+
+def _merge_question_history(
+    existing: dict[str, Any] | None,
+    *,
+    set_hash: str,
+    questions: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    history = {**_question_history_defaults(), **(existing or {})}
+    topic_ids = [
+        str(question.get("topicId") or "").strip()
+        for question in questions
+        if str(question.get("topicId") or "").strip()
+    ]
+    prompt_hashes = [
+        prompt_hash(str(question.get("prompt") or ""))
+        for question in questions
+        if str(question.get("prompt") or "").strip()
+    ]
+    return {
+        "setHashes": _trim_recent([*history["setHashes"], set_hash]),
+        "topicIds": _trim_recent([*history["topicIds"], *topic_ids]),
+        "promptHashes": _trim_recent([*history["promptHashes"], *prompt_hashes]),
+    }
+
+
 def _reward_purpose_matches(value: object, purpose: RewardPurpose) -> bool:
     return value == purpose or value == purpose.value
 
@@ -130,11 +183,16 @@ class InMemoryStateStore(StateStore):
         self._rewards: dict[str, dict[str, Any]] = {}
         self._transactions: set[str] = set()
         self._question_sets: dict[str, dict[str, Any]] = {}
+        self._question_histories: dict[str, dict[str, list[str]]] = {}
         self._profiles: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _usage_id(uid: str, date_key: str) -> str:
         return f"{uid}:{date_key}"
+
+    @staticmethod
+    def _question_history_id(uid: str, mode: str) -> str:
+        return f"{uid}:{mode}"
 
     async def save_question_set(
         self,
@@ -172,6 +230,32 @@ class InMemoryStateStore(StateStore):
             ):
                 return None
             return deepcopy(question_set)
+
+    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
+        async with self._lock:
+            history_id = self._question_history_id(uid, mode)
+            return deepcopy(
+                {
+                    **_question_history_defaults(),
+                    **self._question_histories.get(history_id, {}),
+                }
+            )
+
+    async def record_question_history(
+        self,
+        *,
+        uid: str,
+        mode: str,
+        set_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> None:
+        async with self._lock:
+            history_id = self._question_history_id(uid, mode)
+            self._question_histories[history_id] = _merge_question_history(
+                self._question_histories.get(history_id),
+                set_hash=set_hash,
+                questions=questions,
+            )
 
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         async with self._lock:
@@ -396,6 +480,10 @@ class FirestoreStateStore(StateStore):
     def _usage_id(uid: str, date_key: str) -> str:
         return hashlib.sha256(f"{uid}:{date_key}".encode()).hexdigest()
 
+    @staticmethod
+    def _question_history_id(uid: str, mode: str) -> str:
+        return hashlib.sha256(f"{uid}:{mode}".encode()).hexdigest()
+
     async def save_question_set(
         self,
         *,
@@ -437,6 +525,40 @@ class FirestoreStateStore(StateStore):
             return value
 
         return await asyncio.to_thread(read)
+
+    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
+        def read() -> dict[str, list[str]]:
+            snapshot = self._client.collection("questionHistories").document(
+                self._question_history_id(uid, mode)
+            ).get()
+            return {
+                **_question_history_defaults(),
+                **(snapshot.to_dict() or {}),
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def record_question_history(
+        self,
+        *,
+        uid: str,
+        mode: str,
+        set_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> None:
+        def write() -> None:
+            ref = self._client.collection("questionHistories").document(
+                self._question_history_id(uid, mode)
+            )
+            snapshot = ref.get()
+            updated = _merge_question_history(
+                snapshot.to_dict() if snapshot.exists else None,
+                set_hash=set_hash,
+                questions=questions,
+            )
+            ref.set({**updated, "uid": uid, "mode": mode, "updatedAt": datetime.now(UTC)})
+
+        await asyncio.to_thread(write)
 
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         def read() -> dict[str, int]:

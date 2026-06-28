@@ -1,4 +1,5 @@
 import base64
+import logging
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
@@ -8,6 +9,7 @@ from app.services.admob import AdMobSSVVerifier, SSVVerificationError
 
 
 AD_UNIT = "ca-app-pub-5460686409666356/7091483531"
+AD_UNIT_NUMERIC = "7091483531"
 
 
 def _private_key() -> ec.EllipticCurvePrivateKey:
@@ -52,6 +54,40 @@ async def test_ssv_parses_and_verifies_required_callback_fields(
 
 
 @pytest.mark.asyncio
+async def test_ssv_accepts_numeric_rewarded_ad_unit_from_admob(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_key = _private_key()
+    verifier = AdMobSSVVerifier(expected_ad_unit=AD_UNIT)
+
+    async def get_key(key_id: int) -> str:
+        return _public_pem(private_key)
+
+    monkeypatch.setattr(verifier, "_get_key", get_key)
+    caplog.set_level(logging.INFO, logger="app.services.admob")
+    query = _signed_query(
+        private_key,
+        f"ad_unit={AD_UNIT_NUMERIC}"
+        "&custom_data=reward-nonce"
+        "&transaction_id=tx-1"
+        "&key_id=123"
+        "&user_id=u1",
+    )
+
+    reward = await verifier.verify(query)
+
+    assert reward.nonce == "reward-nonce"
+    assert reward.transaction_id == "tx-1"
+    assert reward.user_id == "u1"
+    assert reward.ad_unit == AD_UNIT_NUMERIC
+    assert "[SSV] ad_unit comparison" in caplog.text
+    assert f"expected={AD_UNIT}" in caplog.text
+    assert f"received={AD_UNIT_NUMERIC}" in caplog.text
+    assert "matched=True" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ssv_rejects_unexpected_rewarded_ad_unit(monkeypatch: pytest.MonkeyPatch) -> None:
     private_key = _private_key()
     verifier = AdMobSSVVerifier(expected_ad_unit=AD_UNIT)
@@ -69,7 +105,7 @@ async def test_ssv_rejects_unexpected_rewarded_ad_unit(monkeypatch: pytest.Monke
         "&user_id=u1",
     )
 
-    with pytest.raises(SSVVerificationError):
+    with pytest.raises(SSVVerificationError, match="unexpected rewarded ad unit"):
         await verifier.verify(query)
 
 

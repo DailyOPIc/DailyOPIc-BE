@@ -31,6 +31,33 @@ async def test_question_set_is_bound_to_user_and_mode() -> None:
 
 
 @pytest.mark.asyncio
+async def test_question_history_records_recent_hashes_and_trims() -> None:
+    store = InMemoryStateStore()
+
+    for index in range(90):
+        await store.record_question_history(
+            uid="u1",
+            mode="practice",
+            set_hash=f"set-{index}",
+            questions=[
+                {
+                    "topicId": f"topic_{index}",
+                    "prompt": f"Describe a unique situation number {index}.",
+                }
+            ],
+        )
+
+    history = await store.get_question_history(uid="u1", mode="practice")
+
+    assert len(history["setHashes"]) == 80
+    assert len(history["topicIds"]) == 80
+    assert len(history["promptHashes"]) == 80
+    assert history["setHashes"][0] == "set-10"
+    assert history["topicIds"][0] == "topic_10"
+    assert history["setHashes"][-1] == "set-89"
+
+
+@pytest.mark.asyncio
 async def test_three_free_then_bonus_credits() -> None:
     store = InMemoryStateStore()
     for index in range(3):

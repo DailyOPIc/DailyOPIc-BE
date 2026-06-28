@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from openai import AsyncOpenAI
@@ -24,6 +25,8 @@ from app.models.api import (
 from app.services.questions import (
     FallbackQuestionGenerator,
     QuestionPatternRepository,
+    prompt_hash,
+    question_set_hash,
     validate_mock_blueprint,
 )
 
@@ -49,9 +52,38 @@ class AIServiceUnavailable(AIServiceError):
     pass
 
 
+class AIQuestionGenerationError(AIServiceError):
+    pass
+
+
 class GeneratedQuestionsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[GeneratedQuestion]
+
+
+@dataclass(slots=True)
+class AIUsage:
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass(slots=True)
+class StructuredAIResult:
+    payload: BaseModel
+    response_id: str | None
+    usage: AIUsage
+
+
+@dataclass(slots=True)
+class QuestionGenerationResult:
+    questions: list[GeneratedQuestion]
+    fallback_used: bool
+    provider: str
+    openai_response_id: str | None = None
+    usage: AIUsage | None = None
 
 
 class AIPracticeResult(BaseModel):
@@ -87,6 +119,49 @@ class AIMockResult(BaseModel):
         return value
 
 
+def openai_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Convert Pydantic JSON schema to OpenAI strict structured-output schema."""
+
+    def convert(value: Any) -> Any:
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        result: dict[str, Any] = {}
+        unsupported_keywords = {
+            "default",
+            "title",
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "format",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minProperties",
+            "maxProperties",
+        }
+        for key, item in value.items():
+            if key in unsupported_keywords:
+                continue
+            result[key] = convert(item)
+
+        properties = result.get("properties")
+        if isinstance(properties, dict):
+            result["additionalProperties"] = False
+            result["required"] = list(properties.keys())
+        return result
+
+    converted = convert(schema)
+    assert isinstance(converted, dict)
+    return converted
+
+
 class AIService:
     def __init__(
         self,
@@ -106,7 +181,7 @@ class AIService:
 
     async def _structured(
         self, *, instructions: str, input_text: str, schema: type[BaseModel]
-    ) -> BaseModel:
+    ) -> StructuredAIResult:
         if not self._client:
             raise AIServiceConfigurationError("OpenAI client is not configured")
         try:
@@ -121,23 +196,32 @@ class AIService:
                         "type": "json_schema",
                         "name": schema.__name__,
                         "strict": True,
-                        "schema": schema.model_json_schema(),
+                        "schema": openai_strict_json_schema(schema.model_json_schema()),
                     }
                 },
             )
-            self._log_usage(response, schema.__name__)
+            usage = self._log_usage(response, schema.__name__)
             if not response.output_text:
                 raise ValueError("OpenAI returned no structured output")
-            return schema.model_validate_json(response.output_text)
+            return StructuredAIResult(
+                payload=schema.model_validate_json(response.output_text),
+                response_id=getattr(response, "id", None),
+                usage=usage,
+            )
         except AIServiceError:
             raise
         except Exception as error:
+            logger.exception(
+                "OpenAI structured request failed. model=%s schema=%s",
+                self.model,
+                schema.__name__,
+            )
             raise AIServiceUnavailable("AI service is temporarily unavailable") from error
 
-    def _log_usage(self, response: Any, schema_name: str) -> None:
+    def _log_usage(self, response: Any, schema_name: str) -> AIUsage:
         usage = getattr(response, "usage", None)
         if usage is None:
-            return
+            return AIUsage()
         input_tokens = self._usage_metric(usage, "input_tokens")
         output_tokens = self._usage_metric(usage, "output_tokens")
         total_tokens = self._usage_metric(usage, "total_tokens")
@@ -145,16 +229,25 @@ class AIService:
         reasoning_tokens = self._usage_metric(
             usage, "output_tokens_details", "reasoning_tokens"
         )
+        response_id = getattr(response, "id", None)
         logger.info(
-            "OpenAI usage recorded. model=%s schema=%s inputTokens=%s "
+            "OpenAI usage recorded. model=%s schema=%s openaiResponseId=%s inputTokens=%s "
             "cachedInputTokens=%s outputTokens=%s reasoningTokens=%s totalTokens=%s",
             self.model,
             schema_name,
+            response_id,
             input_tokens,
             cached_tokens,
             output_tokens,
             reasoning_tokens,
             total_tokens,
+        )
+        return AIUsage(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            total_tokens=total_tokens,
         )
 
     @staticmethod
@@ -172,93 +265,240 @@ class AIService:
         return int(current) if isinstance(current, (int, float)) else None
 
     async def generate_practice(
-        self, target: OPIcLevel, background: BackgroundProfile
-    ) -> tuple[list[GeneratedQuestion], bool]:
+        self,
+        target: OPIcLevel,
+        background: BackgroundProfile,
+        history: dict[str, list[str]] | None = None,
+    ) -> QuestionGenerationResult:
         base_questions = self._fallback.practice(target, background)
         if self._mock:
-            return base_questions, True
-        input_payload = {
-            "targetLevel": target.value,
-            "baseQuestions": [
-                item.model_dump(by_alias=True, mode="json") for item in base_questions
-            ],
-            "constraints": [
-                "Create original English speaking prompts only; do not copy official OPIc wording.",
-                "Keep number, type, comboId, topicId, category, questionType, difficulty, and estimatedLevel unchanged.",
-                "Only polish prompt and followUpPrompt for naturalness and target-level fit.",
-                "Do not add tags to the response.",
-            ],
-        }
-        try:
-            output = await self._structured(
-                instructions=(
-                    "Refine a catalog-based 10-question OPIc-style daily practice set. "
-                    "Preserve every structural field exactly and change only visible prompt text. "
-                    "The result must be original practice content, not official test questions."
-                ),
-                input_text=json.dumps(input_payload, ensure_ascii=False),
-                schema=GeneratedQuestionsPayload,
+            return QuestionGenerationResult(
+                questions=base_questions,
+                fallback_used=True,
+                provider="catalog",
             )
-            questions = output.questions  # type: ignore[attr-defined]
-            if [item.number for item in questions] != list(range(1, 11)):
-                raise ValueError("practice question numbering is invalid")
-            if any(item.type is not QuestionType.PRACTICE for item in questions):
-                raise ValueError("practice question type is invalid")
-            for base, refined in zip(base_questions, questions, strict=True):
-                if (
-                    base.combo_id != refined.combo_id
-                    or base.difficulty != refined.difficulty
-                    or base.question_type != refined.question_type
-                    or base.topic_id != refined.topic_id
-                    or base.category != refined.category
-                    or base.estimated_level != refined.estimated_level
-                ):
-                    raise ValueError("practice question structural fields changed")
-            return questions, False
-        except Exception as error:
-            logger.warning("practice question refinement failed; using catalog fallback: %s", error)
-            return base_questions, True
+
+        payload = self._question_generation_payload(
+            mode="practice",
+            target=target,
+            background=background,
+            blueprint=base_questions,
+            history=history,
+        )
+        return await self._generate_questions_with_openai(
+            mode="practice",
+            target=target,
+            payload=payload,
+            history=history,
+        )
 
     async def generate_mock(
         self,
         target: OPIcLevel,
         background: BackgroundProfile,
         survey: BackgroundSurvey | None = None,
-    ) -> tuple[list[GeneratedQuestion], bool]:
+        history: dict[str, list[str]] | None = None,
+    ) -> QuestionGenerationResult:
         base_questions = self._fallback.mock(target, background, survey=survey)
         if self._mock:
-            return base_questions, True
-        input_payload = {
+            return QuestionGenerationResult(
+                questions=base_questions,
+                fallback_used=True,
+                provider="catalog",
+            )
+
+        payload = self._question_generation_payload(
+            mode="mock",
+            target=target,
+            background=background,
+            blueprint=base_questions,
+            history=history,
+            survey=survey,
+        )
+        return await self._generate_questions_with_openai(
+            mode="mock",
+            target=target,
+            payload=payload,
+            history=history,
+        )
+
+    def _question_generation_payload(
+        self,
+        *,
+        mode: str,
+        target: OPIcLevel,
+        background: BackgroundProfile,
+        blueprint: list[GeneratedQuestion],
+        history: dict[str, list[str]] | None,
+        survey: BackgroundSurvey | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "mode": mode,
             "targetLevel": target.value,
-            "legacyBackground": background.model_dump(mode="json"),
+            "background": background.model_dump(mode="json"),
             "backgroundSurvey": survey.model_dump(mode="json") if survey else None,
-            "baseQuestions": [
-                item.model_dump(by_alias=True, mode="json") for item in base_questions
-            ],
+            "blueprint": [self._blueprint_item(item, target) for item in blueprint],
+            "forbidden": {
+                "setHashes": (history or {}).get("setHashes", []),
+                "topicIds": (history or {}).get("topicIds", []),
+                "promptHashes": (history or {}).get("promptHashes", []),
+            },
             "constraints": [
-                "Create original English speaking prompts only; do not copy official OPIc wording.",
-                "Keep number, type, comboId, topicId, category, questionType, difficulty, and estimatedLevel unchanged.",
-                "Only polish prompt and followUpPrompt for naturalness and target-level fit.",
-                "Do not add tags to the response.",
+                "Generate entirely new OPIc-style practice questions.",
+                "Do not copy official OPIc wording or the catalog examples.",
+                "Use fresh lowercase snake_case topicId values not listed in forbidden.topicIds.",
+                "Make prompt and followUpPrompt specific, natural, and different from prior sets.",
+                "Do not add fields outside the JSON schema.",
             ],
         }
-        for _ in range(2):
+
+    @staticmethod
+    def _blueprint_item(question: GeneratedQuestion, target: OPIcLevel) -> dict[str, Any]:
+        return {
+            "number": question.number,
+            "type": question.type.value,
+            "comboId": question.combo_id,
+            "questionType": question.question_type.value if question.question_type else None,
+            "difficulty": target.value,
+            "estimatedLevel": target.value,
+            "rubricFocus": question.rubric_focus,
+        }
+
+    async def _generate_questions_with_openai(
+        self,
+        *,
+        mode: str,
+        target: OPIcLevel,
+        payload: dict[str, Any],
+        history: dict[str, list[str]] | None,
+    ) -> QuestionGenerationResult:
+        last_error: Exception | None = None
+        for attempt in range(1, 3):
             try:
-                output = await self._structured(
-                    instructions=(
-                        "Refine a catalog-based 15-question OPIc-style practice mock exam. "
-                        "Preserve every structural field exactly and change only the visible prompt text. "
-                        "The result must be original practice content, not official test questions."
+                result = await self._structured(
+                    instructions=self._question_generation_instructions(mode),
+                    input_text=json.dumps(
+                        {**payload, "attempt": attempt},
+                        ensure_ascii=False,
                     ),
-                    input_text=json.dumps(input_payload, ensure_ascii=False),
                     schema=GeneratedQuestionsPayload,
                 )
-                questions = output.questions  # type: ignore[attr-defined]
-                validate_mock_blueprint(questions)
-                return questions, False
-            except Exception:
-                continue
-        return base_questions, True
+                generated = result.payload
+                assert isinstance(generated, GeneratedQuestionsPayload)
+                questions = generated.questions
+                self._validate_generated_questions(
+                    mode=mode,
+                    target=target,
+                    questions=questions,
+                    history=history,
+                )
+                return QuestionGenerationResult(
+                    questions=questions,
+                    fallback_used=False,
+                    provider="openai",
+                    openai_response_id=result.response_id,
+                    usage=result.usage,
+                )
+            except Exception as error:
+                last_error = error
+                logger.exception(
+                    "AI question generation attempt failed. mode=%s model=%s attempt=%s",
+                    mode,
+                    self.model,
+                    attempt,
+                )
+        raise AIQuestionGenerationError(
+            f"AI question generation failed after 2 attempts for mode={mode}"
+        ) from last_error
+
+    @staticmethod
+    def _question_generation_instructions(mode: str) -> str:
+        if mode == "practice":
+            return (
+                "Create a brand-new 10-question Daily OPIc practice set. "
+                "Follow the blueprint numbers and questionType values exactly. "
+                "Every question must have type='practice', comboId=null, a unique topicId, "
+                "difficulty and estimatedLevel matching targetLevel, and original English prompt text. "
+                "Do not reuse forbidden topic IDs or prompts."
+            )
+        return (
+            "Create a brand-new 15-question OPIc mock exam. "
+            "Follow the blueprint numbers, type, comboId, and questionType values exactly. "
+            "Questions 2-4, 5-7, and 8-10 must each share one fresh survey topicId inside their combo; "
+            "other questions need fresh topic IDs. Do not reuse forbidden topic IDs or prompts. "
+            "difficulty and estimatedLevel must match targetLevel."
+        )
+
+    def _validate_generated_questions(
+        self,
+        *,
+        mode: str,
+        target: OPIcLevel,
+        questions: list[GeneratedQuestion],
+        history: dict[str, list[str]] | None,
+    ) -> None:
+        if mode == "practice":
+            self._validate_practice_questions(target, questions)
+        else:
+            validate_mock_blueprint(questions)
+            self._validate_common_question_fields(target, questions)
+        self._validate_question_uniqueness(mode=mode, questions=questions, history=history)
+
+    @staticmethod
+    def _validate_practice_questions(
+        target: OPIcLevel, questions: list[GeneratedQuestion]
+    ) -> None:
+        if [item.number for item in questions] != list(range(1, 11)):
+            raise ValueError("practice question numbering is invalid")
+        if any(item.type is not QuestionType.PRACTICE for item in questions):
+            raise ValueError("practice question type is invalid")
+        if any(item.combo_id is not None for item in questions):
+            raise ValueError("practice question comboId must be null")
+        if any(item.difficulty != target for item in questions):
+            raise ValueError("practice question difficulty must match target")
+        if any(item.estimated_level != target for item in questions):
+            raise ValueError("practice question estimatedLevel must match target")
+        if any(item.question_type is None for item in questions):
+            raise ValueError("practice questionType is required")
+        topic_ids = [item.topic_id for item in questions if item.topic_id]
+        if len(topic_ids) != 10 or len(set(topic_ids)) != 10:
+            raise ValueError("practice question topicIds must be present and unique")
+
+    @staticmethod
+    def _validate_common_question_fields(
+        target: OPIcLevel, questions: list[GeneratedQuestion]
+    ) -> None:
+        if any(item.difficulty != target for item in questions):
+            raise ValueError("question difficulty must match target")
+        if any(item.estimated_level != target for item in questions):
+            raise ValueError("question estimatedLevel must match target")
+        if any(not item.topic_id for item in questions):
+            raise ValueError("question topicId is required")
+
+    @staticmethod
+    def _validate_question_uniqueness(
+        *,
+        mode: str,
+        questions: list[GeneratedQuestion],
+        history: dict[str, list[str]] | None,
+    ) -> None:
+        serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
+        set_hash = question_set_hash(serialized)
+        prompt_hashes = [prompt_hash(item.prompt) for item in questions]
+        topic_ids = [item.topic_id for item in questions if item.topic_id]
+        recent_set_hashes = set((history or {}).get("setHashes", []))
+        recent_topic_ids = set((history or {}).get("topicIds", []))
+        recent_prompt_hashes = set((history or {}).get("promptHashes", []))
+        if set_hash in recent_set_hashes:
+            raise ValueError("generated question set repeats a recent setHash")
+        if set(topic_ids).intersection(recent_topic_ids):
+            raise ValueError("generated question set repeats recent topicIds")
+        if set(prompt_hashes).intersection(recent_prompt_hashes):
+            raise ValueError("generated question set repeats recent promptHashes")
+        if len(prompt_hashes) != len(set(prompt_hashes)):
+            raise ValueError("generated question set contains duplicate prompts")
+        if mode == "practice" and len(topic_ids) != len(set(topic_ids)):
+            raise ValueError("practice question set contains duplicate topicIds")
 
     @staticmethod
     def _fallback_score(transcript: str, metrics: AudioMetrics) -> tuple[OPIcLevel, EvaluationScores]:
@@ -326,7 +566,7 @@ class AIService:
                 "deliveryMetrics": metrics.model_dump(by_alias=True, mode="json"),
                 "targetLevelForFeedbackOnly": target.value,
             }
-            result = await self._structured(
+            structured = await self._structured(
                 instructions=(
                     "Act as a conservative OPIc practice evaluator. Grade the answer independently of the target level. "
                     "Use targetLevel only for targetGap and sampleAnswer. Do not claim phoneme-level pronunciation analysis. "
@@ -336,6 +576,7 @@ class AIService:
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIPracticeResult,
             )
+            result = structured.payload
         assert isinstance(result, AIPracticeResult)
         return PracticeEvaluation(
             **result.model_dump(by_alias=True),
@@ -394,7 +635,7 @@ class AIService:
                 ],
                 "targetLevelForFeedbackOnly": target.value,
             }
-            result = await self._structured(
+            structured = await self._structured(
                 instructions=(
                     "Evaluate this complete 15-answer OPIc-style mock exam conservatively and holistically. "
                     "Determine predictedLevel before considering the target level. Use audio metrics only for delivery and fluency, "
@@ -404,6 +645,7 @@ class AIService:
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIMockResult,
             )
+            result = structured.payload
         assert isinstance(result, AIMockResult)
         return MockEvaluation(
             **result.model_dump(by_alias=True),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import secrets
@@ -39,10 +40,10 @@ from app.models.api import (
     UsageResponse,
 )
 from app.services.admob import SSVVerificationError
-from app.services.ai import AIServiceError
+from app.services.ai import AIQuestionGenerationError, AIServiceError
 from app.services.audio import AudioValidationError
 from app.services.auth import CurrentUser, current_user
-from app.services.questions import question_set_hash
+from app.services.questions import prompt_hash, question_set_hash
 from app.services.state import (
     RequestAlreadyProcessing,
     RewardNotVerified,
@@ -71,6 +72,10 @@ def _request_id(value: str | None) -> str:
             },
         )
     return value
+
+
+def _uid_hash(uid: str) -> str:
+    return hashlib.sha256(uid.encode()).hexdigest()[:12]
 
 
 def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentResponse:
@@ -130,14 +135,53 @@ async def _create_question_set(
     mode: str,
 ) -> QuestionSetResponse:
     await _ensure_target_level(request, user, payload.target_level.value)
-    if mode == "mock":
-        questions, fallback = await request.app.state.ai_service.generate_mock(
-            payload.target_level, payload.background, getattr(payload, "survey", None)
+    uid_hash = _uid_hash(user.uid)
+    history = await request.app.state.state_store.get_question_history(
+        uid=user.uid,
+        mode=mode,
+    )
+    logger.info(
+        "question generation requested mode=%s uidHash=%s targetLevel=%s mockAI=%s "
+        "model=%s recentSetCount=%s recentTopicCount=%s recentPromptCount=%s",
+        mode,
+        uid_hash,
+        payload.target_level.value,
+        request.app.state.settings.mock_ai,
+        request.app.state.ai_service.model,
+        len(history.get("setHashes", [])),
+        len(history.get("topicIds", [])),
+        len(history.get("promptHashes", [])),
+    )
+    try:
+        if mode == "mock":
+            generation = await request.app.state.ai_service.generate_mock(
+                payload.target_level,
+                payload.background,
+                getattr(payload, "survey", None),
+                history=history,
+            )
+        else:
+            generation = await request.app.state.ai_service.generate_practice(
+                payload.target_level,
+                payload.background,
+                history=history,
+            )
+    except AIQuestionGenerationError as error:
+        logger.exception(
+            "question generation failed mode=%s uidHash=%s targetLevel=%s model=%s",
+            mode,
+            uid_hash,
+            payload.target_level.value,
+            request.app.state.ai_service.model,
         )
-    else:
-        questions, fallback = await request.app.state.ai_service.generate_practice(
-            payload.target_level, payload.background
-        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_question_generation_failed",
+                "message": "AI 질문 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            },
+        ) from error
+    questions = generation.questions
     set_id = str(uuid.uuid4())
     serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
     set_hash = question_set_hash(serialized)
@@ -151,13 +195,43 @@ async def _create_question_set(
         expires_at=datetime.now(UTC)
         + timedelta(seconds=86_400 if mode == "practice" else 7 * 86_400),
     )
+    await request.app.state.state_store.record_question_history(
+        uid=user.uid,
+        mode=mode,
+        set_hash=set_hash,
+        questions=serialized,
+    )
+    topic_ids = [str(item.get("topicId") or "") for item in serialized]
+    prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
+    usage = generation.usage
+    logger.info(
+        "question generation succeeded mode=%s uidHash=%s targetLevel=%s provider=%s "
+        "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s topicIds=%s "
+        "promptHashes=%s inputTokens=%s cachedInputTokens=%s outputTokens=%s "
+        "reasoningTokens=%s totalTokens=%s",
+        mode,
+        uid_hash,
+        payload.target_level.value,
+        generation.provider,
+        request.app.state.ai_service.model,
+        generation.openai_response_id,
+        generation.fallback_used,
+        set_hash,
+        topic_ids,
+        prompt_hashes,
+        usage.input_tokens if usage else None,
+        usage.cached_input_tokens if usage else None,
+        usage.output_tokens if usage else None,
+        usage.reasoning_tokens if usage else None,
+        usage.total_tokens if usage else None,
+    )
     return QuestionSetResponse(
         setId=set_id,
         setHash=set_hash,
         questions=questions,
         modelVersion=request.app.state.ai_service.model,
         generatedAt=datetime.now(UTC),
-        fallbackUsed=fallback,
+        fallbackUsed=generation.fallback_used,
     )
 
 
@@ -268,21 +342,45 @@ async def reward_status(
 async def admob_ssv(request: Request) -> PlainTextResponse:
     query_keys = sorted(request.query_params.keys())
     client_host = request.client.host if request.client else "unknown"
-    logger.info("admob ssv callback received client=%s keys=%s", client_host, query_keys)
+    if not request.query_params.get("custom_data"):
+        logger.info(
+            "[SSV] AdMob URL verification request detected. "
+            "No custom_data present. client=%s keys=%s",
+            client_host,
+            query_keys,
+        )
+        return PlainTextResponse("OK")
+
+    logger.info("[SSV] callback received client=%s keys=%s", client_host, query_keys)
     try:
         verified = await request.app.state.ssv_verifier.verify(request.url.query)
+        logger.info(
+            "[SSV] nonce=%s transactionId=%s user=%s adUnit=%s",
+            verified.nonce,
+            verified.transaction_id,
+            verified.user_id,
+            verified.ad_unit,
+        )
         if not verified.user_id:
+            logger.warning("[SSV] missing parameter name=user_id nonce=%s", verified.nonce)
             raise RewardNotVerified("SSV user_id is required")
         reward = await request.app.state.state_store.get_reward_intent(
             verified.nonce, verified.user_id
         )
         if not reward:
+            logger.warning(
+                "[SSV] nonce not found nonce=%s user=%s",
+                verified.nonce,
+                verified.user_id,
+            )
             raise RewardNotVerified("SSV user_id does not match the reward intent")
         await request.app.state.state_store.verify_reward(
             nonce=verified.nonce,
             transaction_id=verified.transaction_id,
             practice_credit_amount=request.app.state.settings.reward_practice_credits,
         )
+        logger.info("[SSV] reward verified nonce=%s", verified.nonce)
+        logger.info("[SSV] reward completed nonce=%s", verified.nonce)
         logger.info(
             "admob ssv verified nonce=%s transactionId=%s user=%s purpose=%s",
             verified.nonce,
@@ -291,6 +389,13 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
             reward.get("purpose"),
         )
     except (SSVVerificationError, RewardNotVerified) as error:
+        error_text = str(error)
+        if "required SSV parameters are missing" in error_text:
+            logger.warning("[SSV] missing parameter client=%s keys=%s", client_host, query_keys)
+        elif "signature" in error_text:
+            logger.warning("[SSV] invalid signature client=%s keys=%s", client_host, query_keys)
+        elif "does not match" in error_text or "missing or expired" in error_text:
+            logger.warning("[SSV] nonce not found client=%s keys=%s", client_host, query_keys)
         logger.warning(
             "admob ssv verification failed client=%s keys=%s error=%s",
             client_host,

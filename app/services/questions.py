@@ -74,6 +74,11 @@ def question_set_hash(questions: list[dict[str, Any]]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def prompt_hash(prompt: str) -> str:
+    normalized = " ".join(prompt.strip().lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 class QuestionPatternRepository:
     def __init__(self, path: Path) -> None:
         self._path = path
