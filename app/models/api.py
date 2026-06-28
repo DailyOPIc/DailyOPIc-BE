@@ -131,6 +131,7 @@ class PracticeSetRequest(BaseModel):
     initial_level: int | None = Field(default=None, alias="initialLevel", ge=1, le=6)
     target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
     background: BackgroundProfile = Field(default_factory=BackgroundProfile)
+    survey: BackgroundSurvey | None = None
     recent_question_hashes: list[str] = Field(
         default_factory=list, alias="recentQuestionHashes", max_length=50
     )
@@ -144,6 +145,10 @@ class PracticeSetRequest(BaseModel):
 
 class MockExamRequest(PracticeSetRequest):
     survey: BackgroundSurvey | None = None
+
+
+class PracticeRefreshRequest(PracticeSetRequest):
+    adjustment: DifficultyAdjustment = DifficultyAdjustment.SAME
 
 
 class QuestionSetResponse(BaseModel):

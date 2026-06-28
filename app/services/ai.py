@@ -28,10 +28,11 @@ from app.services.questions import (
     QuestionPatternRepository,
     prompt_hash,
     question_set_hash,
-    validate_practice_blueprint,
+    validate_daily_pool,
     validate_mock_blueprint,
+    validate_practice_blueprint,
 )
-from app.services.difficulty import expected_target_level
+from app.services.difficulty import adjusted_level, expected_target_level
 from app.services.difficulty import initial_level_from_target
 
 PROMPT_VERSION = "opic-rubric-2026-06-22-v1"
@@ -319,6 +320,51 @@ class AIService:
             history=history,
         )
 
+    async def generate_daily_pool(
+        self,
+        initial_level: int | OPIcLevel,
+        background: BackgroundProfile,
+        survey: BackgroundSurvey | None = None,
+        *,
+        adjustment: DifficultyAdjustment | None = None,
+        history: dict[str, list[str]] | None = None,
+    ) -> QuestionGenerationResult:
+        if isinstance(initial_level, OPIcLevel):
+            initial_level = initial_level_from_target(initial_level) or 4
+        level = adjusted_level(initial_level, adjustment)
+        base_questions = self._fallback.daily_pool(
+            initial_level,
+            background,
+            survey=survey,
+            adjustment=adjustment,
+        )
+        if self._mock:
+            return QuestionGenerationResult(
+                questions=base_questions,
+                fallback_used=True,
+                provider="catalog",
+            )
+
+        payload = self._question_generation_payload(
+            mode="daily",
+            stage="pool",
+            initial_level=initial_level,
+            effective_level=level,
+            adjustment=adjustment,
+            background=background,
+            blueprint=base_questions,
+            history=history,
+            survey=survey,
+        )
+        return await self._generate_questions_with_openai(
+            mode="daily",
+            stage="pool",
+            simulation_level=level,
+            blueprint=base_questions,
+            payload=payload,
+            history=history,
+        )
+
     async def generate_mock(
         self,
         initial_level: int | OPIcLevel,
@@ -346,7 +392,7 @@ class AIService:
         )
         if self._mock:
             return QuestionGenerationResult(
-                questions=base_questions,
+                questions=self._with_fixed_intro(base_questions),
                 fallback_used=True,
                 provider="catalog",
             )
@@ -362,13 +408,20 @@ class AIService:
             history=history,
             survey=survey,
         )
-        return await self._generate_questions_with_openai(
+        result = await self._generate_questions_with_openai(
             mode="mock",
             stage=stage,
             simulation_level=level,
             blueprint=base_questions,
             payload=payload,
             history=history,
+        )
+        return QuestionGenerationResult(
+            questions=self._with_fixed_intro(result.questions),
+            fallback_used=result.fallback_used,
+            provider=result.provider,
+            openai_response_id=result.openai_response_id,
+            usage=result.usage,
         )
 
     def _question_generation_payload(
@@ -399,6 +452,7 @@ class AIService:
                 "setHashes": (history or {}).get("setHashes", []),
                 "topicIds": (history or {}).get("topicIds", []),
                 "promptHashes": (history or {}).get("promptHashes", []),
+                "promptTexts": (history or {}).get("promptTexts", [])[-30:],
             },
             "constraints": [
                 "Generate entirely new OPIc interviewer-style simulation questions.",
@@ -429,7 +483,29 @@ class AIService:
         }
 
     @staticmethod
+    def _with_fixed_intro(questions: list[GeneratedQuestion]) -> list[GeneratedQuestion]:
+        if not questions or questions[0].number != 1:
+            return questions
+        return [
+            questions[0].model_copy(
+                update={
+                    "prompt": "Introduce yourself.",
+                    "follow_up_prompt": None,
+                    "topic": "self introduction",
+                    "topic_id": "self_introduction",
+                }
+            ),
+            *questions[1:],
+        ]
+
+    @staticmethod
     def _exam_plan(*, mode: str, stage: str) -> list[str]:
+        if mode == "daily":
+            return [
+                "Q2-Q15 randomized Daily practice prompts only",
+                "No Q1, no introduction, and no self-introduction",
+                "Use survey-based and unexpected OPIc-style question types without combo requirements",
+            ]
         if mode == "practice" and stage == "front":
             return [
                 "Q1 self introduction",
@@ -461,7 +537,8 @@ class AIService:
         history: dict[str, list[str]] | None,
     ) -> QuestionGenerationResult:
         last_error: Exception | None = None
-        for attempt in range(1, 3):
+        max_attempts = 3 if mode == "daily" else 2
+        for attempt in range(1, max_attempts + 1):
             try:
                 result = await self._structured(
                     instructions=self._question_generation_instructions(mode),
@@ -498,7 +575,7 @@ class AIService:
                     attempt,
                 )
         raise AIQuestionGenerationError(
-            f"AI question generation failed after 2 attempts for mode={mode}"
+            f"AI question generation failed after {max_attempts} attempts for mode={mode}"
         ) from last_error
 
     @staticmethod
@@ -540,6 +617,16 @@ class AIService:
                 + "Keep the flow close to an actual OPIc interview: self introduction, topic combo, topic combo, then adjusted or unexpected questions."
             )
 
+        if mode == "daily":
+            return (
+                base
+                + "Create a brand-new randomized Daily OPIc question pool. "
+                + "Generate only questions numbered Q2 through Q15. "
+                + "Never include self-introduction, 'Introduce yourself', warm-up, or hint-like follow-up content. "
+                + "The questions are independent practice prompts, not a mock exam combo sequence. "
+                + "Use varied survey-based and unexpected topics, and make each prompt clearly different from forbidden.promptTexts."
+            )
+
         return (
             base
             + "Create a brand-new 15-question OPIc mock exam stage. "
@@ -557,7 +644,9 @@ class AIService:
         history: dict[str, list[str]] | None,
     ) -> None:
         self._validate_against_blueprint(blueprint, questions)
-        if mode == "practice":
+        if mode == "daily":
+            validate_daily_pool(questions)
+        elif mode == "practice":
             validate_practice_blueprint(questions)
         elif len(questions) == 15:
             validate_mock_blueprint(questions)

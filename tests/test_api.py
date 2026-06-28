@@ -31,6 +31,9 @@ class FailingQuestionAIService:
     async def generate_practice(self, *args: object, **kwargs: object) -> object:
         raise AIQuestionGenerationError("forced failure")
 
+    async def generate_daily_pool(self, *args: object, **kwargs: object) -> object:
+        raise AIQuestionGenerationError("forced failure")
+
 
 def _headers(request_id: str | None = None) -> dict[str, str]:
     value = {
@@ -97,9 +100,10 @@ def test_practice_quota_and_reward_flow() -> None:
             json={"targetLevel": "IH", "background": {"interests": ["news"]}},
         ).json()
         assert "setToken" not in question_set
+        assert [item["number"] for item in question_set["questions"]] == list(range(2, 16))
         form = {
             "setId": question_set["setId"],
-            "questionNumber": "1",
+            "questionNumber": str(question_set["questions"][0]["number"]),
             "transcript": "I read several news sources every morning because I want balanced information.",
             "targetLevel": "IH",
         }
@@ -136,6 +140,68 @@ def test_practice_quota_and_reward_flow() -> None:
         assert response.status_code == 200, response.text
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["bonusRemaining"] == 0
+
+
+def test_daily_pool_is_archived_and_refresh_consumes_practice_token() -> None:
+    with TestClient(app) as client:
+        payload = {
+            "initialLevel": 5,
+            "background": {"interests": ["cafes"]},
+            "survey": {
+                "status": "student",
+                "residence": "family",
+                "leisure": ["movies", "music", "cafes"],
+                "hobbies": [],
+                "sports": [],
+                "travel": [],
+            },
+        }
+        first = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json=payload,
+        )
+        assert first.status_code == 200, first.text
+        first_set = first.json()
+        assert [item["number"] for item in first_set["questions"]] == list(range(2, 16))
+        assert all(item["type"] != "introduction" for item in first_set["questions"])
+
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 3
+
+        archived = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json=payload,
+        )
+        assert archived.status_code == 200, archived.text
+        assert archived.json()["setId"] == first_set["setId"]
+
+        refreshed = client.post(
+            "/v1/question-sets/practice/refresh",
+            headers=_headers(),
+            json={**payload, "adjustment": "harder"},
+        )
+        assert refreshed.status_code == 200, refreshed.text
+        refreshed_set = refreshed.json()
+        assert refreshed_set["setId"] != first_set["setId"]
+        assert refreshed_set["effectiveLevelCode"] == "5-6"
+        assert [item["number"] for item in refreshed_set["questions"]] == list(range(2, 16))
+
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 2
+
+        response = client.post(
+            "/v1/evaluations/practice",
+            headers=_headers(str(uuid.uuid4())),
+            data={
+                "setId": refreshed_set["setId"],
+                "questionNumber": "15",
+                "transcript": "Technology changes how I plan my day, communicate, and solve small problems at work.",
+                "targetLevel": "AL",
+            },
+        )
+        assert response.status_code == 200, response.text
 
 
 def test_question_generation_failure_returns_503_without_fallback() -> None:

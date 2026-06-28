@@ -65,6 +65,9 @@ class StateStore(ABC):
         question_hash: str,
         questions: list[dict[str, Any]],
         expires_at: datetime,
+        source: str | None = None,
+        date_key: str | None = None,
+        pool_index: int | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -165,7 +168,7 @@ def _usage_defaults() -> dict[str, int]:
 
 
 def _question_history_defaults() -> dict[str, list[str]]:
-    return {"setHashes": [], "topicIds": [], "promptHashes": []}
+    return {"setHashes": [], "topicIds": [], "promptHashes": [], "promptTexts": []}
 
 
 def _trim_recent(values: list[str], limit: int = 80) -> list[str]:
@@ -196,10 +199,16 @@ def _merge_question_history(
         for question in questions
         if str(question.get("prompt") or "").strip()
     ]
+    prompt_texts = [
+        str(question.get("prompt") or "").strip()
+        for question in questions
+        if str(question.get("prompt") or "").strip()
+    ]
     return {
         "setHashes": _trim_recent([*history["setHashes"], set_hash]),
         "topicIds": _trim_recent([*history["topicIds"], *topic_ids]),
         "promptHashes": _trim_recent([*history["promptHashes"], *prompt_hashes]),
+        "promptTexts": _trim_recent([*history.get("promptTexts", []), *prompt_texts], 40),
     }
 
 
@@ -294,6 +303,9 @@ class InMemoryStateStore(StateStore):
         question_hash: str,
         questions: list[dict[str, Any]],
         expires_at: datetime,
+        source: str | None = None,
+        date_key: str | None = None,
+        pool_index: int | None = None,
     ) -> None:
         async with self._lock:
             self._question_sets[set_id] = {
@@ -312,6 +324,9 @@ class InMemoryStateStore(StateStore):
                 "survey": deepcopy(survey),
                 "questionHash": question_hash,
                 "questions": deepcopy(questions),
+                "source": source,
+                "dateKey": date_key,
+                "poolIndex": pool_index,
                 "expiresAt": expires_at,
                 "createdAt": datetime.now(UTC),
                 "updatedAt": datetime.now(UTC),
@@ -683,6 +698,9 @@ class FirestoreStateStore(StateStore):
         question_hash: str,
         questions: list[dict[str, Any]],
         expires_at: datetime,
+        source: str | None = None,
+        date_key: str | None = None,
+        pool_index: int | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._client.collection("questionSets").document(set_id).set,
@@ -702,6 +720,9 @@ class FirestoreStateStore(StateStore):
                 "survey": survey,
                 "questionHash": question_hash,
                 "questions": questions,
+                "source": source,
+                "dateKey": date_key,
+                "poolIndex": pool_index,
                 "expiresAt": expires_at,
                 "createdAt": datetime.now(UTC),
                 "updatedAt": datetime.now(UTC),

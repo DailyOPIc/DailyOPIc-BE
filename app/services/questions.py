@@ -14,7 +14,7 @@ from app.models.api import (
     QuestionType,
     SurveyQuestionType,
 )
-from app.services.difficulty import expected_target_level
+from app.services.difficulty import adjusted_level, expected_target_level
 
 
 LEVEL_ORDER = list(OPIcLevel)
@@ -271,6 +271,20 @@ def validate_practice_blueprint(questions: list[GeneratedQuestion]) -> None:
         raise ValueError("practice tail must contain questions 8 through 10")
 
 
+def validate_daily_pool(questions: list[GeneratedQuestion]) -> None:
+    if [item.number for item in questions] != list(range(2, 16)):
+        raise ValueError("daily pool must contain ordered numbers 2 through 15")
+    if any(item.type is QuestionType.INTRODUCTION for item in questions):
+        raise ValueError("daily pool must not include introduction questions")
+    for item in questions:
+        prompt = item.prompt.lower()
+        if "introduce yourself" in prompt or "self introduction" in prompt:
+            raise ValueError("daily pool must not include self-introduction prompts")
+    prompt_hashes = [prompt_hash(item.prompt) for item in questions]
+    if len(prompt_hashes) != len(set(prompt_hashes)):
+        raise ValueError("daily pool contains duplicate prompts")
+
+
 class FallbackQuestionGenerator:
     def __init__(self, repository: QuestionPatternRepository) -> None:
         self._repository = repository
@@ -368,17 +382,8 @@ class FallbackQuestionGenerator:
 
     @staticmethod
     def _intro_prompt(level: int) -> str:
-        if level <= 1:
-            return "Please introduce yourself."
-        if level == 2:
-            return "Please introduce yourself. Tell me about your daily life."
-        if level == 3:
-            return "Please introduce yourself. Explain one thing you usually enjoy."
-        if level == 4:
-            return "Please introduce yourself. Describe your daily life and one important interest."
-        if level == 5:
-            return "Please introduce yourself. Describe your daily life and the roles that matter to you. Explain one experience that shows your personality."
-        return "Please introduce yourself in detail. Explain your daily life, interests, and responsibilities. Describe how these things have influenced the way you communicate."
+        del level
+        return "Introduce yourself."
 
     def _generated_question(
         self,
@@ -654,6 +659,65 @@ class FallbackQuestionGenerator:
             )
             for index, (number, question_type) in enumerate(zip(range(8, 11), sequence))
         ]
+
+    def daily_pool(
+        self,
+        initial_level: int,
+        background: BackgroundProfile,
+        survey: BackgroundSurvey | None = None,
+        adjustment: DifficultyAdjustment | str | None = None,
+    ) -> list[GeneratedQuestion]:
+        level = adjusted_level(initial_level, adjustment)
+        survey = survey or self._survey_from_background(background)
+        topics = self._survey_topics(survey)
+        sequence = [
+            SurveyQuestionType.DESCRIPTION,
+            SurveyQuestionType.ROUTINE,
+            SurveyQuestionType.PAST_EXPERIENCE,
+            SurveyQuestionType.COMPARISON,
+            SurveyQuestionType.ROLEPLAY,
+            SurveyQuestionType.PROBLEM_SOLVING,
+            SurveyQuestionType.OPINION,
+            SurveyQuestionType.DESCRIPTION,
+            SurveyQuestionType.PAST_EXPERIENCE,
+            SurveyQuestionType.COMPARISON,
+            SurveyQuestionType.ROLEPLAY,
+            SurveyQuestionType.PROBLEM_SOLVING,
+            SurveyQuestionType.OPINION,
+            SurveyQuestionType.ROUTINE,
+        ]
+        broad_types = [
+            QuestionType.SURVEY,
+            QuestionType.SURVEY,
+            QuestionType.SURVEY,
+            QuestionType.COMPARISON,
+            QuestionType.ROLEPLAY,
+            QuestionType.ROLEPLAY,
+            QuestionType.ADVANCED,
+            QuestionType.UNEXPECTED,
+            QuestionType.UNEXPECTED,
+            QuestionType.COMPARISON,
+            QuestionType.ROLEPLAY,
+            QuestionType.ROLEPLAY,
+            QuestionType.ADVANCED,
+            QuestionType.UNEXPECTED,
+        ]
+        questions: list[GeneratedQuestion] = []
+        for index, number in enumerate(range(2, 16)):
+            base_topic = topics[index % len(topics)]
+            topic_id = base_topic if index < len(topics) else f"{base_topic}_daily_{number}"
+            questions.append(
+                self._generated_question(
+                    number=number,
+                    broad_type=broad_types[index],
+                    combo_id=None,
+                    level=level,
+                    topic_id=topic_id,
+                    category="daily",
+                    requested_type=sequence[index],
+                )
+            )
+        return questions
 
     def practice(
         self, target_level: OPIcLevel, background: BackgroundProfile, count: int = 10

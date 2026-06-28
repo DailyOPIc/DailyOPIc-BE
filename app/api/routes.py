@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -33,6 +34,7 @@ from app.models.api import (
     MockEvaluationManifest,
     MockExamRequest,
     PracticeEvaluation,
+    PracticeRefreshRequest,
     PracticeSetRequest,
     QuestionSetAdjustmentRequest,
     QuestionSetResponse,
@@ -88,6 +90,14 @@ def _request_id(value: str | None) -> str:
 
 def _uid_hash(uid: str) -> str:
     return hashlib.sha256(uid.encode()).hexdigest()[:12]
+
+
+def _daily_free_set_id(uid: str, date_key: str) -> str:
+    return hashlib.sha256(f"{uid}:practice:{date_key}:free".encode()).hexdigest()
+
+
+def _stable_json(value: dict[str, object] | None) -> str:
+    return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentResponse:
@@ -197,6 +207,156 @@ async def _ensure_initial_level(
         _target_level_change_required(
             "Self Assessment 단계를 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
         )
+
+
+def _daily_record_matches(
+    record: dict[str, object],
+    *,
+    initial_level: int,
+    background: dict[str, object],
+    survey: dict[str, object] | None,
+    date_key: str,
+) -> bool:
+    return (
+        record.get("source") == "free"
+        and record.get("dateKey") == date_key
+        and int(record.get("initialLevel") or 0) == initial_level
+        and _stable_json(record.get("background")) == _stable_json(background)
+        and _stable_json(record.get("survey")) == _stable_json(survey)
+    )
+
+
+async def _create_daily_pool(
+    request: Request,
+    user: CurrentUser,
+    payload: PracticeSetRequest,
+    *,
+    adjustment: DifficultyAdjustment,
+    source: str,
+    date_key: str,
+    pool_index: int,
+    set_id: str | None = None,
+) -> QuestionSetResponse:
+    initial_level = _request_initial_level(payload)
+    effective_level = adjusted_level(initial_level, adjustment)
+    expected_level = expected_target_level(effective_level)
+    await _ensure_initial_level(request, user, initial_level)
+    uid_hash = _uid_hash(user.uid)
+    history = await request.app.state.state_store.get_question_history(
+        uid=user.uid,
+        mode="practice",
+    )
+    logger.info(
+        "question generation requested mode=practice kind=daily_pool uidHash=%s "
+        "initialLevel=%s adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s "
+        "source=%s mockAI=%s model=%s recentSetCount=%s recentTopicCount=%s "
+        "recentPromptCount=%s",
+        uid_hash,
+        initial_level,
+        adjustment.value,
+        effective_level_code(initial_level, adjustment),
+        expected_level.value,
+        source,
+        request.app.state.settings.mock_ai,
+        request.app.state.ai_service.model,
+        len(history.get("setHashes", [])),
+        len(history.get("topicIds", [])),
+        len(history.get("promptHashes", [])),
+    )
+    try:
+        generation = await request.app.state.ai_service.generate_daily_pool(
+            initial_level,
+            payload.background,
+            payload.survey,
+            adjustment=adjustment,
+            history=history,
+        )
+    except AIQuestionGenerationError as error:
+        logger.exception(
+            "question generation failed mode=practice kind=daily_pool uidHash=%s "
+            "initialLevel=%s adjustment=%s model=%s",
+            uid_hash,
+            initial_level,
+            adjustment.value,
+            request.app.state.ai_service.model,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_question_generation_failed",
+                "message": "AI 질문 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            },
+        ) from error
+
+    questions = generation.questions
+    saved_set_id = set_id or str(uuid.uuid4())
+    serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
+    set_hash = question_set_hash(serialized)
+    await request.app.state.state_store.save_question_set(
+        uid=user.uid,
+        set_id=saved_set_id,
+        mode="practice",
+        target_level=expected_level.value,
+        initial_level=initial_level,
+        adjustment=adjustment.value,
+        effective_level=effective_level,
+        effective_level_code=effective_level_code(initial_level, adjustment),
+        status=QuestionSetStatus.COMPLETE.value,
+        front_question_count=0,
+        background=payload.background.model_dump(mode="json"),
+        survey=payload.survey.model_dump(mode="json") if payload.survey else None,
+        question_hash=set_hash,
+        questions=serialized,
+        expires_at=datetime.now(UTC) + timedelta(days=2),
+        source=source,
+        date_key=date_key,
+        pool_index=pool_index,
+    )
+    await request.app.state.state_store.record_question_history(
+        uid=user.uid,
+        mode="practice",
+        set_hash=set_hash,
+        questions=serialized,
+    )
+    topic_ids = [str(item.get("topicId") or "") for item in serialized]
+    prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
+    usage = generation.usage
+    logger.info(
+        "question generation succeeded mode=practice kind=daily_pool uidHash=%s "
+        "initialLevel=%s adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s "
+        "provider=%s model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s "
+        "source=%s topicIds=%s promptHashes=%s inputTokens=%s cachedInputTokens=%s "
+        "outputTokens=%s reasoningTokens=%s totalTokens=%s",
+        uid_hash,
+        initial_level,
+        adjustment.value,
+        effective_level_code(initial_level, adjustment),
+        expected_level.value,
+        generation.provider,
+        request.app.state.ai_service.model,
+        generation.openai_response_id,
+        generation.fallback_used,
+        set_hash,
+        source,
+        topic_ids,
+        prompt_hashes,
+        usage.input_tokens if usage else None,
+        usage.cached_input_tokens if usage else None,
+        usage.output_tokens if usage else None,
+        usage.reasoning_tokens if usage else None,
+        usage.total_tokens if usage else None,
+    )
+    return _question_set_response(
+        set_id=saved_set_id,
+        set_hash=set_hash,
+        questions=questions,
+        model_version=request.app.state.ai_service.model,
+        fallback_used=generation.fallback_used,
+        initial_level=initial_level,
+        adjustment=adjustment,
+        effective_level=effective_level,
+        status_value=QuestionSetStatus.COMPLETE,
+    )
 
 
 @router.get("/health")
@@ -375,7 +535,78 @@ async def create_practice_set(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> QuestionSetResponse:
-    return await _create_question_set(request, user, payload, mode="practice")
+    date_key = _date_key()
+    initial_level = _request_initial_level(payload)
+    free_set_id = _daily_free_set_id(user.uid, date_key)
+    existing = await request.app.state.state_store.get_question_set(
+        uid=user.uid,
+        set_id=free_set_id,
+        mode="practice",
+    )
+    background = payload.background.model_dump(mode="json")
+    survey = payload.survey.model_dump(mode="json") if payload.survey else None
+    if existing and _daily_record_matches(
+        existing,
+        initial_level=initial_level,
+        background=background,
+        survey=survey,
+        date_key=date_key,
+    ):
+        return _question_set_response_from_record(
+            existing,
+            model_version=request.app.state.ai_service.model,
+        )
+    return await _create_daily_pool(
+        request,
+        user,
+        payload,
+        adjustment=DifficultyAdjustment.SAME,
+        source="free",
+        date_key=date_key,
+        pool_index=0,
+        set_id=free_set_id,
+    )
+
+
+@router.post("/v1/question-sets/practice/refresh", response_model=QuestionSetResponse)
+async def refresh_practice_set(
+    payload: PracticeRefreshRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> QuestionSetResponse:
+    request_id = str(uuid.uuid4())
+    date_key = _date_key()
+    try:
+        await request.app.state.state_store.reserve_practice(
+            user.uid,
+            date_key,
+            request_id,
+            request.app.state.settings.free_practice_limit,
+        )
+    except UsageLimitExceeded as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
+        ) from error
+    try:
+        response = await _create_daily_pool(
+            request,
+            user,
+            payload,
+            adjustment=payload.adjustment,
+            source="token",
+            date_key=date_key,
+            pool_index=int(datetime.now(UTC).timestamp()),
+        )
+        await request.app.state.state_store.finalize_request(
+            request_id,
+            {"setId": response.set_id, "setHash": response.set_hash},
+            request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except Exception:
+        await request.app.state.state_store.fail_request(request_id)
+        raise
 
 
 @router.post("/v1/mock-exams", response_model=QuestionSetResponse)
@@ -717,7 +948,8 @@ async def evaluate_practice(
             status_code=401,
             detail={"code": "invalid_set", "message": str(error)},
         ) from error
-    if question_number < 1 or question_number > len(questions):
+    question = next((item for item in questions if item.number == question_number), None)
+    if question is None:
         raise HTTPException(status_code=422, detail={"code": "invalid_question_number"})
 
     settings = request.app.state.settings
@@ -739,7 +971,7 @@ async def evaluate_practice(
     try:
         metrics = await request.app.state.audio_service.analyze(audio, transcript)
         result = await request.app.state.ai_service.evaluate_practice(
-            question=questions[question_number - 1],
+            question=question,
             transcript=transcript.strip(),
             target=target,
             metrics=metrics,

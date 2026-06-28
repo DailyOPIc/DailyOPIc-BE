@@ -114,22 +114,31 @@ OpenAPI 문서는 `/docs`에서 확인할 수 있습니다. 보호되는 endpoin
 
 Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. 새 요청은 `initialLevel` 1~6을 보내며, 기존 `targetLevel`만 저장된 사용자는 서버가 자동으로 단계 값으로 매핑합니다. 최초 설정과 같은 단계 재확정은 무료이고, 기존 단계에서 다른 단계로 바꿀 때는 `target_level_change` reward intent를 만들고 SSV 검증이 끝난 뒤 `rewardNonce`를 함께 보내야 합니다.
 
-문제 세트 생성은 실제 OPIc 흐름처럼 두 단계로 진행합니다.
+Daily 문제와 Mock 문제 생성은 서로 다르게 동작합니다.
 
 ```text
-POST /v1/question-sets/practice  -> Q1~Q7, status=awaiting_adjustment
-POST /v1/mock-exams              -> Q1~Q7, status=awaiting_adjustment
+POST /v1/question-sets/practice
+  -> 오늘의 무료 Daily 랜덤 풀, Q2~Q15, status=complete
+
+POST /v1/question-sets/practice/refresh
+  body: {"initialLevel":5, "adjustment":"easier|same|harder", "survey":{...}}
+  -> practice quota 1개 소모 후 새 Daily 랜덤 풀 생성
+
+POST /v1/mock-exams
+  -> Mock Q1~Q7, status=awaiting_adjustment
+
 POST /v1/question-sets/{setId}/adjustment
   body: {"adjustment":"easier|same|harder"}
+  -> Mock Q8~Q15 append
 ```
 
-Daily는 adjustment 후 10문항으로 완성되고, Mock은 adjustment 후 15문항으로 완성됩니다. 같은 `setId`에 같은 adjustment를 다시 보내면 완성된 세트를 그대로 반환하고, 다른 adjustment를 다시 보내면 `409 adjustment_already_applied`를 반환합니다.
+Daily는 자기소개 Q1을 포함하지 않습니다. 첫 Daily 풀은 매일 무료이며 같은 날 같은 조건으로 다시 요청하면 archived free pool을 반환합니다. Mock은 Q1을 항상 `Introduce yourself.`로 고정하고, Q7 이후 adjustment를 적용해 15문항으로 완성합니다. 같은 `setId`에 같은 adjustment를 다시 보내면 완성된 세트를 그대로 반환하고, 다른 adjustment를 다시 보내면 `409 adjustment_already_applied`를 반환합니다.
 
 오디오는 요청 처리 중 임시 파일로만 분석하며 OpenAI로 보내지 않습니다. 요청 처리가 끝나면 임시 오디오는 삭제됩니다.
 
 ## 사용량 정책
 
-v1에서는 일반 문제 생성 횟수는 제한하지 않고, AI 피드백/평가 호출만 quota를 사용합니다. 다만 Self Assessment 단계 변경은 새 문제 재생성을 유발하므로 보상형 광고 검증 후 허용합니다. Q7 이후 `easier/same/harder` 난이도 조정은 시험 진행의 일부이므로 별도 보상을 요구하지 않습니다. 날짜 기준은 KST `YYYYMMDD`입니다.
+v1에서는 첫 Daily 문제 풀 생성은 매일 무료입니다. Daily에서 새 랜덤 풀을 더 불러오는 refresh와 AI 피드백/평가 호출은 같은 practice quota를 공유합니다. Self Assessment 단계 변경은 새 문제 재생성을 유발하므로 보상형 광고 검증 후 허용합니다. Mock Q7 이후 `easier/same/harder` 난이도 조정은 시험 진행의 일부이므로 별도 보상을 요구하지 않습니다. 날짜 기준은 KST `YYYYMMDD`입니다.
 
 - 기본 무료 피드백: `FREE_PRACTICE_LIMIT=3`
 - 리워드 광고 1회 시 추가 피드백: `REWARD_PRACTICE_CREDITS=1`
