@@ -7,6 +7,30 @@ from app.services.state import InMemoryStateStore, RewardNotVerified, UsageLimit
 
 
 @pytest.mark.asyncio
+async def test_question_set_is_bound_to_user_and_mode() -> None:
+    store = InMemoryStateStore()
+    expires_at = datetime.now(UTC) + timedelta(minutes=30)
+    questions = [{"number": 1, "prompt": "Please introduce yourself."}]
+
+    await store.save_question_set(
+        uid="u1",
+        set_id="set-1",
+        mode="practice",
+        target_level="IH",
+        question_hash="hash-1",
+        questions=questions,
+        expires_at=expires_at,
+    )
+
+    saved = await store.get_question_set(uid="u1", set_id="set-1", mode="practice")
+
+    assert saved is not None
+    assert saved["questionHash"] == "hash-1"
+    assert await store.get_question_set(uid="u2", set_id="set-1", mode="practice") is None
+    assert await store.get_question_set(uid="u1", set_id="set-1", mode="mock") is None
+
+
+@pytest.mark.asyncio
 async def test_three_free_then_bonus_credits() -> None:
     store = InMemoryStateStore()
     for index in range(3):

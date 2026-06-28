@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import secrets
 import uuid
@@ -40,12 +39,12 @@ from app.services.admob import SSVVerificationError
 from app.services.ai import AIServiceError
 from app.services.audio import AudioValidationError
 from app.services.auth import CurrentUser, current_user
+from app.services.questions import question_set_hash
 from app.services.state import (
     RequestAlreadyProcessing,
     RewardNotVerified,
     UsageLimitExceeded,
 )
-from app.services.tokens import TokenError
 
 
 router = APIRouter()
@@ -70,16 +69,6 @@ def _request_id(value: str | None) -> str:
     return value
 
 
-def _parse_questions(raw: str) -> list[GeneratedQuestion]:
-    try:
-        return QUESTION_LIST.validate_json(raw)
-    except ValidationError as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "invalid_questions", "message": str(error)},
-        ) from error
-
-
 def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentResponse:
     purpose = reward["purpose"]
     if isinstance(purpose, str):
@@ -98,7 +87,6 @@ def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentRe
 async def health(request: Request) -> dict[str, str | bool]:
     return {
         "status": "ok",
-        "environment": request.app.state.settings.environment,
         "mockAI": request.app.state.settings.mock_ai,
     }
 
@@ -120,18 +108,19 @@ async def _create_question_set(
         )
     set_id = str(uuid.uuid4())
     serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
-    set_hash = request.app.state.token_service.question_hash(serialized)
-    token = request.app.state.token_service.issue(
+    set_hash = question_set_hash(serialized)
+    await request.app.state.state_store.save_question_set(
         uid=user.uid,
         set_id=set_id,
         mode=mode,
         target_level=payload.target_level.value,
+        question_hash=set_hash,
         questions=serialized,
-        ttl_seconds=86_400 if mode == "practice" else 7 * 86_400,
+        expires_at=datetime.now(UTC)
+        + timedelta(seconds=86_400 if mode == "practice" else 7 * 86_400),
     )
     return QuestionSetResponse(
         setId=set_id,
-        setToken=token,
         setHash=set_hash,
         questions=questions,
         modelVersion=request.app.state.ai_service.model,
@@ -182,7 +171,6 @@ async def create_reward_intent(
     settings = request.app.state.settings
     nonce = secrets.token_urlsafe(32)
     expires_at = datetime.now(UTC) + timedelta(minutes=30)
-    auto_verify = settings.debug_reward_auto_verify and not settings.is_production
     try:
         reward = await request.app.state.state_store.create_reward_intent(
             nonce=nonce,
@@ -191,7 +179,7 @@ async def create_reward_intent(
             session_hash=payload.session_hash,
             date_key=_date_key(),
             expires_at=expires_at,
-            auto_verify=auto_verify,
+            auto_verify=False,
             practice_credit_amount=settings.reward_practice_credits,
             max_daily_reward_count=settings.max_daily_reward_count,
         )
@@ -222,38 +210,6 @@ async def reward_status(
     return _reward_response(reward, user.uid)
 
 
-@router.post("/v1/ad-rewards/{nonce}/client-complete", response_model=RewardIntentResponse)
-async def complete_reward_from_client(
-    nonce: str,
-    request: Request,
-    user: Annotated[CurrentUser, Depends(current_user)],
-) -> RewardIntentResponse:
-    settings = request.app.state.settings
-    if settings.admob_ssv_required:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "ssv_required",
-                "message": "Reward must be verified by AdMob server-side verification.",
-            },
-        )
-
-    reward = await request.app.state.state_store.get_reward_intent(nonce, user.uid)
-    if not reward:
-        raise HTTPException(status_code=404, detail={"code": "reward_not_found"})
-    if reward["status"] == "verified":
-        return _reward_response(reward, user.uid)
-    try:
-        verified = await request.app.state.state_store.verify_reward(
-            nonce=nonce,
-            transaction_id=f"client:{nonce}",
-            practice_credit_amount=settings.reward_practice_credits,
-        )
-    except RewardNotVerified as error:
-        raise HTTPException(status_code=400, detail={"code": "reward_not_verified"}) from error
-    return _reward_response(verified, user.uid)
-
-
 @router.get("/v1/admob/ssv", response_class=PlainTextResponse)
 async def admob_ssv(request: Request) -> PlainTextResponse:
     try:
@@ -279,26 +235,29 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
 async def evaluate_practice(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
-    question_set_json: Annotated[str, Form(alias="questionSet")],
+    set_id: Annotated[str, Form(alias="setId")],
     question_number: Annotated[int, Form(alias="questionNumber")],
     transcript: Annotated[str, Form(min_length=1, max_length=12_000)],
     target_level: Annotated[str, Form(alias="targetLevel")],
-    set_token: Annotated[str, Form(alias="setToken")],
     audio: Annotated[UploadFile | None, File()] = None,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> PracticeEvaluation:
     request_id = _request_id(idempotency_key)
-    questions = _parse_questions(question_set_json)
+    try:
+        target = request.app.state.level_adapter.validate_python(target_level)
+        question_set = await request.app.state.state_store.get_question_set(
+            uid=user.uid, set_id=set_id, mode="practice"
+        )
+        if not question_set or question_set.get("targetLevel") != target.value:
+            raise ValueError("question set not found")
+        questions = QUESTION_LIST.validate_python(question_set["questions"])
+    except (ValueError, ValidationError) as error:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "invalid_set", "message": str(error)},
+        ) from error
     if question_number < 1 or question_number > len(questions):
         raise HTTPException(status_code=422, detail={"code": "invalid_question_number"})
-    serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
-    try:
-        request.app.state.token_service.verify(
-            set_token, uid=user.uid, mode="practice", questions=serialized
-        )
-        target = request.app.state.level_adapter.validate_python(target_level)
-    except (TokenError, ValidationError) as error:
-        raise HTTPException(status_code=401, detail={"code": "invalid_set", "message": str(error)}) from error
 
     settings = request.app.state.settings
     try:
@@ -326,12 +285,15 @@ async def evaluate_practice(
         )
         serialized_result = result.model_dump(by_alias=True, mode="json")
         await request.app.state.state_store.finalize_request(
-            request_id, serialized_result, settings.request_result_ttl_hours
+            request_id, serialized_result, request.app.state.request_result_ttl_hours
         )
         return result
     except AudioValidationError as error:
         await request.app.state.state_store.fail_request(request_id)
-        raise HTTPException(status_code=422, detail={"code": "invalid_audio", "message": str(error)}) from error
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_audio", "message": str(error)},
+        ) from error
     except AIServiceError as error:
         await request.app.state.state_store.fail_request(request_id)
         raise HTTPException(
@@ -363,17 +325,24 @@ async def evaluate_mock(
     try:
         manifest = MockEvaluationManifest.model_validate_json(manifest_json)
     except ValidationError as error:
-        raise HTTPException(status_code=422, detail={"code": "invalid_manifest", "message": str(error)}) from error
-    serialized = [item.model_dump(by_alias=True, mode="json") for item in manifest.questions]
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_manifest", "message": str(error)},
+        ) from error
     try:
-        token_payload = request.app.state.token_service.verify(
-            manifest.set_token, uid=user.uid, mode="mock", questions=serialized
+        question_set = await request.app.state.state_store.get_question_set(
+            uid=user.uid, set_id=manifest.set_id, mode="mock"
         )
-    except TokenError as error:
-        raise HTTPException(status_code=401, detail={"code": "invalid_set", "message": str(error)}) from error
-
-    settings = request.app.state.settings
-    if settings.is_production and len(audio_files) != 15:
+        if not question_set or question_set.get("targetLevel") != manifest.target_level.value:
+            raise ValueError("question set not found")
+        questions = QUESTION_LIST.validate_python(question_set["questions"])
+        question_hash = str(question_set["questionHash"])
+    except (ValueError, ValidationError) as error:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "invalid_set", "message": str(error)},
+        ) from error
+    if len(audio_files) != 15:
         raise HTTPException(
             status_code=422,
             detail={"code": "missing_audio", "message": "All 15 audio files are required."},
@@ -383,7 +352,7 @@ async def evaluate_mock(
             user.uid,
             request_id,
             manifest.reward_nonce,
-            str(token_payload["questionHash"]),
+            question_hash,
         )
     except RewardNotVerified as error:
         raise HTTPException(
@@ -410,19 +379,22 @@ async def evaluate_mock(
             ]
         )
         result = await request.app.state.ai_service.evaluate_mock(
-            questions=manifest.questions,
+            questions=questions,
             transcripts=[item.transcript for item in manifest.answers],
             target=manifest.target_level,
             metrics=list(metrics),
         )
         serialized_result = result.model_dump(by_alias=True, mode="json")
         await request.app.state.state_store.finalize_request(
-            request_id, serialized_result, settings.request_result_ttl_hours
+            request_id, serialized_result, request.app.state.request_result_ttl_hours
         )
         return result
     except AudioValidationError as error:
         await request.app.state.state_store.fail_request(request_id)
-        raise HTTPException(status_code=422, detail={"code": "invalid_audio", "message": str(error)}) from error
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_audio", "message": str(error)},
+        ) from error
     except AIServiceError as error:
         await request.app.state.state_store.fail_request(request_id)
         raise HTTPException(

@@ -28,10 +28,9 @@ class VerifiedReward:
 
 
 class AdMobSSVVerifier:
-    def __init__(self, *, required: bool, expected_ad_unit: str | None) -> None:
-        if required and not expected_ad_unit:
-            raise ValueError("ADMOB_REWARDED_AD_UNIT_ID is required when AdMob SSV is enabled")
-        self._required = required
+    def __init__(self, *, expected_ad_unit: str) -> None:
+        if not expected_ad_unit:
+            raise ValueError("ADMOB_REWARDED_AD_UNIT_ID is required")
         self._expected_ad_unit = expected_ad_unit
         self._keys: dict[int, str] = {}
         self._keys_expire_at = 0.0
@@ -62,25 +61,24 @@ class AdMobSSVVerifier:
         except (KeyError, ValueError, IndexError) as error:
             raise SSVVerificationError("required SSV parameters are missing") from error
 
-        if self._required:
-            marker = "&signature="
-            marker_index = raw_query.rfind(marker)
-            if marker_index < 0:
-                raise SSVVerificationError("invalid signed SSV query")
-            signed_content = raw_query[:marker_index].encode("utf-8")
-            padding = "=" * (-len(signature_text) % 4)
-            try:
-                signature = base64.urlsafe_b64decode(signature_text + padding)
-                pem = await self._get_key(key_id)
-                public_key = serialization.load_pem_public_key(pem.encode("utf-8"))
-                if not isinstance(public_key, ec.EllipticCurvePublicKey):
-                    raise SSVVerificationError("invalid SSV public key")
-                public_key.verify(signature, signed_content, ec.ECDSA(hashes.SHA256()))
-            except (ValueError, InvalidSignature) as error:
-                raise SSVVerificationError("invalid AdMob SSV signature") from error
+        marker = "&signature="
+        marker_index = raw_query.rfind(marker)
+        if marker_index < 0:
+            raise SSVVerificationError("invalid signed SSV query")
+        signed_content = raw_query[:marker_index].encode("utf-8")
+        padding = "=" * (-len(signature_text) % 4)
+        try:
+            signature = base64.urlsafe_b64decode(signature_text + padding)
+            pem = await self._get_key(key_id)
+            public_key = serialization.load_pem_public_key(pem.encode("utf-8"))
+            if not isinstance(public_key, ec.EllipticCurvePublicKey):
+                raise SSVVerificationError("invalid SSV public key")
+            public_key.verify(signature, signed_content, ec.ECDSA(hashes.SHA256()))
+        except (ValueError, InvalidSignature) as error:
+            raise SSVVerificationError("invalid AdMob SSV signature") from error
 
         ad_unit = params.get("ad_unit", [None])[0]
-        if self._expected_ad_unit and ad_unit != self._expected_ad_unit:
+        if ad_unit != self._expected_ad_unit:
             raise SSVVerificationError("unexpected rewarded ad unit")
         return VerifiedReward(
             nonce=nonce,

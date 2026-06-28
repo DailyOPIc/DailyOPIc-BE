@@ -67,6 +67,13 @@ TOPIC_LABELS = {
 SURVEY_CATEGORY_PRIORITY = {"leisure", "hobbies", "sports", "travel"}
 
 
+def question_set_hash(questions: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(
+        questions, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 class QuestionPatternRepository:
     def __init__(self, path: Path) -> None:
         self._path = path

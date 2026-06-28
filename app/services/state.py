@@ -36,6 +36,24 @@ class Reservation:
 
 class StateStore(ABC):
     @abstractmethod
+    async def save_question_set(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+        expires_at: datetime,
+    ) -> None: ...
+
+    @abstractmethod
+    async def get_question_set(
+        self, *, uid: str, set_id: str, mode: str
+    ) -> dict[str, Any] | None: ...
+
+    @abstractmethod
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]: ...
 
     @abstractmethod
@@ -95,10 +113,48 @@ class InMemoryStateStore(StateStore):
         self._requests: dict[str, dict[str, Any]] = {}
         self._rewards: dict[str, dict[str, Any]] = {}
         self._transactions: set[str] = set()
+        self._question_sets: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _usage_id(uid: str, date_key: str) -> str:
         return f"{uid}:{date_key}"
+
+    async def save_question_set(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+        expires_at: datetime,
+    ) -> None:
+        async with self._lock:
+            self._question_sets[set_id] = {
+                "uid": uid,
+                "setId": set_id,
+                "mode": mode,
+                "targetLevel": target_level,
+                "questionHash": question_hash,
+                "questions": deepcopy(questions),
+                "expiresAt": expires_at,
+                "createdAt": datetime.now(UTC),
+            }
+
+    async def get_question_set(
+        self, *, uid: str, set_id: str, mode: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            question_set = self._question_sets.get(set_id)
+            if (
+                not question_set
+                or question_set["uid"] != uid
+                or question_set["mode"] != mode
+                or question_set["expiresAt"] < datetime.now(UTC)
+            ):
+                return None
+            return deepcopy(question_set)
 
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         async with self._lock:
@@ -277,6 +333,48 @@ class FirestoreStateStore(StateStore):
     @staticmethod
     def _usage_id(uid: str, date_key: str) -> str:
         return hashlib.sha256(f"{uid}:{date_key}".encode()).hexdigest()
+
+    async def save_question_set(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+        expires_at: datetime,
+    ) -> None:
+        await asyncio.to_thread(
+            self._client.collection("questionSets").document(set_id).set,
+            {
+                "uid": uid,
+                "setId": set_id,
+                "mode": mode,
+                "targetLevel": target_level,
+                "questionHash": question_hash,
+                "questions": questions,
+                "expiresAt": expires_at,
+                "createdAt": datetime.now(UTC),
+            },
+        )
+
+    async def get_question_set(
+        self, *, uid: str, set_id: str, mode: str
+    ) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("questionSets").document(set_id).get()
+            value = snapshot.to_dict() if snapshot.exists else None
+            if (
+                not value
+                or value.get("uid") != uid
+                or value.get("mode") != mode
+                or value.get("expiresAt") < datetime.now(UTC)
+            ):
+                return None
+            return value
+
+        return await asyncio.to_thread(read)
 
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         def read() -> dict[str, int]:

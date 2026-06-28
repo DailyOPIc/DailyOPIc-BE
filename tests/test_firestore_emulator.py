@@ -16,6 +16,30 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
+async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
+    uid = f"question-set-{uuid.uuid4()}"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    set_id = f"set-{uuid.uuid4()}"
+
+    await store.save_question_set(
+        uid=uid,
+        set_id=set_id,
+        mode="practice",
+        target_level="IH",
+        question_hash="hash-1",
+        questions=[{"number": 1, "prompt": "Please introduce yourself."}],
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
+    )
+
+    saved = await store.get_question_set(uid=uid, set_id=set_id, mode="practice")
+
+    assert saved is not None
+    assert saved["questionHash"] == "hash-1"
+    assert await store.get_question_set(uid=f"{uid}-other", set_id=set_id, mode="practice") is None
+    assert await store.get_question_set(uid=uid, set_id=set_id, mode="mock") is None
+
+
+@pytest.mark.asyncio
 async def test_firestore_transaction_allows_exactly_three_parallel_free_uses() -> None:
     uid = f"emulator-{uuid.uuid4()}"
     date_key = "20260622"

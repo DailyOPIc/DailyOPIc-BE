@@ -132,7 +132,6 @@ class QuestionSetResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     set_id: str = Field(alias="setId")
-    set_token: str = Field(alias="setToken")
     set_hash: str = Field(alias="setHash")
     questions: list[GeneratedQuestion]
     model_version: str = Field(alias="modelVersion")
@@ -187,15 +186,12 @@ class MockEvaluationManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_level: OPIcLevel = Field(alias="targetLevel")
-    set_token: str = Field(alias="setToken")
+    set_id: str = Field(alias="setId", min_length=8)
     reward_nonce: str = Field(alias="rewardNonce", min_length=16)
-    questions: list[GeneratedQuestion]
     answers: list[MockAnswerManifest]
 
     @model_validator(mode="after")
     def validate_complete_exam(self) -> "MockEvaluationManifest":
-        if [question.number for question in self.questions] != list(range(1, 16)):
-            raise ValueError("questions must contain ordered numbers 1 through 15")
         if [answer.number for answer in self.answers] != list(range(1, 16)):
             raise ValueError("answers must contain ordered numbers 1 through 15")
         return self
