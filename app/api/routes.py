@@ -25,13 +25,18 @@ from fastapi.responses import PlainTextResponse
 from pydantic import TypeAdapter, ValidationError
 
 from app.models.api import (
+    BackgroundProfile,
+    BackgroundSurvey,
+    DifficultyAdjustment,
     GeneratedQuestion,
     MockEvaluation,
     MockEvaluationManifest,
     MockExamRequest,
     PracticeEvaluation,
     PracticeSetRequest,
+    QuestionSetAdjustmentRequest,
     QuestionSetResponse,
+    QuestionSetStatus,
     RewardIntentRequest,
     RewardIntentResponse,
     RewardPurpose,
@@ -43,8 +48,15 @@ from app.services.admob import SSVVerificationError
 from app.services.ai import AIQuestionGenerationError, AIServiceError
 from app.services.audio import AudioValidationError
 from app.services.auth import CurrentUser, current_user
+from app.services.difficulty import (
+    adjusted_level,
+    effective_level_code,
+    expected_target_level,
+    initial_level_from_target,
+)
 from app.services.questions import prompt_hash, question_set_hash
 from app.services.state import (
+    AdjustmentAlreadyApplied,
     RequestAlreadyProcessing,
     RewardNotVerified,
     UsageLimitExceeded,
@@ -99,23 +111,91 @@ def _target_level_change_required(message: str) -> None:
     )
 
 
-async def _ensure_target_level(
-    request: Request, user: CurrentUser, target_level: str
+def _request_initial_level(payload: PracticeSetRequest | TargetLevelRequest) -> int:
+    if payload.initial_level is not None:
+        return payload.initial_level
+    value = initial_level_from_target(payload.target_level)
+    if value is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_initial_level", "message": "initialLevel is required"},
+        )
+    return value
+
+
+def _question_set_response(
+    *,
+    set_id: str,
+    set_hash: str,
+    questions: list[GeneratedQuestion],
+    model_version: str,
+    fallback_used: bool,
+    initial_level: int,
+    adjustment: DifficultyAdjustment | None,
+    effective_level: int,
+    status_value: QuestionSetStatus,
+) -> QuestionSetResponse:
+    return QuestionSetResponse(
+        setId=set_id,
+        setHash=set_hash,
+        questions=questions,
+        modelVersion=model_version,
+        generatedAt=datetime.now(UTC),
+        fallbackUsed=fallback_used,
+        initialLevel=initial_level,
+        adjustment=adjustment,
+        effectiveLevel=effective_level,
+        effectiveLevelCode=effective_level_code(
+            initial_level, adjustment or DifficultyAdjustment.SAME
+        ),
+        expectedTargetLevel=expected_target_level(effective_level),
+        status=status_value,
+        requiresAdjustmentAfter=7
+        if status_value is QuestionSetStatus.AWAITING_ADJUSTMENT
+        else None,
+        isComplete=status_value is QuestionSetStatus.COMPLETE,
+    )
+
+
+def _question_set_response_from_record(
+    record: dict[str, object],
+    *,
+    model_version: str,
+) -> QuestionSetResponse:
+    questions = QUESTION_LIST.validate_python(record["questions"])
+    adjustment_value = record.get("adjustment")
+    adjustment = DifficultyAdjustment(str(adjustment_value)) if adjustment_value else None
+    status_value = QuestionSetStatus(str(record.get("status") or "complete"))
+    return _question_set_response(
+        set_id=str(record["setId"]),
+        set_hash=str(record["questionHash"]),
+        questions=questions,
+        model_version=model_version,
+        fallback_used=False,
+        initial_level=int(record["initialLevel"]),
+        adjustment=adjustment,
+        effective_level=int(record["effectiveLevel"]),
+        status_value=status_value,
+    )
+
+
+async def _ensure_initial_level(
+    request: Request, user: CurrentUser, initial_level: int
 ) -> None:
-    current = await request.app.state.state_store.get_target_level(user.uid)
-    if current is None:
+    profile = await request.app.state.state_store.get_learning_profile(user.uid)
+    if profile is None:
         try:
-            await request.app.state.state_store.set_target_level(
+            await request.app.state.state_store.set_initial_level(
                 uid=user.uid,
-                target_level=target_level,
+                initial_level=initial_level,
                 reward_nonce=None,
             )
         except RewardNotVerified as error:
             _target_level_change_required(str(error))
         return
-    if current != target_level:
+    if int(profile["initialLevel"]) != initial_level:
         _target_level_change_required(
-            "목표 등급을 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
+            "Self Assessment 단계를 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
         )
 
 
@@ -134,18 +214,25 @@ async def _create_question_set(
     *,
     mode: str,
 ) -> QuestionSetResponse:
-    await _ensure_target_level(request, user, payload.target_level.value)
+    initial_level = _request_initial_level(payload)
+    effective_level = initial_level
+    expected_level = expected_target_level(effective_level)
+    await _ensure_initial_level(request, user, initial_level)
     uid_hash = _uid_hash(user.uid)
     history = await request.app.state.state_store.get_question_history(
         uid=user.uid,
         mode=mode,
     )
     logger.info(
-        "question generation requested mode=%s uidHash=%s targetLevel=%s mockAI=%s "
+        "question generation requested mode=%s stage=front uidHash=%s initialLevel=%s "
+        "adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s mockAI=%s "
         "model=%s recentSetCount=%s recentTopicCount=%s recentPromptCount=%s",
         mode,
         uid_hash,
-        payload.target_level.value,
+        initial_level,
+        None,
+        effective_level_code(initial_level, DifficultyAdjustment.SAME),
+        expected_level.value,
         request.app.state.settings.mock_ai,
         request.app.state.ai_service.model,
         len(history.get("setHashes", [])),
@@ -155,23 +242,25 @@ async def _create_question_set(
     try:
         if mode == "mock":
             generation = await request.app.state.ai_service.generate_mock(
-                payload.target_level,
+                initial_level,
                 payload.background,
                 getattr(payload, "survey", None),
+                stage="front",
                 history=history,
             )
         else:
             generation = await request.app.state.ai_service.generate_practice(
-                payload.target_level,
+                initial_level,
                 payload.background,
+                stage="front",
                 history=history,
             )
     except AIQuestionGenerationError as error:
         logger.exception(
-            "question generation failed mode=%s uidHash=%s targetLevel=%s model=%s",
+            "question generation failed mode=%s stage=front uidHash=%s initialLevel=%s model=%s",
             mode,
             uid_hash,
-            payload.target_level.value,
+            initial_level,
             request.app.state.ai_service.model,
         )
         raise HTTPException(
@@ -189,7 +278,17 @@ async def _create_question_set(
         uid=user.uid,
         set_id=set_id,
         mode=mode,
-        target_level=payload.target_level.value,
+        target_level=expected_level.value,
+        initial_level=initial_level,
+        adjustment=None,
+        effective_level=effective_level,
+        effective_level_code=effective_level_code(initial_level, DifficultyAdjustment.SAME),
+        status=QuestionSetStatus.AWAITING_ADJUSTMENT.value,
+        front_question_count=7,
+        background=payload.background.model_dump(mode="json"),
+        survey=getattr(payload, "survey", None).model_dump(mode="json")
+        if getattr(payload, "survey", None)
+        else None,
         question_hash=set_hash,
         questions=serialized,
         expires_at=datetime.now(UTC)
@@ -205,13 +304,17 @@ async def _create_question_set(
     prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
     usage = generation.usage
     logger.info(
-        "question generation succeeded mode=%s uidHash=%s targetLevel=%s provider=%s "
+        "question generation succeeded mode=%s stage=front uidHash=%s initialLevel=%s "
+        "adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s provider=%s "
         "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s topicIds=%s "
         "promptHashes=%s inputTokens=%s cachedInputTokens=%s outputTokens=%s "
         "reasoningTokens=%s totalTokens=%s",
         mode,
         uid_hash,
-        payload.target_level.value,
+        initial_level,
+        None,
+        effective_level_code(initial_level, DifficultyAdjustment.SAME),
+        expected_level.value,
         generation.provider,
         request.app.state.ai_service.model,
         generation.openai_response_id,
@@ -225,13 +328,16 @@ async def _create_question_set(
         usage.reasoning_tokens if usage else None,
         usage.total_tokens if usage else None,
     )
-    return QuestionSetResponse(
-        setId=set_id,
-        setHash=set_hash,
+    return _question_set_response(
+        set_id=set_id,
+        set_hash=set_hash,
         questions=questions,
-        modelVersion=request.app.state.ai_service.model,
-        generatedAt=datetime.now(UTC),
-        fallbackUsed=generation.fallback_used,
+        model_version=request.app.state.ai_service.model,
+        fallback_used=generation.fallback_used,
+        initial_level=initial_level,
+        adjustment=None,
+        effective_level=effective_level,
+        status_value=QuestionSetStatus.AWAITING_ADJUSTMENT,
     )
 
 
@@ -241,10 +347,11 @@ async def update_target_level(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> TargetLevelResponse:
+    initial_level = _request_initial_level(payload)
     try:
-        result = await request.app.state.state_store.set_target_level(
+        result = await request.app.state.state_store.set_initial_level(
             uid=user.uid,
-            target_level=payload.target_level.value,
+            initial_level=initial_level,
             reward_nonce=payload.reward_nonce,
         )
     except RewardNotVerified as error:
@@ -252,6 +359,11 @@ async def update_target_level(
     return TargetLevelResponse(
         targetLevel=result["targetLevel"],
         previousTargetLevel=result["previousTargetLevel"],
+        initialLevel=result["initialLevel"],
+        previousInitialLevel=result["previousInitialLevel"],
+        latestAdjustment=result["latestAdjustment"],
+        effectiveLevel=result["effectiveLevel"],
+        effectiveLevelCode=result["effectiveLevelCode"],
         changed=result["changed"],
         rewardConsumed=result["rewardConsumed"],
     )
@@ -273,6 +385,178 @@ async def create_mock_exam(
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> QuestionSetResponse:
     return await _create_question_set(request, user, payload, mode="mock")
+
+
+@router.post("/v1/question-sets/{set_id}/adjustment", response_model=QuestionSetResponse)
+async def apply_question_set_adjustment(
+    set_id: str,
+    payload: QuestionSetAdjustmentRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> QuestionSetResponse:
+    mode = "practice"
+    record = await request.app.state.state_store.get_question_set(
+        uid=user.uid, set_id=set_id, mode=mode
+    )
+    if record is None:
+        mode = "mock"
+        record = await request.app.state.state_store.get_question_set(
+            uid=user.uid, set_id=set_id, mode=mode
+        )
+    if record is None:
+        raise HTTPException(status_code=404, detail={"code": "question_set_not_found"})
+    current_status = str(record.get("status") or "complete")
+    current_adjustment = record.get("adjustment")
+    if current_status == QuestionSetStatus.COMPLETE.value:
+        if current_adjustment == payload.adjustment.value:
+            return _question_set_response_from_record(
+                record,
+                model_version=request.app.state.ai_service.model,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "adjustment_already_applied",
+                "message": "This question set already has a different adjustment.",
+            },
+        )
+
+    initial_level = int(record["initialLevel"])
+    effective_level = adjusted_level(initial_level, payload.adjustment)
+    code = effective_level_code(initial_level, payload.adjustment)
+    expected_level = expected_target_level(effective_level)
+    background = BackgroundProfile.model_validate(record.get("background") or {})
+    survey = (
+        BackgroundSurvey.model_validate(record["survey"])
+        if record.get("survey")
+        else None
+    )
+    history = await request.app.state.state_store.get_question_history(
+        uid=user.uid,
+        mode=mode,
+    )
+    uid_hash = _uid_hash(user.uid)
+    logger.info(
+        "question generation requested mode=%s stage=tail uidHash=%s initialLevel=%s "
+        "adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s mockAI=%s model=%s",
+        mode,
+        uid_hash,
+        initial_level,
+        payload.adjustment.value,
+        code,
+        expected_level.value,
+        request.app.state.settings.mock_ai,
+        request.app.state.ai_service.model,
+    )
+    try:
+        if mode == "mock":
+            generation = await request.app.state.ai_service.generate_mock(
+                initial_level,
+                background,
+                survey,
+                stage="tail",
+                adjustment=payload.adjustment,
+                effective_level=effective_level,
+                history=history,
+            )
+        else:
+            generation = await request.app.state.ai_service.generate_practice(
+                initial_level,
+                background,
+                stage="tail",
+                adjustment=payload.adjustment,
+                effective_level=effective_level,
+                history=history,
+            )
+    except AIQuestionGenerationError as error:
+        logger.exception(
+            "question generation failed mode=%s stage=tail uidHash=%s initialLevel=%s "
+            "adjustment=%s model=%s",
+            mode,
+            uid_hash,
+            initial_level,
+            payload.adjustment.value,
+            request.app.state.ai_service.model,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_question_generation_failed",
+                "message": "AI 질문 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            },
+        ) from error
+
+    existing_questions = QUESTION_LIST.validate_python(record["questions"])
+    questions = [*existing_questions, *generation.questions]
+    serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
+    set_hash = question_set_hash(serialized)
+    try:
+        await request.app.state.state_store.apply_question_set_adjustment(
+            uid=user.uid,
+            set_id=set_id,
+            mode=mode,
+            adjustment=payload.adjustment.value,
+            effective_level=effective_level,
+            effective_level_code=code,
+            target_level=expected_level.value,
+            question_hash=set_hash,
+            questions=serialized,
+        )
+    except AdjustmentAlreadyApplied as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "adjustment_already_applied", "message": str(error)},
+        ) from error
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "question_set_not_found"},
+        ) from error
+    await request.app.state.state_store.record_question_history(
+        uid=user.uid,
+        mode=mode,
+        set_hash=set_hash,
+        questions=serialized,
+    )
+    topic_ids = [str(item.get("topicId") or "") for item in serialized]
+    prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
+    usage = generation.usage
+    logger.info(
+        "question generation succeeded mode=%s stage=tail uidHash=%s initialLevel=%s "
+        "adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s provider=%s "
+        "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s topicIds=%s "
+        "promptHashes=%s inputTokens=%s cachedInputTokens=%s outputTokens=%s "
+        "reasoningTokens=%s totalTokens=%s",
+        mode,
+        uid_hash,
+        initial_level,
+        payload.adjustment.value,
+        code,
+        expected_level.value,
+        generation.provider,
+        request.app.state.ai_service.model,
+        generation.openai_response_id,
+        generation.fallback_used,
+        set_hash,
+        topic_ids,
+        prompt_hashes,
+        usage.input_tokens if usage else None,
+        usage.cached_input_tokens if usage else None,
+        usage.output_tokens if usage else None,
+        usage.reasoning_tokens if usage else None,
+        usage.total_tokens if usage else None,
+    )
+    return _question_set_response(
+        set_id=set_id,
+        set_hash=set_hash,
+        questions=questions,
+        model_version=request.app.state.ai_service.model,
+        fallback_used=generation.fallback_used,
+        initial_level=initial_level,
+        adjustment=payload.adjustment,
+        effective_level=effective_level,
+        status_value=QuestionSetStatus.COMPLETE,
+    )
 
 
 @router.get("/v1/usage", response_model=UsageResponse)
@@ -413,18 +697,20 @@ async def evaluate_practice(
     set_id: Annotated[str, Form(alias="setId")],
     question_number: Annotated[int, Form(alias="questionNumber")],
     transcript: Annotated[str, Form(min_length=1, max_length=12_000)],
-    target_level: Annotated[str, Form(alias="targetLevel")],
+    target_level: Annotated[str | None, Form(alias="targetLevel")] = None,
     audio: Annotated[UploadFile | None, File()] = None,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> PracticeEvaluation:
     request_id = _request_id(idempotency_key)
     try:
-        target = request.app.state.level_adapter.validate_python(target_level)
         question_set = await request.app.state.state_store.get_question_set(
             uid=user.uid, set_id=set_id, mode="practice"
         )
-        if not question_set or question_set.get("targetLevel") != target.value:
+        if not question_set:
             raise ValueError("question set not found")
+        target = request.app.state.level_adapter.validate_python(
+            question_set.get("expectedTargetLevel") or question_set.get("targetLevel")
+        )
         questions = QUESTION_LIST.validate_python(question_set["questions"])
     except (ValueError, ValidationError) as error:
         raise HTTPException(
@@ -508,8 +794,11 @@ async def evaluate_mock(
         question_set = await request.app.state.state_store.get_question_set(
             uid=user.uid, set_id=manifest.set_id, mode="mock"
         )
-        if not question_set or question_set.get("targetLevel") != manifest.target_level.value:
+        if not question_set:
             raise ValueError("question set not found")
+        target = request.app.state.level_adapter.validate_python(
+            question_set.get("expectedTargetLevel") or question_set.get("targetLevel")
+        )
         questions = QUESTION_LIST.validate_python(question_set["questions"])
         question_hash = str(question_set["questionHash"])
     except (ValueError, ValidationError) as error:
@@ -556,7 +845,7 @@ async def evaluate_mock(
         result = await request.app.state.ai_service.evaluate_mock(
             questions=questions,
             transcripts=[item.transcript for item in manifest.answers],
-            target=manifest.target_level,
+            target=target,
             metrics=list(metrics),
         )
         serialized_result = result.model_dump(by_alias=True, mode="json")

@@ -28,6 +28,17 @@ class QuestionType(StrEnum):
     PRACTICE = "practice"
 
 
+class DifficultyAdjustment(StrEnum):
+    EASIER = "easier"
+    SAME = "same"
+    HARDER = "harder"
+
+
+class QuestionSetStatus(StrEnum):
+    AWAITING_ADJUSTMENT = "awaiting_adjustment"
+    COMPLETE = "complete"
+
+
 class SurveyQuestionType(StrEnum):
     DESCRIPTION = "description"
     ROUTINE = "routine"
@@ -117,11 +128,18 @@ class GeneratedQuestion(BaseModel):
 class PracticeSetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_level: OPIcLevel = Field(alias="targetLevel")
+    initial_level: int | None = Field(default=None, alias="initialLevel", ge=1, le=6)
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
     background: BackgroundProfile = Field(default_factory=BackgroundProfile)
     recent_question_hashes: list[str] = Field(
         default_factory=list, alias="recentQuestionHashes", max_length=50
     )
+
+    @model_validator(mode="after")
+    def validate_level(self) -> "PracticeSetRequest":
+        if self.initial_level is None and self.target_level is None:
+            raise ValueError("initialLevel is required")
+        return self
 
 
 class MockExamRequest(PracticeSetRequest):
@@ -137,13 +155,36 @@ class QuestionSetResponse(BaseModel):
     model_version: str = Field(alias="modelVersion")
     generated_at: datetime = Field(alias="generatedAt")
     fallback_used: bool = Field(default=False, alias="fallbackUsed")
+    initial_level: int = Field(alias="initialLevel", ge=1, le=6)
+    adjustment: DifficultyAdjustment | None = None
+    effective_level: int = Field(alias="effectiveLevel", ge=1, le=6)
+    effective_level_code: str = Field(alias="effectiveLevelCode")
+    expected_target_level: OPIcLevel = Field(alias="expectedTargetLevel")
+    status: QuestionSetStatus
+    requires_adjustment_after: int | None = Field(
+        default=None, alias="requiresAdjustmentAfter"
+    )
+    is_complete: bool = Field(alias="isComplete")
+
+
+class QuestionSetAdjustmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adjustment: DifficultyAdjustment
 
 
 class TargetLevelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_level: OPIcLevel = Field(alias="targetLevel")
+    initial_level: int | None = Field(default=None, alias="initialLevel", ge=1, le=6)
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
     reward_nonce: str | None = Field(default=None, alias="rewardNonce", min_length=16)
+
+    @model_validator(mode="after")
+    def validate_level(self) -> "TargetLevelRequest":
+        if self.initial_level is None and self.target_level is None:
+            raise ValueError("initialLevel is required")
+        return self
 
 
 class TargetLevelResponse(BaseModel):
@@ -153,6 +194,11 @@ class TargetLevelResponse(BaseModel):
     previous_target_level: OPIcLevel | None = Field(
         default=None, alias="previousTargetLevel"
     )
+    initial_level: int = Field(alias="initialLevel", ge=1, le=6)
+    previous_initial_level: int | None = Field(default=None, alias="previousInitialLevel")
+    latest_adjustment: DifficultyAdjustment = Field(alias="latestAdjustment")
+    effective_level: int = Field(alias="effectiveLevel", ge=1, le=6)
+    effective_level_code: str = Field(alias="effectiveLevelCode")
     changed: bool
     reward_consumed: bool = Field(alias="rewardConsumed")
 
@@ -203,7 +249,7 @@ class MockAnswerManifest(BaseModel):
 class MockEvaluationManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_level: OPIcLevel = Field(alias="targetLevel")
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
     set_id: str = Field(alias="setId", min_length=8)
     reward_nonce: str = Field(alias="rewardNonce", min_length=16)
     answers: list[MockAnswerManifest]

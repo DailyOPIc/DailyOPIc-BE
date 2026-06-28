@@ -245,7 +245,17 @@ def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
                 },
             },
         ).json()
+        assert len(question_set["questions"]) == 7
+        assert question_set["isComplete"] is False
+        adjusted = client.post(
+            f"/v1/question-sets/{question_set['setId']}/adjustment",
+            headers=_headers(),
+            json={"adjustment": "same"},
+        )
+        assert adjusted.status_code == 200, adjusted.text
+        question_set = adjusted.json()
         assert len(question_set["questions"]) == 15
+        assert question_set["isComplete"] is True
         assert "setToken" not in question_set
         assert "tags" not in question_set["questions"][1]
         assert {item["topicId"] for item in question_set["questions"][1:10]} >= {

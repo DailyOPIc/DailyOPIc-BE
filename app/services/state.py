@@ -12,7 +12,13 @@ import firebase_admin
 from firebase_admin import firestore as admin_firestore
 from google.cloud import firestore
 
-from app.models.api import RewardPurpose
+from app.models.api import DifficultyAdjustment, RewardPurpose
+from app.services.difficulty import (
+    adjusted_level,
+    effective_level_code,
+    expected_target_level,
+    initial_level_from_target,
+)
 from app.services.questions import prompt_hash
 
 
@@ -25,6 +31,10 @@ class RewardNotVerified(RuntimeError):
 
 
 class RequestAlreadyProcessing(RuntimeError):
+    pass
+
+
+class AdjustmentAlreadyApplied(RuntimeError):
     pass
 
 
@@ -44,6 +54,14 @@ class StateStore(ABC):
         set_id: str,
         mode: str,
         target_level: str,
+        initial_level: int,
+        adjustment: str | None,
+        effective_level: int,
+        effective_level_code: str,
+        status: str,
+        front_question_count: int,
+        background: dict[str, Any],
+        survey: dict[str, Any] | None,
         question_hash: str,
         questions: list[dict[str, Any]],
         expires_at: datetime,
@@ -74,8 +92,26 @@ class StateStore(ABC):
     async def get_target_level(self, uid: str) -> str | None: ...
 
     @abstractmethod
-    async def set_target_level(
-        self, *, uid: str, target_level: str, reward_nonce: str | None
+    async def get_learning_profile(self, uid: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def set_initial_level(
+        self, *, uid: str, initial_level: int, reward_nonce: str | None
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def apply_question_set_adjustment(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        adjustment: str,
+        effective_level: int,
+        effective_level_code: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
     ) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -175,6 +211,52 @@ def _counts_toward_daily_reward_quota(purpose: RewardPurpose) -> bool:
     return purpose is not RewardPurpose.TARGET_LEVEL_CHANGE
 
 
+def _profile_from_value(profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not profile:
+        return None
+    initial_level = profile.get("initialLevel")
+    if initial_level is None:
+        initial_level = initial_level_from_target(profile.get("targetLevel"))
+    if initial_level is None:
+        return None
+    initial_level = int(initial_level)
+    latest_adjustment = str(
+        profile.get("latestAdjustment") or DifficultyAdjustment.SAME.value
+    )
+    effective_level = adjusted_level(initial_level, latest_adjustment)
+    target_level = str(
+        profile.get("expectedTargetLevel") or expected_target_level(effective_level).value
+    )
+    return {
+        **profile,
+        "initialLevel": initial_level,
+        "latestAdjustment": latest_adjustment,
+        "effectiveLevel": effective_level,
+        "effectiveLevelCode": effective_level_code(initial_level, latest_adjustment),
+        "expectedTargetLevel": target_level,
+        "targetLevel": target_level,
+    }
+
+
+def _target_change_response(
+    *,
+    profile: dict[str, Any],
+    previous: dict[str, Any] | None,
+    reward_consumed: bool,
+) -> dict[str, Any]:
+    return {
+        "targetLevel": profile["targetLevel"],
+        "previousTargetLevel": previous["targetLevel"] if previous else None,
+        "initialLevel": profile["initialLevel"],
+        "previousInitialLevel": previous["initialLevel"] if previous else None,
+        "latestAdjustment": profile["latestAdjustment"],
+        "effectiveLevel": profile["effectiveLevel"],
+        "effectiveLevelCode": profile["effectiveLevelCode"],
+        "changed": previous is None or previous["initialLevel"] != profile["initialLevel"],
+        "rewardConsumed": reward_consumed,
+    }
+
+
 class InMemoryStateStore(StateStore):
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -201,6 +283,14 @@ class InMemoryStateStore(StateStore):
         set_id: str,
         mode: str,
         target_level: str,
+        initial_level: int,
+        adjustment: str | None,
+        effective_level: int,
+        effective_level_code: str,
+        status: str,
+        front_question_count: int,
+        background: dict[str, Any],
+        survey: dict[str, Any] | None,
         question_hash: str,
         questions: list[dict[str, Any]],
         expires_at: datetime,
@@ -211,10 +301,20 @@ class InMemoryStateStore(StateStore):
                 "setId": set_id,
                 "mode": mode,
                 "targetLevel": target_level,
+                "expectedTargetLevel": target_level,
+                "initialLevel": initial_level,
+                "adjustment": adjustment,
+                "effectiveLevel": effective_level,
+                "effectiveLevelCode": effective_level_code,
+                "status": status,
+                "frontQuestionCount": front_question_count,
+                "background": deepcopy(background),
+                "survey": deepcopy(survey),
                 "questionHash": question_hash,
                 "questions": deepcopy(questions),
                 "expiresAt": expires_at,
                 "createdAt": datetime.now(UTC),
+                "updatedAt": datetime.now(UTC),
             }
 
     async def get_question_set(
@@ -263,18 +363,21 @@ class InMemoryStateStore(StateStore):
 
     async def get_target_level(self, uid: str) -> str | None:
         async with self._lock:
-            profile = self._profiles.get(uid)
+            profile = _profile_from_value(self._profiles.get(uid))
             return str(profile["targetLevel"]) if profile else None
 
-    async def set_target_level(
-        self, *, uid: str, target_level: str, reward_nonce: str | None
+    async def get_learning_profile(self, uid: str) -> dict[str, Any] | None:
+        async with self._lock:
+            return deepcopy(_profile_from_value(self._profiles.get(uid)))
+
+    async def set_initial_level(
+        self, *, uid: str, initial_level: int, reward_nonce: str | None
     ) -> dict[str, Any]:
         async with self._lock:
             now = datetime.now(UTC)
-            profile = self._profiles.get(uid)
-            previous = str(profile["targetLevel"]) if profile else None
+            previous = _profile_from_value(self._profiles.get(uid))
             reward_consumed = False
-            if previous and previous != target_level:
+            if previous and previous["initialLevel"] != initial_level:
                 reward = self._rewards.get(reward_nonce or "")
                 if (
                     not reward
@@ -291,19 +394,97 @@ class InMemoryStateStore(StateStore):
                 reward["consumedAt"] = now
                 reward["consumedFor"] = "target_level_change"
                 reward_consumed = True
-            created_at = profile["createdAt"] if profile else now
+            created_at = previous["createdAt"] if previous and previous.get("createdAt") else now
+            profile = _profile_from_value(
+                {
+                    "uid": uid,
+                    "initialLevel": initial_level,
+                    "latestAdjustment": DifficultyAdjustment.SAME.value,
+                    "createdAt": created_at,
+                    "updatedAt": now,
+                }
+            )
+            assert profile is not None
             self._profiles[uid] = {
                 "uid": uid,
-                "targetLevel": target_level,
+                "targetLevel": profile["targetLevel"],
+                "expectedTargetLevel": profile["expectedTargetLevel"],
+                "initialLevel": profile["initialLevel"],
+                "latestAdjustment": profile["latestAdjustment"],
+                "effectiveLevel": profile["effectiveLevel"],
+                "effectiveLevelCode": profile["effectiveLevelCode"],
                 "createdAt": created_at,
                 "updatedAt": now,
             }
-            return {
-                "targetLevel": target_level,
-                "previousTargetLevel": previous,
-                "changed": previous != target_level,
-                "rewardConsumed": reward_consumed,
-            }
+            return _target_change_response(
+                profile=profile,
+                previous=previous,
+                reward_consumed=reward_consumed,
+            )
+
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        initial_level = initial_level_from_target(target_level)
+        if initial_level is None:
+            raise ValueError("invalid target level")
+        return await self.set_initial_level(
+            uid=uid,
+            initial_level=initial_level,
+            reward_nonce=reward_nonce,
+        )
+
+    async def apply_question_set_adjustment(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        adjustment: str,
+        effective_level: int,
+        effective_level_code: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        async with self._lock:
+            question_set = self._question_sets.get(set_id)
+            if (
+                not question_set
+                or question_set["uid"] != uid
+                or question_set["mode"] != mode
+                or question_set["expiresAt"] < datetime.now(UTC)
+            ):
+                raise KeyError("question set not found")
+            if question_set.get("status") == "complete":
+                if question_set.get("adjustment") == adjustment:
+                    return deepcopy(question_set)
+                raise AdjustmentAlreadyApplied("question set adjustment already applied")
+            question_set.update(
+                {
+                    "targetLevel": target_level,
+                    "expectedTargetLevel": target_level,
+                    "adjustment": adjustment,
+                    "effectiveLevel": effective_level,
+                    "effectiveLevelCode": effective_level_code,
+                    "status": "complete",
+                    "questionHash": question_hash,
+                    "questions": deepcopy(questions),
+                    "updatedAt": datetime.now(UTC),
+                }
+            )
+            profile = _profile_from_value(self._profiles.get(uid))
+            if profile:
+                self._profiles[uid] = {
+                    **self._profiles[uid],
+                    "latestAdjustment": adjustment,
+                    "effectiveLevel": effective_level,
+                    "effectiveLevelCode": effective_level_code,
+                    "expectedTargetLevel": target_level,
+                    "targetLevel": target_level,
+                    "updatedAt": datetime.now(UTC),
+                }
+            return deepcopy(question_set)
 
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
@@ -491,6 +672,14 @@ class FirestoreStateStore(StateStore):
         set_id: str,
         mode: str,
         target_level: str,
+        initial_level: int,
+        adjustment: str | None,
+        effective_level: int,
+        effective_level_code: str,
+        status: str,
+        front_question_count: int,
+        background: dict[str, Any],
+        survey: dict[str, Any] | None,
         question_hash: str,
         questions: list[dict[str, Any]],
         expires_at: datetime,
@@ -502,10 +691,20 @@ class FirestoreStateStore(StateStore):
                 "setId": set_id,
                 "mode": mode,
                 "targetLevel": target_level,
+                "expectedTargetLevel": target_level,
+                "initialLevel": initial_level,
+                "adjustment": adjustment,
+                "effectiveLevel": effective_level,
+                "effectiveLevelCode": effective_level_code,
+                "status": status,
+                "frontQuestionCount": front_question_count,
+                "background": background,
+                "survey": survey,
                 "questionHash": question_hash,
                 "questions": questions,
                 "expiresAt": expires_at,
                 "createdAt": datetime.now(UTC),
+                "updatedAt": datetime.now(UTC),
             },
         )
 
@@ -572,13 +771,20 @@ class FirestoreStateStore(StateStore):
     async def get_target_level(self, uid: str) -> str | None:
         def read() -> str | None:
             snapshot = self._client.collection("userProfiles").document(uid).get()
-            value = snapshot.to_dict() if snapshot.exists else None
+            value = _profile_from_value(snapshot.to_dict() if snapshot.exists else None)
             return str(value["targetLevel"]) if value and value.get("targetLevel") else None
 
         return await asyncio.to_thread(read)
 
-    async def set_target_level(
-        self, *, uid: str, target_level: str, reward_nonce: str | None
+    async def get_learning_profile(self, uid: str) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            return _profile_from_value(snapshot.to_dict() if snapshot.exists else None)
+
+        return await asyncio.to_thread(read)
+
+    async def set_initial_level(
+        self, *, uid: str, initial_level: int, reward_nonce: str | None
     ) -> dict[str, Any]:
         def run() -> dict[str, Any]:
             transaction = self._client.transaction()
@@ -594,11 +800,9 @@ class FirestoreStateStore(StateStore):
                 now = datetime.now(UTC)
                 profile_snapshot = profile_ref.get(transaction=transaction)
                 profile = profile_snapshot.to_dict() if profile_snapshot.exists else {}
-                previous = (
-                    str(profile["targetLevel"]) if profile and profile.get("targetLevel") else None
-                )
+                previous = _profile_from_value(profile)
                 reward_consumed = False
-                if previous and previous != target_level:
+                if previous and previous["initialLevel"] != initial_level:
                     if reward_ref is None:
                         raise RewardNotVerified(
                             "verified target level change reward is required"
@@ -620,12 +824,27 @@ class FirestoreStateStore(StateStore):
                             "verified target level change reward is required"
                         )
                     reward_consumed = True
+                updated_profile = _profile_from_value(
+                    {
+                        "uid": uid,
+                        "initialLevel": initial_level,
+                        "latestAdjustment": DifficultyAdjustment.SAME.value,
+                        "createdAt": profile.get("createdAt", now),
+                        "updatedAt": now,
+                    }
+                )
+                assert updated_profile is not None
 
                 transaction.set(
                     profile_ref,
                     {
                         "uid": uid,
-                        "targetLevel": target_level,
+                        "targetLevel": updated_profile["targetLevel"],
+                        "expectedTargetLevel": updated_profile["expectedTargetLevel"],
+                        "initialLevel": updated_profile["initialLevel"],
+                        "latestAdjustment": updated_profile["latestAdjustment"],
+                        "effectiveLevel": updated_profile["effectiveLevel"],
+                        "effectiveLevelCode": updated_profile["effectiveLevelCode"],
                         "createdAt": profile.get("createdAt", now),
                         "updatedAt": now,
                     },
@@ -640,12 +859,87 @@ class FirestoreStateStore(StateStore):
                             "consumedFor": "target_level_change",
                         },
                     )
-                return {
+                return _target_change_response(
+                    profile=updated_profile,
+                    previous=previous,
+                    reward_consumed=reward_consumed,
+                )
+
+            return apply(transaction)
+
+        return await asyncio.to_thread(run)
+
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        initial_level = initial_level_from_target(target_level)
+        if initial_level is None:
+            raise ValueError("invalid target level")
+        return await self.set_initial_level(
+            uid=uid,
+            initial_level=initial_level,
+            reward_nonce=reward_nonce,
+        )
+
+    async def apply_question_set_adjustment(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        adjustment: str,
+        effective_level: int,
+        effective_level_code: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        def run() -> dict[str, Any]:
+            transaction = self._client.transaction()
+            set_ref = self._client.collection("questionSets").document(set_id)
+            profile_ref = self._client.collection("userProfiles").document(uid)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                now = datetime.now(UTC)
+                snapshot = set_ref.get(transaction=transaction)
+                question_set = snapshot.to_dict() if snapshot.exists else None
+                if (
+                    not question_set
+                    or question_set.get("uid") != uid
+                    or question_set.get("mode") != mode
+                    or question_set.get("expiresAt") < now
+                ):
+                    raise KeyError("question set not found")
+                if question_set.get("status") == "complete":
+                    if question_set.get("adjustment") == adjustment:
+                        return question_set
+                    raise AdjustmentAlreadyApplied("question set adjustment already applied")
+                updates = {
                     "targetLevel": target_level,
-                    "previousTargetLevel": previous,
-                    "changed": previous != target_level,
-                    "rewardConsumed": reward_consumed,
+                    "expectedTargetLevel": target_level,
+                    "adjustment": adjustment,
+                    "effectiveLevel": effective_level,
+                    "effectiveLevelCode": effective_level_code,
+                    "status": "complete",
+                    "questionHash": question_hash,
+                    "questions": questions,
+                    "updatedAt": now,
                 }
+                transaction.update(set_ref, updates)
+                transaction.set(
+                    profile_ref,
+                    {
+                        "latestAdjustment": adjustment,
+                        "effectiveLevel": effective_level,
+                        "effectiveLevelCode": effective_level_code,
+                        "expectedTargetLevel": target_level,
+                        "targetLevel": target_level,
+                        "updatedAt": now,
+                    },
+                    merge=True,
+                )
+                return {**question_set, **updates}
 
             return apply(transaction)
 

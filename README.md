@@ -15,7 +15,7 @@
 - 사용자 식별은 iOS Keychain에 저장된 UUID를 `X-DailyOPIc-User-ID` 헤더로 전달합니다.
 - AdMob 보상은 Server-side verification callback으로만 지급합니다.
 - 질문 세트는 Firestore `questionSets`에 저장하고 `setId`로 조회합니다.
-- 목표 등급은 Firestore `userProfiles`에 저장하며, 최초 설정은 무료이고 변경은 보상형 광고 검증 후 허용합니다.
+- Self Assessment 단계는 Firestore `userProfiles`에 저장하며, 최초 설정은 무료이고 단계 변경은 보상형 광고 검증 후 허용합니다.
 
 ## 로컬 개발
 
@@ -64,11 +64,12 @@ MAX_DAILY_REWARD_COUNT=3
 
 iOS 번들 ID `com.mark.opicmobile`에 대해 Firebase App Check/App Attest를 활성화해야 합니다. Cloud Run 서비스 계정에는 Firestore 접근 권한이 필요합니다. 서비스 계정 JSON 파일은 레포지토리에 저장하지 않습니다.
 
-Firestore TTL은 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt` 필드에 설정합니다. 사용하는 컬렉션은 아래 다섯 개입니다.
+Firestore TTL은 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt` 필드에 설정합니다. 사용하는 컬렉션은 아래 여섯 개입니다.
 
 - `dailyUsage`
 - `userProfiles`
 - `questionSets`
+- `questionHistories`: 최근 `setHash`, `topicId`, `promptHash` 중복 방지용
 - `adRewardIntents`: SSV transaction replay 방지 sentinel 포함
 - `aiRequests`
 
@@ -111,19 +112,30 @@ OpenAPI 문서는 `/docs`에서 확인할 수 있습니다. 보호되는 endpoin
 - `X-Firebase-AppCheck: <App Check token>`
 - 평가 요청에는 `Idempotency-Key` 필요
 
-목표 등급은 `PUT /v1/users/me/target-level`로 저장합니다. `targetLevel`만 보내면 최초 설정 또는 같은 등급 재확정만 허용됩니다. 기존 등급에서 다른 등급으로 바꿀 때는 `target_level_change` reward intent를 만들고 SSV 검증이 끝난 뒤 `rewardNonce`를 함께 보내야 합니다.
+Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. 새 요청은 `initialLevel` 1~6을 보내며, 기존 `targetLevel`만 저장된 사용자는 서버가 자동으로 단계 값으로 매핑합니다. 최초 설정과 같은 단계 재확정은 무료이고, 기존 단계에서 다른 단계로 바꿀 때는 `target_level_change` reward intent를 만들고 SSV 검증이 끝난 뒤 `rewardNonce`를 함께 보내야 합니다.
+
+문제 세트 생성은 실제 OPIc 흐름처럼 두 단계로 진행합니다.
+
+```text
+POST /v1/question-sets/practice  -> Q1~Q7, status=awaiting_adjustment
+POST /v1/mock-exams              -> Q1~Q7, status=awaiting_adjustment
+POST /v1/question-sets/{setId}/adjustment
+  body: {"adjustment":"easier|same|harder"}
+```
+
+Daily는 adjustment 후 10문항으로 완성되고, Mock은 adjustment 후 15문항으로 완성됩니다. 같은 `setId`에 같은 adjustment를 다시 보내면 완성된 세트를 그대로 반환하고, 다른 adjustment를 다시 보내면 `409 adjustment_already_applied`를 반환합니다.
 
 오디오는 요청 처리 중 임시 파일로만 분석하며 OpenAI로 보내지 않습니다. 요청 처리가 끝나면 임시 오디오는 삭제됩니다.
 
 ## 사용량 정책
 
-v1에서는 일반 문제 생성 횟수는 제한하지 않고, AI 피드백/평가 호출만 quota를 사용합니다. 다만 목표 등급 변경은 새 문제 재생성을 유발하므로 보상형 광고 검증 후 허용합니다. 날짜 기준은 KST `YYYYMMDD`입니다.
+v1에서는 일반 문제 생성 횟수는 제한하지 않고, AI 피드백/평가 호출만 quota를 사용합니다. 다만 Self Assessment 단계 변경은 새 문제 재생성을 유발하므로 보상형 광고 검증 후 허용합니다. Q7 이후 `easier/same/harder` 난이도 조정은 시험 진행의 일부이므로 별도 보상을 요구하지 않습니다. 날짜 기준은 KST `YYYYMMDD`입니다.
 
 - 기본 무료 피드백: `FREE_PRACTICE_LIMIT=3`
 - 리워드 광고 1회 시 추가 피드백: `REWARD_PRACTICE_CREDITS=1`
 - 하루 최대 리워드 intent 수: `MAX_DAILY_REWARD_COUNT=3`
 - `MAX_DAILY_REWARD_COUNT`는 피드백 credit/모의고사 결과용 리워드 남용 방지 제한입니다.
-- 목표 등급 변경용 리워드는 피드백 credit을 지급하지 않고 변경 권한만 1회 소비하며, 위 practice reward quota로 차단하지 않습니다.
+- Self Assessment 단계 변경용 리워드는 피드백 credit을 지급하지 않고 변경 권한만 1회 소비하며, 위 practice reward quota로 차단하지 않습니다.
 
 운영 손익은 AdMob 리워드 광고 1회 실수익이 Practice 분석 1회 평균 AI 비용보다 충분히 높아야 합니다. 서버는 OpenAI 응답 usage를 로그로 남기므로, 출시 후 `inputTokens`, `outputTokens`, `reasoningTokens`를 집계해 실제 비용을 주 단위로 확인합니다.
 

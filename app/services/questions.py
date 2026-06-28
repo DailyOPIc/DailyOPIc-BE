@@ -8,11 +8,13 @@ from typing import Any
 from app.models.api import (
     BackgroundProfile,
     BackgroundSurvey,
+    DifficultyAdjustment,
     GeneratedQuestion,
     OPIcLevel,
     QuestionType,
     SurveyQuestionType,
 )
+from app.services.difficulty import expected_target_level
 
 
 LEVEL_ORDER = list(OPIcLevel)
@@ -244,6 +246,31 @@ def validate_mock_blueprint(questions: list[GeneratedQuestion]) -> None:
         raise ValueError("questions 13-15 must be unexpected, comparison, advanced")
 
 
+def validate_practice_blueprint(questions: list[GeneratedQuestion]) -> None:
+    numbers = [item.number for item in questions]
+    if numbers not in [list(range(1, 8)), list(range(8, 11)), list(range(1, 11))]:
+        raise ValueError("practice question numbering is invalid")
+    if questions and questions[0].number == 1:
+        if questions[0].type is not QuestionType.INTRODUCTION:
+            raise ValueError("practice question 1 must be introduction")
+    complete = {item.number: item for item in questions}
+    for start, end in [(2, 4), (5, 7)]:
+        group = [complete[number] for number in range(start, end + 1) if number in complete]
+        if not group:
+            continue
+        if len(group) != 3:
+            raise ValueError(f"practice questions {start}-{end} must be a full combo")
+        if any(item.type is not QuestionType.SURVEY for item in group):
+            raise ValueError(f"practice questions {start}-{end} must be survey-based")
+        if len({item.combo_id for item in group}) != 1 or group[0].combo_id is None:
+            raise ValueError(f"practice questions {start}-{end} must share one comboId")
+        if len({item.topic_id for item in group}) != 1 or group[0].topic_id is None:
+            raise ValueError(f"practice questions {start}-{end} must share one topicId")
+    tail = [complete[number] for number in range(8, 11) if number in complete]
+    if tail and len(tail) != 3:
+        raise ValueError("practice tail must contain questions 8 through 10")
+
+
 class FallbackQuestionGenerator:
     def __init__(self, repository: QuestionPatternRepository) -> None:
         self._repository = repository
@@ -278,6 +305,128 @@ class FallbackQuestionGenerator:
     @staticmethod
     def _topic_label(topic_id: str) -> str:
         return TOPIC_LABELS.get(topic_id, topic_id.replace("_", " "))
+
+    @staticmethod
+    def _level_question_type(
+        level: int, requested: SurveyQuestionType
+    ) -> SurveyQuestionType:
+        if level <= 1 and requested not in {
+            SurveyQuestionType.DESCRIPTION,
+            SurveyQuestionType.ROUTINE,
+        }:
+            return SurveyQuestionType.DESCRIPTION
+        if level <= 2 and requested in {
+            SurveyQuestionType.COMPARISON,
+            SurveyQuestionType.PROBLEM_SOLVING,
+            SurveyQuestionType.OPINION,
+        }:
+            return SurveyQuestionType.PAST_EXPERIENCE
+        if level <= 3 and requested in {
+            SurveyQuestionType.PROBLEM_SOLVING,
+            SurveyQuestionType.OPINION,
+        }:
+            return SurveyQuestionType.PAST_EXPERIENCE
+        if level <= 4 and requested is SurveyQuestionType.OPINION:
+            return SurveyQuestionType.COMPARISON
+        return requested
+
+    @staticmethod
+    def _prompt_for_level(
+        *, level: int, question_type: SurveyQuestionType, topic_label: str
+    ) -> str:
+        if level <= 1:
+            if question_type is SurveyQuestionType.ROUTINE:
+                return f"What do you usually do when you enjoy {topic_label}."
+            return f"Describe {topic_label} in your daily life."
+        if level == 2:
+            if question_type is SurveyQuestionType.PAST_EXPERIENCE:
+                return f"Tell me about a simple experience related to {topic_label}. Why do you remember it."
+            return f"Tell me about {topic_label}. Why do you like it."
+        if level == 3:
+            if question_type is SurveyQuestionType.ROUTINE:
+                return f"Explain your usual routine for {topic_label}. Give one reason why it fits your life."
+            return f"Tell me about a memorable experience with {topic_label}. Explain why it was memorable."
+        if level == 4:
+            if question_type is SurveyQuestionType.COMPARISON:
+                return f"Compare your experience with {topic_label} now and in the past. Explain what has changed."
+            return f"Tell me about a specific experience with {topic_label}. Explain the situation and why it mattered to you."
+        if level == 5:
+            if question_type is SurveyQuestionType.ROLEPLAY:
+                return f"You need information about {topic_label}. Call someone and explain your situation. Ask three detailed questions and confirm the next step."
+            if question_type is SurveyQuestionType.PROBLEM_SOLVING:
+                return f"Describe a problem you experienced with {topic_label}. Explain how you handled it. Tell me what you learned from that experience."
+            if question_type is SurveyQuestionType.COMPARISON:
+                return f"Compare two different experiences related to {topic_label}. Explain the main differences. Tell me which one was more meaningful and why."
+            return f"Describe a detailed experience related to {topic_label}. Explain the background and the result. Tell me how that experience changed your thinking."
+        if question_type is SurveyQuestionType.OPINION:
+            return f"Discuss how {topic_label} influences people or society today. Explain both advantages and disadvantages. Predict one important change in the future."
+        if question_type is SurveyQuestionType.PROBLEM_SOLVING:
+            return f"Analyze a complex problem connected to {topic_label}. Explain why the problem matters to different people. Propose a realistic solution and discuss its limits."
+        if question_type is SurveyQuestionType.ROLEPLAY:
+            return f"You are handling a complicated situation involving {topic_label}. Explain the background clearly. Negotiate a solution and confirm responsibilities."
+        return f"Discuss a complex experience related to {topic_label}. Explain how the situation developed. Analyze what it shows about people's choices or values."
+
+    @staticmethod
+    def _intro_prompt(level: int) -> str:
+        if level <= 1:
+            return "Please introduce yourself."
+        if level == 2:
+            return "Please introduce yourself. Tell me about your daily life."
+        if level == 3:
+            return "Please introduce yourself. Explain one thing you usually enjoy."
+        if level == 4:
+            return "Please introduce yourself. Describe your daily life and one important interest."
+        if level == 5:
+            return "Please introduce yourself. Describe your daily life and the roles that matter to you. Explain one experience that shows your personality."
+        return "Please introduce yourself in detail. Explain your daily life, interests, and responsibilities. Describe how these things have influenced the way you communicate."
+
+    def _generated_question(
+        self,
+        *,
+        number: int,
+        broad_type: QuestionType,
+        combo_id: str | None,
+        level: int,
+        topic_id: str,
+        category: str,
+        requested_type: SurveyQuestionType,
+    ) -> GeneratedQuestion:
+        question_type = self._level_question_type(level, requested_type)
+        topic_label = self._topic_label(topic_id)
+        return GeneratedQuestion(
+            number=number,
+            type=broad_type,
+            comboId=combo_id,
+            topic=topic_label,
+            prompt=self._prompt_for_level(
+                level=level,
+                question_type=question_type,
+                topic_label=topic_label,
+            ),
+            difficulty=expected_target_level(level),
+            rubricFocus=["task fulfillment", "organization", "supporting detail"],
+            questionType=question_type,
+            followUpPrompt=None,
+            topicId=topic_id,
+            category=category,
+            estimatedLevel=expected_target_level(level),
+        )
+
+    def _introduction(self, *, level: int) -> GeneratedQuestion:
+        return GeneratedQuestion(
+            number=1,
+            type=QuestionType.INTRODUCTION,
+            comboId=None,
+            topic="self introduction",
+            prompt=self._intro_prompt(level),
+            difficulty=expected_target_level(level),
+            rubricFocus=["warm-up", "organization", "fluency"],
+            questionType=SurveyQuestionType.DESCRIPTION,
+            followUpPrompt=None,
+            topicId="self_introduction",
+            category="introduction",
+            estimatedLevel=expected_target_level(level),
+        )
 
     @staticmethod
     def _survey_from_background(background: BackgroundProfile) -> BackgroundSurvey:
@@ -460,31 +609,160 @@ class FallbackQuestionGenerator:
             estimatedLevel=self._estimated_level(reference, target_level),
         )
 
+    def practice_front(
+        self, initial_level: int, background: BackgroundProfile
+    ) -> list[GeneratedQuestion]:
+        survey = self._survey_from_background(background)
+        topics = self._survey_topics(survey)
+        return [
+            self._introduction(level=initial_level),
+            *self._combo(
+                start=2,
+                combo_id="daily-a",
+                level=initial_level,
+                topic_id=topics[0],
+                category="survey",
+            ),
+            *self._combo(
+                start=5,
+                combo_id="daily-b",
+                level=initial_level,
+                topic_id=topics[1],
+                category="survey",
+            ),
+        ]
+
+    def practice_tail(
+        self, *, effective_level: int, background: BackgroundProfile
+    ) -> list[GeneratedQuestion]:
+        survey = self._survey_from_background(background)
+        topic = self._survey_topics(survey)[2]
+        sequence = [
+            SurveyQuestionType.PAST_EXPERIENCE,
+            SurveyQuestionType.COMPARISON,
+            SurveyQuestionType.OPINION,
+        ]
+        return [
+            self._generated_question(
+                number=number,
+                broad_type=QuestionType.UNEXPECTED,
+                combo_id=None,
+                level=effective_level,
+                topic_id=topic if index == 0 else f"unexpected_{index + 1}_{topic}",
+                category="unexpected",
+                requested_type=question_type,
+            )
+            for index, (number, question_type) in enumerate(zip(range(8, 11), sequence))
+        ]
+
     def practice(
         self, target_level: OPIcLevel, background: BackgroundProfile, count: int = 10
     ) -> list[GeneratedQuestion]:
-        sequence = self._practice_sequence(target_level)
-        used_ids: set[str] = set()
-        questions: list[GeneratedQuestion] = []
-        for index in range(count):
-            question_type = sequence[index % len(sequence)]
-            topic_id, category = self._practice_topic(question_type, index)
-            topic_label = self._topic_label(topic_id)
-            questions.append(
-                self._catalog_question(
-                    number=index + 1,
-                    broad_type=QuestionType.PRACTICE,
-                    combo_id=None,
-                    target_level=target_level,
-                    topic_id=topic_id,
-                    category=category,
-                    question_types=[question_type],
-                    fallback_prompt=(
-                        f"Talk about {topic_label}. Give clear details and one specific example."
-                    ),
-                    used_ids=used_ids,
-                )
+        initial_level = {
+            OPIcLevel.IL: 1,
+            OPIcLevel.IM1: 3,
+            OPIcLevel.IM2: 4,
+            OPIcLevel.IM3: 4,
+            OPIcLevel.IH: 5,
+            OPIcLevel.AL: 6,
+        }.get(target_level, 4)
+        questions = [
+            *self.practice_front(initial_level, background),
+            *self.practice_tail(effective_level=initial_level, background=background),
+        ]
+        return questions[:count]
+
+    def _combo(
+        self,
+        *,
+        start: int,
+        combo_id: str,
+        level: int,
+        topic_id: str,
+        category: str,
+    ) -> list[GeneratedQuestion]:
+        sequence = [
+            SurveyQuestionType.DESCRIPTION,
+            SurveyQuestionType.ROUTINE,
+            SurveyQuestionType.PAST_EXPERIENCE,
+        ]
+        return [
+            self._generated_question(
+                number=start + offset,
+                broad_type=QuestionType.SURVEY,
+                combo_id=combo_id,
+                level=level,
+                topic_id=topic_id,
+                category=category,
+                requested_type=question_type,
             )
+            for offset, question_type in enumerate(sequence)
+        ]
+
+    def mock_front(
+        self,
+        initial_level: int,
+        background: BackgroundProfile,
+        survey: BackgroundSurvey | None = None,
+    ) -> list[GeneratedQuestion]:
+        survey = survey or self._survey_from_background(background)
+        topics = self._survey_topics(survey)
+        return [
+            self._introduction(level=initial_level),
+            *self._combo(
+                start=2,
+                combo_id="survey-1",
+                level=initial_level,
+                topic_id=topics[0],
+                category="survey",
+            ),
+            *self._combo(
+                start=5,
+                combo_id="survey-2",
+                level=initial_level,
+                topic_id=topics[1],
+                category="survey",
+            ),
+        ]
+
+    def mock_tail(
+        self,
+        *,
+        effective_level: int,
+        background: BackgroundProfile,
+        survey: BackgroundSurvey | None = None,
+    ) -> list[GeneratedQuestion]:
+        survey = survey or self._survey_from_background(background)
+        topics = self._survey_topics(survey)
+        topic_c = topics[2]
+        questions = [
+            *self._combo(
+                start=8,
+                combo_id="survey-3",
+                level=effective_level,
+                topic_id=topic_c,
+                category="survey",
+            )
+        ]
+        roleplay = [
+            (11, QuestionType.ROLEPLAY, "roleplay_service", SurveyQuestionType.ROLEPLAY),
+            (12, QuestionType.ROLEPLAY, "roleplay_problem", SurveyQuestionType.PROBLEM_SOLVING),
+            (13, QuestionType.UNEXPECTED, "unexpected_daily", SurveyQuestionType.PAST_EXPERIENCE),
+            (14, QuestionType.COMPARISON, "general_comparison", SurveyQuestionType.COMPARISON),
+            (15, QuestionType.ADVANCED, "general_opinion", SurveyQuestionType.OPINION),
+        ]
+        questions.extend(
+            self._generated_question(
+                number=number,
+                broad_type=broad_type,
+                combo_id=None,
+                level=effective_level,
+                topic_id=topic_id,
+                category=broad_type.value,
+                requested_type=question_type,
+            )
+            for number, broad_type, topic_id, question_type in roleplay
+        )
         return questions
 
     def mock(

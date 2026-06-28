@@ -51,13 +51,16 @@ def test_practice_set_contains_ten_numbered_questions() -> None:
         OPIcLevel.IM2, BackgroundProfile(housing="apartment")
     )
     assert [item.number for item in questions] == list(range(1, 11))
-    assert all(item.type is QuestionType.PRACTICE for item in questions)
+    assert questions[0].type is QuestionType.INTRODUCTION
+    assert all(item.type is QuestionType.SURVEY for item in questions[1:7])
+    assert all(item.type is QuestionType.UNEXPECTED for item in questions[7:10])
+    assert {item.combo_id for item in questions[1:4]} == {"daily-a"}
+    assert {item.combo_id for item in questions[4:7]} == {"daily-b"}
     assert all(item.question_type for item in questions)
-    assert all(item.follow_up_prompt for item in questions)
     assert all(item.topic_id for item in questions)
     assert all(item.category for item in questions)
     assert all(item.estimated_level for item in questions)
-    assert SurveyQuestionType.PROBLEM_SOLVING in {item.question_type for item in questions}
+    assert SurveyQuestionType.COMPARISON in {item.question_type for item in questions}
 
 
 def test_practice_set_uses_target_level_instead_of_background_profile() -> None:
@@ -71,8 +74,10 @@ def test_practice_set_uses_target_level_instead_of_background_profile() -> None:
         OPIcLevel.IH,
         BackgroundProfile(interests=["gaming"], sports=["swimming"], travel=["overseas"]),
     )
-    assert [item.topic_id for item in first] == [item.topic_id for item in second]
     assert [item.question_type for item in first] == [item.question_type for item in second]
+    assert {item.combo_id for item in first[1:4]} == {"daily-a"}
+    assert {item.combo_id for item in second[1:4]} == {"daily-a"}
+    assert first[1].difficulty == second[1].difficulty == OPIcLevel.IH
 
 
 def test_background_survey_requires_three_multi_select_topics() -> None:

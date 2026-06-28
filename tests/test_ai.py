@@ -63,33 +63,63 @@ class GeneratedQuestionSetFixture:
 
 def practice_questions(prefix: str) -> list[GeneratedQuestion]:
     sequence = [
-        SurveyQuestionType.DESCRIPTION,
-        SurveyQuestionType.PAST_EXPERIENCE,
-        SurveyQuestionType.COMPARISON,
-        SurveyQuestionType.ROUTINE,
-        SurveyQuestionType.DESCRIPTION,
-        SurveyQuestionType.PROBLEM_SOLVING,
-        SurveyQuestionType.PAST_EXPERIENCE,
-        SurveyQuestionType.COMPARISON,
-        SurveyQuestionType.ROLEPLAY,
-        SurveyQuestionType.OPINION,
+        (1, QuestionType.INTRODUCTION, None, SurveyQuestionType.DESCRIPTION, f"{prefix}_intro"),
+        (2, QuestionType.SURVEY, "daily-a", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_a"),
+        (3, QuestionType.SURVEY, "daily-a", SurveyQuestionType.ROUTINE, f"{prefix}_topic_a"),
+        (4, QuestionType.SURVEY, "daily-a", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_a"),
+        (5, QuestionType.SURVEY, "daily-b", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_b"),
+        (6, QuestionType.SURVEY, "daily-b", SurveyQuestionType.ROUTINE, f"{prefix}_topic_b"),
+        (7, QuestionType.SURVEY, "daily-b", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_b"),
     ]
     return [
         GeneratedQuestion(
-            number=index + 1,
-            type=QuestionType.PRACTICE,
-            comboId=None,
-            topic=f"{prefix} topic {index}",
-            prompt=f"Describe {prefix} situation {index} with a detailed personal example.",
+            number=number,
+            type=broad_type,
+            comboId=combo_id,
+            topic=f"{prefix} topic {number}",
+            prompt=(
+                f"Describe {prefix} situation {number}. "
+                f"Explain the background clearly. "
+                f"Tell me why it matters to you."
+            ),
             difficulty=OPIcLevel.IH,
             rubricFocus=["task fulfillment", "organization"],
             questionType=question_type,
-            followUpPrompt=f"What changed after that {prefix} experience {index}?",
-            topicId=f"{prefix}_topic_{index}",
-            category="practice",
+            followUpPrompt=None,
+            topicId=topic_id,
+            category="survey" if broad_type is QuestionType.SURVEY else "introduction",
             estimatedLevel=OPIcLevel.IH,
         )
-        for index, question_type in enumerate(sequence)
+        for number, broad_type, combo_id, question_type, topic_id in sequence
+    ]
+
+
+def practice_tail_questions(prefix: str) -> list[GeneratedQuestion]:
+    sequence = [
+        (8, QuestionType.UNEXPECTED, None, SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_tail_a"),
+        (9, QuestionType.UNEXPECTED, None, SurveyQuestionType.COMPARISON, f"{prefix}_tail_b"),
+        (10, QuestionType.UNEXPECTED, None, SurveyQuestionType.OPINION, f"{prefix}_tail_c"),
+    ]
+    return [
+        GeneratedQuestion(
+            number=number,
+            type=broad_type,
+            comboId=combo_id,
+            topic=f"{prefix} tail {number}",
+            prompt=(
+                f"Describe {prefix} tail situation {number}. "
+                f"Explain the background clearly. "
+                f"Tell me why it matters to you."
+            ),
+            difficulty=OPIcLevel.AL,
+            rubricFocus=["task fulfillment", "organization"],
+            questionType=question_type,
+            followUpPrompt=None,
+            topicId=topic_id,
+            category="unexpected",
+            estimatedLevel=OPIcLevel.AL,
+        )
+        for number, broad_type, combo_id, question_type, topic_id in sequence
     ]
 
 
@@ -154,7 +184,7 @@ async def test_real_ai_retries_when_recent_topic_is_reused() -> None:
     duplicate = practice_questions("duplicate")
     fresh = practice_questions("fresh")
     service._client = FakeOpenAIClient([duplicate, fresh])  # type: ignore[assignment]
-    history = {"setHashes": [], "topicIds": ["duplicate_topic_0"], "promptHashes": []}
+    history = {"setHashes": [], "topicIds": ["duplicate_topic_a"], "promptHashes": []}
 
     result = await service.generate_practice(OPIcLevel.IH, BackgroundProfile(), history=history)
 
@@ -173,7 +203,7 @@ async def test_real_ai_fails_after_duplicate_retry_exhaustion() -> None:
     service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
     duplicate = practice_questions("duplicate")
     service._client = FakeOpenAIClient([duplicate, duplicate])  # type: ignore[assignment]
-    history = {"setHashes": [], "topicIds": ["duplicate_topic_0"], "promptHashes": []}
+    history = {"setHashes": [], "topicIds": ["duplicate_topic_a"], "promptHashes": []}
 
     with pytest.raises(AIQuestionGenerationError):
         await service.generate_practice(OPIcLevel.IH, BackgroundProfile(), history=history)
