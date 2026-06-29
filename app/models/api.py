@@ -28,6 +28,27 @@ class QuestionType(StrEnum):
     PRACTICE = "practice"
 
 
+class DifficultyAdjustment(StrEnum):
+    EASIER = "easier"
+    SAME = "same"
+    HARDER = "harder"
+
+
+class QuestionSetStatus(StrEnum):
+    AWAITING_ADJUSTMENT = "awaiting_adjustment"
+    COMPLETE = "complete"
+
+
+class SurveyQuestionType(StrEnum):
+    DESCRIPTION = "description"
+    ROUTINE = "routine"
+    PAST_EXPERIENCE = "past_experience"
+    COMPARISON = "comparison"
+    ROLEPLAY = "roleplay"
+    PROBLEM_SOLVING = "problem_solving"
+    OPINION = "opinion"
+
+
 class ConfidenceBand(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
@@ -45,6 +66,48 @@ class BackgroundProfile(BaseModel):
     travel: list[str] = Field(default_factory=list, max_length=8)
 
 
+class SurveyOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    topic_id: str = Field(alias="topicId", min_length=2, max_length=80)
+    label: str = Field(min_length=1, max_length=80)
+    category: str = Field(min_length=2, max_length=80)
+
+
+class BackgroundSurvey(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(min_length=2, max_length=80)
+    residence: str = Field(min_length=2, max_length=80)
+    leisure: list[str] = Field(default_factory=list, max_length=6)
+    hobbies: list[str] = Field(default_factory=list, max_length=6)
+    sports: list[str] = Field(default_factory=list, max_length=6)
+    travel: list[str] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "BackgroundSurvey":
+        selected = self.leisure + self.hobbies + self.sports + self.travel
+        if len(selected) < 3:
+            raise ValueError("at least 3 survey topics are required")
+        return self
+
+    def topic_ids(self) -> list[str]:
+        values = [
+            self.status,
+            self.residence,
+            *self.leisure,
+            *self.hobbies,
+            *self.sports,
+            *self.travel,
+        ]
+        result: list[str] = []
+        for value in values:
+            normalized = value.strip()
+            if normalized and normalized not in result:
+                result.append(normalized)
+        return result
+
+
 class GeneratedQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -55,32 +118,94 @@ class GeneratedQuestion(BaseModel):
     prompt: str = Field(min_length=8, max_length=700)
     difficulty: OPIcLevel
     rubric_focus: list[str] = Field(alias="rubricFocus", min_length=1, max_length=6)
+    question_type: SurveyQuestionType | None = Field(default=None, alias="questionType")
+    follow_up_prompt: str | None = Field(default=None, alias="followUpPrompt", max_length=500)
+    topic_id: str | None = Field(default=None, alias="topicId", max_length=80)
+    category: str | None = Field(default=None, max_length=80)
+    estimated_level: OPIcLevel | None = Field(default=None, alias="estimatedLevel")
 
 
 class PracticeSetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_level: OPIcLevel = Field(alias="targetLevel")
+    initial_level: int | None = Field(default=None, alias="initialLevel", ge=1, le=6)
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
     background: BackgroundProfile = Field(default_factory=BackgroundProfile)
+    survey: BackgroundSurvey | None = None
     recent_question_hashes: list[str] = Field(
         default_factory=list, alias="recentQuestionHashes", max_length=50
     )
 
+    @model_validator(mode="after")
+    def validate_level(self) -> "PracticeSetRequest":
+        if self.initial_level is None and self.target_level is None:
+            raise ValueError("initialLevel is required")
+        return self
+
 
 class MockExamRequest(PracticeSetRequest):
-    pass
+    survey: BackgroundSurvey | None = None
+
+
+class PracticeRefreshRequest(PracticeSetRequest):
+    adjustment: DifficultyAdjustment = DifficultyAdjustment.SAME
 
 
 class QuestionSetResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     set_id: str = Field(alias="setId")
-    set_token: str = Field(alias="setToken")
     set_hash: str = Field(alias="setHash")
     questions: list[GeneratedQuestion]
     model_version: str = Field(alias="modelVersion")
     generated_at: datetime = Field(alias="generatedAt")
     fallback_used: bool = Field(default=False, alias="fallbackUsed")
+    initial_level: int = Field(alias="initialLevel", ge=1, le=6)
+    adjustment: DifficultyAdjustment | None = None
+    effective_level: int = Field(alias="effectiveLevel", ge=1, le=6)
+    effective_level_code: str = Field(alias="effectiveLevelCode")
+    expected_target_level: OPIcLevel = Field(alias="expectedTargetLevel")
+    status: QuestionSetStatus
+    requires_adjustment_after: int | None = Field(
+        default=None, alias="requiresAdjustmentAfter"
+    )
+    is_complete: bool = Field(alias="isComplete")
+
+
+class QuestionSetAdjustmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adjustment: DifficultyAdjustment
+
+
+class TargetLevelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    initial_level: int | None = Field(default=None, alias="initialLevel", ge=1, le=6)
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
+    reward_nonce: str | None = Field(default=None, alias="rewardNonce", min_length=16)
+
+    @model_validator(mode="after")
+    def validate_level(self) -> "TargetLevelRequest":
+        if self.initial_level is None and self.target_level is None:
+            raise ValueError("initialLevel is required")
+        return self
+
+
+class TargetLevelResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    previous_target_level: OPIcLevel | None = Field(
+        default=None, alias="previousTargetLevel"
+    )
+    initial_level: int = Field(alias="initialLevel", ge=1, le=6)
+    previous_initial_level: int | None = Field(default=None, alias="previousInitialLevel")
+    latest_adjustment: DifficultyAdjustment = Field(alias="latestAdjustment")
+    effective_level: int = Field(alias="effectiveLevel", ge=1, le=6)
+    effective_level_code: str = Field(alias="effectiveLevelCode")
+    changed: bool
+    reward_consumed: bool = Field(alias="rewardConsumed")
 
 
 class EvaluationScores(BaseModel):
@@ -129,16 +254,13 @@ class MockAnswerManifest(BaseModel):
 class MockEvaluationManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_level: OPIcLevel = Field(alias="targetLevel")
-    set_token: str = Field(alias="setToken")
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
+    set_id: str = Field(alias="setId", min_length=8)
     reward_nonce: str = Field(alias="rewardNonce", min_length=16)
-    questions: list[GeneratedQuestion]
     answers: list[MockAnswerManifest]
 
     @model_validator(mode="after")
     def validate_complete_exam(self) -> "MockEvaluationManifest":
-        if [question.number for question in self.questions] != list(range(1, 16)):
-            raise ValueError("questions must contain ordered numbers 1 through 15")
         if [answer.number for answer in self.answers] != list(range(1, 16)):
             raise ValueError("answers must contain ordered numbers 1 through 15")
         return self
@@ -148,8 +270,8 @@ class PerQuestionFeedback(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     number: int = Field(ge=1, le=15)
-    feedback: str
-    sample_answer: str = Field(alias="sampleAnswer")
+    feedback: str = Field(min_length=1, max_length=180)
+    sample_answer: str = Field(alias="sampleAnswer", min_length=1, max_length=350)
 
 
 class MockEvaluation(BaseModel):
@@ -186,6 +308,7 @@ class UsageResponse(BaseModel):
 class RewardPurpose(StrEnum):
     PRACTICE_CREDITS = "practice_credits"
     MOCK_RESULT = "mock_result"
+    TARGET_LEVEL_CHANGE = "target_level_change"
 
 
 class RewardIntentRequest(BaseModel):
