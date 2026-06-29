@@ -396,6 +396,11 @@ class AIService:
                 fallback_used=True,
                 provider="catalog",
             )
+        fixed_intro: GeneratedQuestion | None = None
+        generation_blueprint = base_questions
+        if stage == "front":
+            fixed_intro = self._with_fixed_intro([base_questions[0]])[0]
+            generation_blueprint = base_questions[1:]
 
         payload = self._question_generation_payload(
             mode="mock",
@@ -404,7 +409,7 @@ class AIService:
             effective_level=level,
             adjustment=adjustment,
             background=background,
-            blueprint=base_questions,
+            blueprint=generation_blueprint,
             history=history,
             survey=survey,
         )
@@ -412,12 +417,15 @@ class AIService:
             mode="mock",
             stage=stage,
             simulation_level=level,
-            blueprint=base_questions,
+            blueprint=generation_blueprint,
             payload=payload,
             history=history,
         )
+        questions = (
+            [fixed_intro, *result.questions] if fixed_intro is not None else result.questions
+        )
         return QuestionGenerationResult(
-            questions=self._with_fixed_intro(result.questions),
+            questions=questions,
             fallback_used=result.fallback_used,
             provider=result.provider,
             openai_response_id=result.openai_response_id,
@@ -506,6 +514,20 @@ class AIService:
                 "No Q1, no introduction, and no self-introduction",
                 "Use survey-based and unexpected OPIc-style question types without combo requirements",
             ]
+        if mode == "mock" and stage == "front":
+            return [
+                "Q1 is fixed server-side as exactly 'Introduce yourself.' and must not be returned",
+                "Return exactly Q2-Q7 only",
+                "Q2-Q4 topic A combo",
+                "Q5-Q7 topic B combo",
+            ]
+        if mode == "mock":
+            return [
+                "Return exactly Q8-Q15 only",
+                "Q8-Q10 topic C combo",
+                "Q11-Q12 roleplay",
+                "Q13-Q15 unexpected, comparison, advanced",
+            ]
         if mode == "practice" and stage == "front":
             return [
                 "Q1 self introduction",
@@ -514,17 +536,7 @@ class AIService:
             ]
         if mode == "practice":
             return ["Q8-Q10 adjusted unexpected or experience questions"]
-        if stage == "front":
-            return [
-                "Q1 self introduction",
-                "Q2-Q4 topic A combo",
-                "Q5-Q7 topic B combo",
-            ]
-        return [
-            "Q8-Q10 topic C combo",
-            "Q11-Q12 roleplay",
-            "Q13-Q15 unexpected, comparison, advanced",
-        ]
+        return []
 
     async def _generate_questions_with_openai(
         self,
@@ -541,7 +553,7 @@ class AIService:
         for attempt in range(1, max_attempts + 1):
             try:
                 result = await self._structured(
-                    instructions=self._question_generation_instructions(mode),
+                    instructions=self._question_generation_instructions(mode, stage),
                     input_text=json.dumps(
                         {**payload, "attempt": attempt},
                         ensure_ascii=False,
@@ -579,7 +591,7 @@ class AIService:
         ) from last_error
 
     @staticmethod
-    def _question_generation_instructions(mode: str) -> str:
+    def _question_generation_instructions(mode: str, stage: str) -> str:
         base = (
             "You create OPIc-style speaking test questions. "
             "Output must strictly match the provided JSON schema. "
@@ -627,10 +639,20 @@ class AIService:
                 + "Use varied survey-based and unexpected topics, and make each prompt clearly different from forbidden.promptTexts."
             )
 
+        if stage == "front":
+            return (
+                base
+                + "Create only the generated front section of a brand-new OPIc mock exam. "
+                + "Return exactly 6 questions: Q2 through Q7. "
+                + "Do not include Q1; the server supplies Q1 as exactly 'Introduce yourself.'. "
+                + "Q2-Q4 must be one survey-based combo and Q5-Q7 must be another survey-based combo."
+            )
+
         return (
             base
-            + "Create a brand-new 15-question OPIc mock exam stage. "
-            + "Keep the flow close to an actual OPIc exam: self introduction, survey-based combos, difficulty adjustment, roleplay, and unexpected topics."
+            + "Create only the generated tail section of a brand-new OPIc mock exam. "
+            + "Return exactly 8 questions: Q8 through Q15. "
+            + "Q8-Q10 must be the final survey-based combo, Q11-Q12 roleplay, and Q13-Q15 unexpected/comparison/advanced prompts."
         )
 
     def _validate_generated_questions(

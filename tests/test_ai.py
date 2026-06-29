@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,10 +26,11 @@ class FakeResponses:
     def __init__(self, outputs: list[list[GeneratedQuestion]]) -> None:
         self.outputs = outputs
         self.calls = 0
+        self.requests: list[dict[str, object]] = []
 
     async def create(self, **kwargs: object) -> SimpleNamespace:
-        del kwargs
         self.calls += 1
+        self.requests.append(kwargs)
         questions = self.outputs.pop(0)
         return SimpleNamespace(
             id=f"resp-{self.calls}",
@@ -123,6 +125,38 @@ def practice_tail_questions(prefix: str) -> list[GeneratedQuestion]:
     ]
 
 
+def mock_front_generated_questions(prefix: str) -> list[GeneratedQuestion]:
+    sequence = [
+        (2, QuestionType.SURVEY, "survey-1", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_a"),
+        (3, QuestionType.SURVEY, "survey-1", SurveyQuestionType.ROUTINE, f"{prefix}_topic_a"),
+        (4, QuestionType.SURVEY, "survey-1", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_a"),
+        (5, QuestionType.SURVEY, "survey-2", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_b"),
+        (6, QuestionType.SURVEY, "survey-2", SurveyQuestionType.ROUTINE, f"{prefix}_topic_b"),
+        (7, QuestionType.SURVEY, "survey-2", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_b"),
+    ]
+    return [
+        GeneratedQuestion(
+            number=number,
+            type=broad_type,
+            comboId=combo_id,
+            topic=f"{prefix} mock topic {number}",
+            prompt=(
+                f"Describe {prefix} mock situation {number}. "
+                f"Explain the background clearly. "
+                f"Tell me why it matters to you."
+            ),
+            difficulty=OPIcLevel.AL,
+            rubricFocus=["task fulfillment", "organization"],
+            questionType=question_type,
+            followUpPrompt=None,
+            topicId=topic_id,
+            category="survey",
+            estimatedLevel=OPIcLevel.AL,
+        )
+        for number, broad_type, combo_id, question_type, topic_id in sequence
+    ]
+
+
 def test_openai_strict_schema_requires_nullable_question_fields() -> None:
     schema = openai_strict_json_schema(GeneratedQuestionsPayload.model_json_schema())
     question_schema = schema["$defs"]["GeneratedQuestion"]
@@ -175,6 +209,23 @@ def test_real_ai_requires_api_key() -> None:
     repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
     with pytest.raises(AIServiceConfigurationError):
         AIService(api_key=None, model="test-model", mock=False, repository=repository)
+
+
+@pytest.mark.asyncio
+async def test_mock_front_keeps_q1_fixed_and_generates_only_q2_to_q7() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    generated = mock_front_generated_questions("fresh")
+    service._client = FakeOpenAIClient([generated])  # type: ignore[assignment]
+
+    result = await service.generate_mock(6, BackgroundProfile(), stage="front")
+
+    assert [item.number for item in result.questions] == list(range(1, 8))
+    assert result.questions[0].prompt == "Introduce yourself."
+    request = service._client.responses.requests[0]  # type: ignore[union-attr]
+    input_text = json.loads(str(request["input"]))
+    assert [item["number"] for item in input_text["blueprint"]] == list(range(2, 8))
+    assert "Return exactly 6 questions" in str(request["instructions"])
 
 
 @pytest.mark.asyncio
