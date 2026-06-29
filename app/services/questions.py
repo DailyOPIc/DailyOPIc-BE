@@ -333,6 +333,7 @@ class FallbackQuestionGenerator:
             SurveyQuestionType.COMPARISON,
             SurveyQuestionType.PROBLEM_SOLVING,
             SurveyQuestionType.OPINION,
+            SurveyQuestionType.ROLEPLAY,
         }:
             return SurveyQuestionType.PAST_EXPERIENCE
         if level <= 3 and requested in {
@@ -342,6 +343,22 @@ class FallbackQuestionGenerator:
             return SurveyQuestionType.PAST_EXPERIENCE
         if level <= 4 and requested is SurveyQuestionType.OPINION:
             return SurveyQuestionType.COMPARISON
+        return requested
+
+    @staticmethod
+    def _broad_type_for_level(
+        level: int, requested: QuestionType, question_type: SurveyQuestionType
+    ) -> QuestionType:
+        if requested in {QuestionType.SURVEY, QuestionType.UNEXPECTED}:
+            return requested
+        if requested is QuestionType.ADVANCED and question_type is SurveyQuestionType.COMPARISON:
+            return QuestionType.COMPARISON
+        if level <= 2 and requested in {
+            QuestionType.ROLEPLAY,
+            QuestionType.COMPARISON,
+            QuestionType.ADVANCED,
+        }:
+            return QuestionType.UNEXPECTED
         return requested
 
     @staticmethod
@@ -355,6 +372,8 @@ class FallbackQuestionGenerator:
         if level == 2:
             if question_type is SurveyQuestionType.PAST_EXPERIENCE:
                 return f"Tell me about a simple experience related to {topic_label}. Why do you remember it."
+            if question_type is SurveyQuestionType.ROUTINE:
+                return f"What do you usually do when you spend time with {topic_label}. Give one simple reason."
             return f"Tell me about {topic_label}. Why do you like it."
         if level == 3:
             if question_type is SurveyQuestionType.ROUTINE:
@@ -397,6 +416,7 @@ class FallbackQuestionGenerator:
         requested_type: SurveyQuestionType,
     ) -> GeneratedQuestion:
         question_type = self._level_question_type(level, requested_type)
+        broad_type = self._broad_type_for_level(level, broad_type, question_type)
         topic_label = self._topic_label(topic_id)
         return GeneratedQuestion(
             number=number,

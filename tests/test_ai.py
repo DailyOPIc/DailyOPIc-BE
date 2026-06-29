@@ -7,6 +7,7 @@ import pytest
 from app.models.api import (
     AudioMetrics,
     BackgroundProfile,
+    DifficultyAdjustment,
     GeneratedQuestion,
     OPIcLevel,
     QuestionType,
@@ -20,6 +21,7 @@ from app.services.ai import (
     openai_strict_json_schema,
 )
 from app.services.questions import QuestionPatternRepository, prompt_hash, question_set_hash
+from app.services.questions import FallbackQuestionGenerator
 
 
 class FakeResponses:
@@ -226,6 +228,40 @@ async def test_mock_front_keeps_q1_fixed_and_generates_only_q2_to_q7() -> None:
     input_text = json.loads(str(request["input"]))
     assert [item["number"] for item in input_text["blueprint"]] == list(range(2, 8))
     assert "Return exactly 6 questions" in str(request["instructions"])
+
+
+@pytest.mark.asyncio
+async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    generated = FallbackQuestionGenerator(repository).mock_tail(
+        effective_level=2,
+        background=BackgroundProfile(),
+    )
+    service._client = FakeOpenAIClient([generated])  # type: ignore[assignment]
+
+    result = await service.generate_mock(
+        1,
+        BackgroundProfile(),
+        stage="tail",
+        adjustment=DifficultyAdjustment.HARDER,
+        effective_level=2,
+    )
+
+    forbidden = {
+        SurveyQuestionType.COMPARISON,
+        SurveyQuestionType.PROBLEM_SOLVING,
+        SurveyQuestionType.OPINION,
+        SurveyQuestionType.ROLEPLAY,
+    }
+    assert [item.number for item in result.questions] == list(range(8, 16))
+    assert {item.question_type for item in result.questions}.isdisjoint(forbidden)
+    request = service._client.responses.requests[0]  # type: ignore[union-attr]
+    input_text = json.loads(str(request["input"]))
+    assert input_text["effectiveLevel"] == 2
+    assert {
+        item["questionType"] for item in input_text["blueprint"]
+    }.isdisjoint({value.value for value in forbidden})
 
 
 @pytest.mark.asyncio
