@@ -297,6 +297,57 @@ async def test_daily_pool_normalizes_model_metadata_to_blueprint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daily_pool_rewrites_recent_topic_id_collisions() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(
+        api_key="test-key",
+        model="test-model",
+        mock=False,
+        repository=repository,
+    )
+    background = BackgroundProfile(interests=["cafes"])
+    generated = FallbackQuestionGenerator(repository).daily_pool(3, background)
+    history = {
+        "setHashes": [],
+        "topicIds": [str(generated[0].topic_id)],
+        "promptHashes": [],
+    }
+    service._client = FakeOpenAIClient([generated])  # type: ignore[assignment]
+
+    result = await service.generate_daily_pool(3, background, history=history)
+
+    assert service._client.responses.calls == 1  # type: ignore[union-attr]
+    assert result.questions[0].topic_id not in history["topicIds"]
+    assert result.questions[0].topic_id.startswith(f"{generated[0].topic_id}_q2_")
+    assert result.questions[0].prompt == generated[0].prompt
+    assert result.questions[1].topic_id == generated[1].topic_id
+
+
+@pytest.mark.asyncio
+async def test_generation_retry_includes_previous_validation_errors() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(
+        api_key="test-key",
+        model="test-model",
+        mock=False,
+        repository=repository,
+    )
+    duplicate = practice_questions("duplicate")
+    fresh = practice_questions("fresh")
+    service._client = FakeOpenAIClient([duplicate, fresh])  # type: ignore[assignment]
+    history = {"setHashes": [], "topicIds": ["duplicate_topic_a"], "promptHashes": []}
+
+    await service.generate_practice(OPIcLevel.IH, BackgroundProfile(), history=history)
+
+    second_request = service._client.responses.requests[1]  # type: ignore[union-attr]
+    input_text = json.loads(str(second_request["input"]))
+    assert input_text["previousValidationErrors"] == [
+        "generated question set repeats recent topicIds"
+    ]
+    assert "Regenerate the full set" in input_text["retryInstructions"][0]
+
+
+@pytest.mark.asyncio
 async def test_real_ai_retries_when_recent_topic_is_reused() -> None:
     repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
     service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)

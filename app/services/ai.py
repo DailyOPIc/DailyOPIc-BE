@@ -552,12 +552,21 @@ class AIService:
     ) -> QuestionGenerationResult:
         last_error: Exception | None = None
         max_attempts = 3 if mode == "daily" else 2
+        validation_errors: list[str] = []
         for attempt in range(1, max_attempts + 1):
             try:
+                attempt_payload = {**payload, "attempt": attempt}
+                if validation_errors:
+                    attempt_payload["previousValidationErrors"] = validation_errors[-2:]
+                    attempt_payload["retryInstructions"] = [
+                        "Regenerate the full set with fresh prompt text.",
+                        "Do not reuse any topicId or prompt text that caused a previous validation error.",
+                        "Keep all blueprint metadata unchanged.",
+                    ]
                 result = await self._structured(
                     instructions=self._question_generation_instructions(mode, stage),
                     input_text=json.dumps(
-                        {**payload, "attempt": attempt},
+                        attempt_payload,
                         ensure_ascii=False,
                     ),
                     schema=GeneratedQuestionsPayload,
@@ -570,6 +579,7 @@ class AIService:
                         blueprint,
                         questions,
                     )
+                    questions = self._normalize_daily_topic_ids(questions, history)
                 self._validate_generated_questions(
                     mode=mode,
                     stage=stage,
@@ -587,6 +597,7 @@ class AIService:
                 )
             except Exception as error:
                 last_error = error
+                validation_errors.append(str(error))
                 logger.exception(
                     "AI question generation attempt failed. mode=%s model=%s attempt=%s",
                     mode,
@@ -596,6 +607,69 @@ class AIService:
         raise AIQuestionGenerationError(
             f"AI question generation failed after {max_attempts} attempts for mode={mode}"
         ) from last_error
+
+    def _normalize_daily_topic_ids(
+        self,
+        questions: list[GeneratedQuestion],
+        history: dict[str, list[str]] | None,
+    ) -> list[GeneratedQuestion]:
+        recent_topic_ids = set((history or {}).get("topicIds", []))
+        used_topic_ids: set[str] = set()
+        normalized: list[GeneratedQuestion] = []
+        rewrites: list[str] = []
+
+        for question in questions:
+            original = (question.topic_id or "").strip()
+            topic_id = self._daily_unique_topic_id(
+                question=question,
+                original=original,
+                blocked={*recent_topic_ids, *used_topic_ids},
+            )
+            used_topic_ids.add(topic_id)
+            if topic_id != original:
+                rewrites.append(
+                    f"Q{question.number}: {original or '<empty>'}->{topic_id}"
+                )
+                normalized.append(question.model_copy(update={"topic_id": topic_id}))
+            else:
+                normalized.append(question)
+
+        if rewrites:
+            logger.warning(
+                "AI daily question topicIds were normalized to avoid recent collisions. "
+                "model=%s rewrites=%s",
+                self.model,
+                rewrites[:20],
+            )
+        return normalized
+
+    @classmethod
+    def _daily_unique_topic_id(
+        cls,
+        *,
+        question: GeneratedQuestion,
+        original: str,
+        blocked: set[str],
+    ) -> str:
+        base = cls._snake_case_topic_id(original or question.topic or "daily_topic")
+        if original == base and base not in blocked:
+            return base
+
+        suffix = f"_q{question.number}_{prompt_hash(question.prompt)[:8]}"
+        trimmed_base = base[: max(1, 80 - len(suffix))].rstrip("_")
+        candidate = f"{trimmed_base}{suffix}"
+        counter = 2
+        while candidate in blocked:
+            counter_suffix = f"{suffix}_{counter}"
+            trimmed_base = base[: max(1, 80 - len(counter_suffix))].rstrip("_")
+            candidate = f"{trimmed_base}{counter_suffix}"
+            counter += 1
+        return candidate
+
+    @staticmethod
+    def _snake_case_topic_id(value: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+        return slug or "daily_topic"
 
     def _normalize_daily_metadata_to_blueprint(
         self,
