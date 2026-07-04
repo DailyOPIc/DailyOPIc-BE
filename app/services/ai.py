@@ -21,6 +21,7 @@ from app.models.api import (
     OPIcLevel,
     PerQuestionFeedback,
     PracticeEvaluation,
+    QuestionType,
     SurveyQuestionType,
 )
 from app.services.questions import (
@@ -487,6 +488,7 @@ class AIService:
                 if question.estimated_level
                 else question.difficulty.value
             ),
+            "category": question.category,
             "rubricFocus": question.rubric_focus,
         }
 
@@ -512,7 +514,7 @@ class AIService:
             return [
                 "Q2-Q15 randomized Daily practice prompts only",
                 "No Q1, no introduction, and no self-introduction",
-                "Use survey-based and unexpected OPIc-style question types without combo requirements",
+                "Copy each blueprint type and questionType exactly; comboId remains null",
             ]
         if mode == "mock" and stage == "front":
             return [
@@ -563,6 +565,11 @@ class AIService:
                 generated = result.payload
                 assert isinstance(generated, GeneratedQuestionsPayload)
                 questions = generated.questions
+                if mode == "daily":
+                    questions = self._normalize_daily_metadata_to_blueprint(
+                        blueprint,
+                        questions,
+                    )
                 self._validate_generated_questions(
                     mode=mode,
                     stage=stage,
@@ -590,12 +597,64 @@ class AIService:
             f"AI question generation failed after {max_attempts} attempts for mode={mode}"
         ) from last_error
 
+    def _normalize_daily_metadata_to_blueprint(
+        self,
+        blueprint: list[GeneratedQuestion],
+        questions: list[GeneratedQuestion],
+    ) -> list[GeneratedQuestion]:
+        if len(blueprint) != len(questions):
+            return questions
+        if any(
+            actual.number != expected.number
+            for expected, actual in zip(blueprint, questions)
+        ):
+            return questions
+        if any(
+            actual.type is QuestionType.INTRODUCTION
+            and expected.type is not QuestionType.INTRODUCTION
+            for expected, actual in zip(blueprint, questions)
+        ):
+            return questions
+
+        normalized: list[GeneratedQuestion] = []
+        mismatches: list[str] = []
+        metadata_fields = [
+            "type",
+            "combo_id",
+            "question_type",
+            "difficulty",
+            "estimated_level",
+            "category",
+        ]
+
+        for expected, actual in zip(blueprint, questions):
+            update: dict[str, Any] = {}
+            for field in metadata_fields:
+                expected_value = getattr(expected, field)
+                actual_value = getattr(actual, field)
+                if actual_value != expected_value:
+                    update[field] = expected_value
+                    mismatches.append(
+                        f"Q{expected.number}.{field}: "
+                        f"{actual_value!s}->{expected_value!s}"
+                    )
+            normalized.append(actual.model_copy(update=update) if update else actual)
+
+        if mismatches:
+            logger.warning(
+                "AI daily question metadata differed from blueprint and was normalized. "
+                "model=%s mismatches=%s",
+                self.model,
+                mismatches[:20],
+            )
+        return normalized
+
     @staticmethod
     def _question_generation_instructions(mode: str, stage: str) -> str:
         base = (
             "You create OPIc-style speaking test questions. "
             "Output must strictly match the provided JSON schema. "
-            "Follow the blueprint exactly for number, type, comboId, questionType, difficulty, and estimatedLevel. "
+            "Follow the blueprint exactly for number, type, comboId, questionType, difficulty, estimatedLevel, and category. "
             "Do not invent or change blueprint metadata. "
             "Only make topic, topicId, prompt, followUpPrompt, and rubricFocus fresh and natural. "
             "topic must be a short label under 40 characters, such as 'Self Introduction' or 'Coffee Shops'. "
@@ -636,6 +695,8 @@ class AIService:
                 + "Generate only questions numbered Q2 through Q15. "
                 + "Never include self-introduction, 'Introduce yourself', warm-up, or hint-like follow-up content. "
                 + "The questions are independent practice prompts, not a mock exam combo sequence. "
+                + "Daily independence does not change the metadata: keep type exactly as the blueprint says, "
+                + "including roleplay, comparison, and advanced. "
                 + "Use varied survey-based and unexpected topics, and make each prompt clearly different from forbidden.promptTexts."
             )
 

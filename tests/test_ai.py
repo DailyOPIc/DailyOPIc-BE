@@ -265,6 +265,38 @@ async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() 
 
 
 @pytest.mark.asyncio
+async def test_daily_pool_normalizes_model_metadata_to_blueprint() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(
+        api_key="test-key",
+        model="test-model",
+        mock=False,
+        repository=repository,
+    )
+    background = BackgroundProfile(interests=["cafes"])
+    expected = FallbackQuestionGenerator(repository).daily_pool(1, background)
+    generated = [
+        item.model_copy(
+            update={
+                "type": QuestionType.SURVEY,
+                "category": "model_selected",
+            }
+        )
+        for item in expected
+    ]
+    service._client = FakeOpenAIClient([generated])  # type: ignore[assignment]
+
+    result = await service.generate_daily_pool(1, background)
+
+    assert service._client.responses.calls == 1  # type: ignore[union-attr]
+    assert [item.number for item in result.questions] == list(range(2, 16))
+    assert [item.type for item in result.questions] == [item.type for item in expected]
+    assert [item.category for item in result.questions] == [
+        item.category for item in expected
+    ]
+
+
+@pytest.mark.asyncio
 async def test_real_ai_retries_when_recent_topic_is_reused() -> None:
     repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
     service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
