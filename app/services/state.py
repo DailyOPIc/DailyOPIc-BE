@@ -12,7 +12,14 @@ import firebase_admin
 from firebase_admin import firestore as admin_firestore
 from google.cloud import firestore
 
-from app.models.api import RewardPurpose
+from app.models.api import DifficultyAdjustment, RewardPurpose
+from app.services.difficulty import (
+    adjusted_level,
+    effective_level_code,
+    expected_target_level,
+    initial_level_from_target,
+)
+from app.services.questions import prompt_hash
 
 
 class UsageLimitExceeded(RuntimeError):
@@ -27,6 +34,10 @@ class RequestAlreadyProcessing(RuntimeError):
     pass
 
 
+class AdjustmentAlreadyApplied(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class Reservation:
     status: str
@@ -36,7 +47,75 @@ class Reservation:
 
 class StateStore(ABC):
     @abstractmethod
+    async def save_question_set(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        target_level: str,
+        initial_level: int,
+        adjustment: str | None,
+        effective_level: int,
+        effective_level_code: str,
+        status: str,
+        front_question_count: int,
+        background: dict[str, Any],
+        survey: dict[str, Any] | None,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+        expires_at: datetime,
+        source: str | None = None,
+        date_key: str | None = None,
+        pool_index: int | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    async def get_question_set(
+        self, *, uid: str, set_id: str, mode: str
+    ) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]: ...
+
+    @abstractmethod
+    async def record_question_history(
+        self,
+        *,
+        uid: str,
+        mode: str,
+        set_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> None: ...
+
+    @abstractmethod
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]: ...
+
+    @abstractmethod
+    async def get_target_level(self, uid: str) -> str | None: ...
+
+    @abstractmethod
+    async def get_learning_profile(self, uid: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def set_initial_level(
+        self, *, uid: str, initial_level: int, reward_nonce: str | None
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def apply_question_set_adjustment(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        adjustment: str,
+        effective_level: int,
+        effective_level_code: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
 
     @abstractmethod
     async def reserve_practice(
@@ -68,6 +147,7 @@ class StateStore(ABC):
         expires_at: datetime,
         auto_verify: bool,
         practice_credit_amount: int,
+        max_daily_reward_count: int,
     ) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -84,7 +164,106 @@ class StateStore(ABC):
 
 
 def _usage_defaults() -> dict[str, int]:
-    return {"freeUsed": 0, "bonusRemaining": 0}
+    return {"freeUsed": 0, "bonusRemaining": 0, "rewardCount": 0}
+
+
+def _question_history_defaults() -> dict[str, list[str]]:
+    return {"setHashes": [], "topicIds": [], "promptHashes": [], "promptTexts": []}
+
+
+def _trim_recent(values: list[str], limit: int = 80) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        if value in result:
+            result.remove(value)
+        result.append(value)
+    return result[-limit:]
+
+
+def _merge_question_history(
+    existing: dict[str, Any] | None,
+    *,
+    set_hash: str,
+    questions: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    history = {**_question_history_defaults(), **(existing or {})}
+    topic_ids = [
+        str(question.get("topicId") or "").strip()
+        for question in questions
+        if str(question.get("topicId") or "").strip()
+    ]
+    prompt_hashes = [
+        prompt_hash(str(question.get("prompt") or ""))
+        for question in questions
+        if str(question.get("prompt") or "").strip()
+    ]
+    prompt_texts = [
+        str(question.get("prompt") or "").strip()
+        for question in questions
+        if str(question.get("prompt") or "").strip()
+    ]
+    return {
+        "setHashes": _trim_recent([*history["setHashes"], set_hash]),
+        "topicIds": _trim_recent([*history["topicIds"], *topic_ids]),
+        "promptHashes": _trim_recent([*history["promptHashes"], *prompt_hashes]),
+        "promptTexts": _trim_recent([*history.get("promptTexts", []), *prompt_texts], 40),
+    }
+
+
+def _reward_purpose_matches(value: object, purpose: RewardPurpose) -> bool:
+    return value == purpose or value == purpose.value
+
+
+def _counts_toward_daily_reward_quota(purpose: RewardPurpose) -> bool:
+    return purpose is not RewardPurpose.TARGET_LEVEL_CHANGE
+
+
+def _profile_from_value(profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not profile:
+        return None
+    initial_level = profile.get("initialLevel")
+    if initial_level is None:
+        initial_level = initial_level_from_target(profile.get("targetLevel"))
+    if initial_level is None:
+        return None
+    initial_level = int(initial_level)
+    latest_adjustment = str(
+        profile.get("latestAdjustment") or DifficultyAdjustment.SAME.value
+    )
+    effective_level = adjusted_level(initial_level, latest_adjustment)
+    target_level = str(
+        profile.get("expectedTargetLevel") or expected_target_level(effective_level).value
+    )
+    return {
+        **profile,
+        "initialLevel": initial_level,
+        "latestAdjustment": latest_adjustment,
+        "effectiveLevel": effective_level,
+        "effectiveLevelCode": effective_level_code(initial_level, latest_adjustment),
+        "expectedTargetLevel": target_level,
+        "targetLevel": target_level,
+    }
+
+
+def _target_change_response(
+    *,
+    profile: dict[str, Any],
+    previous: dict[str, Any] | None,
+    reward_consumed: bool,
+) -> dict[str, Any]:
+    return {
+        "targetLevel": profile["targetLevel"],
+        "previousTargetLevel": previous["targetLevel"] if previous else None,
+        "initialLevel": profile["initialLevel"],
+        "previousInitialLevel": previous["initialLevel"] if previous else None,
+        "latestAdjustment": profile["latestAdjustment"],
+        "effectiveLevel": profile["effectiveLevel"],
+        "effectiveLevelCode": profile["effectiveLevelCode"],
+        "changed": previous is None or previous["initialLevel"] != profile["initialLevel"],
+        "rewardConsumed": reward_consumed,
+    }
 
 
 class InMemoryStateStore(StateStore):
@@ -94,14 +273,233 @@ class InMemoryStateStore(StateStore):
         self._requests: dict[str, dict[str, Any]] = {}
         self._rewards: dict[str, dict[str, Any]] = {}
         self._transactions: set[str] = set()
+        self._question_sets: dict[str, dict[str, Any]] = {}
+        self._question_histories: dict[str, dict[str, list[str]]] = {}
+        self._profiles: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _usage_id(uid: str, date_key: str) -> str:
         return f"{uid}:{date_key}"
 
+    @staticmethod
+    def _question_history_id(uid: str, mode: str) -> str:
+        return f"{uid}:{mode}"
+
+    async def save_question_set(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        target_level: str,
+        initial_level: int,
+        adjustment: str | None,
+        effective_level: int,
+        effective_level_code: str,
+        status: str,
+        front_question_count: int,
+        background: dict[str, Any],
+        survey: dict[str, Any] | None,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+        expires_at: datetime,
+        source: str | None = None,
+        date_key: str | None = None,
+        pool_index: int | None = None,
+    ) -> None:
+        async with self._lock:
+            self._question_sets[set_id] = {
+                "uid": uid,
+                "setId": set_id,
+                "mode": mode,
+                "targetLevel": target_level,
+                "expectedTargetLevel": target_level,
+                "initialLevel": initial_level,
+                "adjustment": adjustment,
+                "effectiveLevel": effective_level,
+                "effectiveLevelCode": effective_level_code,
+                "status": status,
+                "frontQuestionCount": front_question_count,
+                "background": deepcopy(background),
+                "survey": deepcopy(survey),
+                "questionHash": question_hash,
+                "questions": deepcopy(questions),
+                "source": source,
+                "dateKey": date_key,
+                "poolIndex": pool_index,
+                "expiresAt": expires_at,
+                "createdAt": datetime.now(UTC),
+                "updatedAt": datetime.now(UTC),
+            }
+
+    async def get_question_set(
+        self, *, uid: str, set_id: str, mode: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            question_set = self._question_sets.get(set_id)
+            if (
+                not question_set
+                or question_set["uid"] != uid
+                or question_set["mode"] != mode
+                or question_set["expiresAt"] < datetime.now(UTC)
+            ):
+                return None
+            return deepcopy(question_set)
+
+    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
+        async with self._lock:
+            history_id = self._question_history_id(uid, mode)
+            return deepcopy(
+                {
+                    **_question_history_defaults(),
+                    **self._question_histories.get(history_id, {}),
+                }
+            )
+
+    async def record_question_history(
+        self,
+        *,
+        uid: str,
+        mode: str,
+        set_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> None:
+        async with self._lock:
+            history_id = self._question_history_id(uid, mode)
+            self._question_histories[history_id] = _merge_question_history(
+                self._question_histories.get(history_id),
+                set_hash=set_hash,
+                questions=questions,
+            )
+
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         async with self._lock:
             return deepcopy(self._usage.get(self._usage_id(uid, date_key), _usage_defaults()))
+
+    async def get_target_level(self, uid: str) -> str | None:
+        async with self._lock:
+            profile = _profile_from_value(self._profiles.get(uid))
+            return str(profile["targetLevel"]) if profile else None
+
+    async def get_learning_profile(self, uid: str) -> dict[str, Any] | None:
+        async with self._lock:
+            return deepcopy(_profile_from_value(self._profiles.get(uid)))
+
+    async def set_initial_level(
+        self, *, uid: str, initial_level: int, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        async with self._lock:
+            now = datetime.now(UTC)
+            previous = _profile_from_value(self._profiles.get(uid))
+            reward_consumed = False
+            if previous and previous["initialLevel"] != initial_level:
+                reward = self._rewards.get(reward_nonce or "")
+                if (
+                    not reward
+                    or reward["uid"] != uid
+                    or not _reward_purpose_matches(
+                        reward["purpose"], RewardPurpose.TARGET_LEVEL_CHANGE
+                    )
+                    or reward["status"] != "verified"
+                    or reward.get("consumed", False)
+                    or reward["expiresAt"] < now
+                ):
+                    raise RewardNotVerified("verified target level change reward is required")
+                reward["consumed"] = True
+                reward["consumedAt"] = now
+                reward["consumedFor"] = "target_level_change"
+                reward_consumed = True
+            created_at = previous["createdAt"] if previous and previous.get("createdAt") else now
+            profile = _profile_from_value(
+                {
+                    "uid": uid,
+                    "initialLevel": initial_level,
+                    "latestAdjustment": DifficultyAdjustment.SAME.value,
+                    "createdAt": created_at,
+                    "updatedAt": now,
+                }
+            )
+            assert profile is not None
+            self._profiles[uid] = {
+                "uid": uid,
+                "targetLevel": profile["targetLevel"],
+                "expectedTargetLevel": profile["expectedTargetLevel"],
+                "initialLevel": profile["initialLevel"],
+                "latestAdjustment": profile["latestAdjustment"],
+                "effectiveLevel": profile["effectiveLevel"],
+                "effectiveLevelCode": profile["effectiveLevelCode"],
+                "createdAt": created_at,
+                "updatedAt": now,
+            }
+            return _target_change_response(
+                profile=profile,
+                previous=previous,
+                reward_consumed=reward_consumed,
+            )
+
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        initial_level = initial_level_from_target(target_level)
+        if initial_level is None:
+            raise ValueError("invalid target level")
+        return await self.set_initial_level(
+            uid=uid,
+            initial_level=initial_level,
+            reward_nonce=reward_nonce,
+        )
+
+    async def apply_question_set_adjustment(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        adjustment: str,
+        effective_level: int,
+        effective_level_code: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        async with self._lock:
+            question_set = self._question_sets.get(set_id)
+            if (
+                not question_set
+                or question_set["uid"] != uid
+                or question_set["mode"] != mode
+                or question_set["expiresAt"] < datetime.now(UTC)
+            ):
+                raise KeyError("question set not found")
+            if question_set.get("status") == "complete":
+                if question_set.get("adjustment") == adjustment:
+                    return deepcopy(question_set)
+                raise AdjustmentAlreadyApplied("question set adjustment already applied")
+            question_set.update(
+                {
+                    "targetLevel": target_level,
+                    "expectedTargetLevel": target_level,
+                    "adjustment": adjustment,
+                    "effectiveLevel": effective_level,
+                    "effectiveLevelCode": effective_level_code,
+                    "status": "complete",
+                    "questionHash": question_hash,
+                    "questions": deepcopy(questions),
+                    "updatedAt": datetime.now(UTC),
+                }
+            )
+            profile = _profile_from_value(self._profiles.get(uid))
+            if profile:
+                self._profiles[uid] = {
+                    **self._profiles[uid],
+                    "latestAdjustment": adjustment,
+                    "effectiveLevel": effective_level,
+                    "effectiveLevelCode": effective_level_code,
+                    "expectedTargetLevel": target_level,
+                    "targetLevel": target_level,
+                    "updatedAt": datetime.now(UTC),
+                }
+            return deepcopy(question_set)
 
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
@@ -153,7 +551,7 @@ class InMemoryStateStore(StateStore):
             if (
                 not reward
                 or reward["uid"] != uid
-                or reward["purpose"] != RewardPurpose.MOCK_RESULT
+                or not _reward_purpose_matches(reward["purpose"], RewardPurpose.MOCK_RESULT)
                 or reward["sessionHash"] != session_hash
                 or reward["status"] != "verified"
                 or reward.get("consumed", False)
@@ -211,8 +609,14 @@ class InMemoryStateStore(StateStore):
         expires_at: datetime,
         auto_verify: bool,
         practice_credit_amount: int,
+        max_daily_reward_count: int,
     ) -> dict[str, Any]:
         async with self._lock:
+            usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
+            if _counts_toward_daily_reward_quota(purpose):
+                if usage["rewardCount"] >= max_daily_reward_count:
+                    raise UsageLimitExceeded("daily reward quota exhausted")
+                usage["rewardCount"] += 1
             reward = {
                 "nonce": nonce,
                 "uid": uid,
@@ -226,7 +630,6 @@ class InMemoryStateStore(StateStore):
             }
             self._rewards[nonce] = reward
             if auto_verify and purpose is RewardPurpose.PRACTICE_CREDITS:
-                usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
                 usage["bonusRemaining"] += practice_credit_amount
                 reward["credited"] = True
             return deepcopy(reward)
@@ -273,6 +676,110 @@ class FirestoreStateStore(StateStore):
     def _usage_id(uid: str, date_key: str) -> str:
         return hashlib.sha256(f"{uid}:{date_key}".encode()).hexdigest()
 
+    @staticmethod
+    def _question_history_id(uid: str, mode: str) -> str:
+        return hashlib.sha256(f"{uid}:{mode}".encode()).hexdigest()
+
+    async def save_question_set(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        target_level: str,
+        initial_level: int,
+        adjustment: str | None,
+        effective_level: int,
+        effective_level_code: str,
+        status: str,
+        front_question_count: int,
+        background: dict[str, Any],
+        survey: dict[str, Any] | None,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+        expires_at: datetime,
+        source: str | None = None,
+        date_key: str | None = None,
+        pool_index: int | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._client.collection("questionSets").document(set_id).set,
+            {
+                "uid": uid,
+                "setId": set_id,
+                "mode": mode,
+                "targetLevel": target_level,
+                "expectedTargetLevel": target_level,
+                "initialLevel": initial_level,
+                "adjustment": adjustment,
+                "effectiveLevel": effective_level,
+                "effectiveLevelCode": effective_level_code,
+                "status": status,
+                "frontQuestionCount": front_question_count,
+                "background": background,
+                "survey": survey,
+                "questionHash": question_hash,
+                "questions": questions,
+                "source": source,
+                "dateKey": date_key,
+                "poolIndex": pool_index,
+                "expiresAt": expires_at,
+                "createdAt": datetime.now(UTC),
+                "updatedAt": datetime.now(UTC),
+            },
+        )
+
+    async def get_question_set(
+        self, *, uid: str, set_id: str, mode: str
+    ) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("questionSets").document(set_id).get()
+            value = snapshot.to_dict() if snapshot.exists else None
+            if (
+                not value
+                or value.get("uid") != uid
+                or value.get("mode") != mode
+                or value.get("expiresAt") < datetime.now(UTC)
+            ):
+                return None
+            return value
+
+        return await asyncio.to_thread(read)
+
+    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
+        def read() -> dict[str, list[str]]:
+            snapshot = self._client.collection("questionHistories").document(
+                self._question_history_id(uid, mode)
+            ).get()
+            return {
+                **_question_history_defaults(),
+                **(snapshot.to_dict() or {}),
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def record_question_history(
+        self,
+        *,
+        uid: str,
+        mode: str,
+        set_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> None:
+        def write() -> None:
+            ref = self._client.collection("questionHistories").document(
+                self._question_history_id(uid, mode)
+            )
+            snapshot = ref.get()
+            updated = _merge_question_history(
+                snapshot.to_dict() if snapshot.exists else None,
+                set_hash=set_hash,
+                questions=questions,
+            )
+            ref.set({**updated, "uid": uid, "mode": mode, "updatedAt": datetime.now(UTC)})
+
+        await asyncio.to_thread(write)
+
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         def read() -> dict[str, int]:
             snapshot = self._client.collection("dailyUsage").document(
@@ -281,6 +788,183 @@ class FirestoreStateStore(StateStore):
             return {**_usage_defaults(), **(snapshot.to_dict() or {})}
 
         return await asyncio.to_thread(read)
+
+    async def get_target_level(self, uid: str) -> str | None:
+        def read() -> str | None:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            value = _profile_from_value(snapshot.to_dict() if snapshot.exists else None)
+            return str(value["targetLevel"]) if value and value.get("targetLevel") else None
+
+        return await asyncio.to_thread(read)
+
+    async def get_learning_profile(self, uid: str) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            return _profile_from_value(snapshot.to_dict() if snapshot.exists else None)
+
+        return await asyncio.to_thread(read)
+
+    async def set_initial_level(
+        self, *, uid: str, initial_level: int, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        def run() -> dict[str, Any]:
+            transaction = self._client.transaction()
+            profile_ref = self._client.collection("userProfiles").document(uid)
+            reward_ref = (
+                self._client.collection("adRewardIntents").document(reward_nonce)
+                if reward_nonce
+                else None
+            )
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                now = datetime.now(UTC)
+                profile_snapshot = profile_ref.get(transaction=transaction)
+                profile = profile_snapshot.to_dict() if profile_snapshot.exists else {}
+                previous = _profile_from_value(profile)
+                reward_consumed = False
+                if previous and previous["initialLevel"] != initial_level:
+                    if reward_ref is None:
+                        raise RewardNotVerified(
+                            "verified target level change reward is required"
+                        )
+                    reward_snapshot = reward_ref.get(transaction=transaction)
+                    reward = reward_snapshot.to_dict() or {}
+                    if (
+                        not reward_snapshot.exists
+                        or reward.get("uid") != uid
+                        or not _reward_purpose_matches(
+                            reward.get("purpose"), RewardPurpose.TARGET_LEVEL_CHANGE
+                        )
+                        or reward.get("status") != "verified"
+                        or reward.get("consumed", False)
+                        or not reward.get("expiresAt")
+                        or reward.get("expiresAt") < now
+                    ):
+                        raise RewardNotVerified(
+                            "verified target level change reward is required"
+                        )
+                    reward_consumed = True
+                updated_profile = _profile_from_value(
+                    {
+                        "uid": uid,
+                        "initialLevel": initial_level,
+                        "latestAdjustment": DifficultyAdjustment.SAME.value,
+                        "createdAt": profile.get("createdAt", now),
+                        "updatedAt": now,
+                    }
+                )
+                assert updated_profile is not None
+
+                transaction.set(
+                    profile_ref,
+                    {
+                        "uid": uid,
+                        "targetLevel": updated_profile["targetLevel"],
+                        "expectedTargetLevel": updated_profile["expectedTargetLevel"],
+                        "initialLevel": updated_profile["initialLevel"],
+                        "latestAdjustment": updated_profile["latestAdjustment"],
+                        "effectiveLevel": updated_profile["effectiveLevel"],
+                        "effectiveLevelCode": updated_profile["effectiveLevelCode"],
+                        "createdAt": profile.get("createdAt", now),
+                        "updatedAt": now,
+                    },
+                    merge=True,
+                )
+                if reward_ref is not None and reward_consumed:
+                    transaction.update(
+                        reward_ref,
+                        {
+                            "consumed": True,
+                            "consumedAt": now,
+                            "consumedFor": "target_level_change",
+                        },
+                    )
+                return _target_change_response(
+                    profile=updated_profile,
+                    previous=previous,
+                    reward_consumed=reward_consumed,
+                )
+
+            return apply(transaction)
+
+        return await asyncio.to_thread(run)
+
+    async def set_target_level(
+        self, *, uid: str, target_level: str, reward_nonce: str | None
+    ) -> dict[str, Any]:
+        initial_level = initial_level_from_target(target_level)
+        if initial_level is None:
+            raise ValueError("invalid target level")
+        return await self.set_initial_level(
+            uid=uid,
+            initial_level=initial_level,
+            reward_nonce=reward_nonce,
+        )
+
+    async def apply_question_set_adjustment(
+        self,
+        *,
+        uid: str,
+        set_id: str,
+        mode: str,
+        adjustment: str,
+        effective_level: int,
+        effective_level_code: str,
+        target_level: str,
+        question_hash: str,
+        questions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        def run() -> dict[str, Any]:
+            transaction = self._client.transaction()
+            set_ref = self._client.collection("questionSets").document(set_id)
+            profile_ref = self._client.collection("userProfiles").document(uid)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                now = datetime.now(UTC)
+                snapshot = set_ref.get(transaction=transaction)
+                question_set = snapshot.to_dict() if snapshot.exists else None
+                if (
+                    not question_set
+                    or question_set.get("uid") != uid
+                    or question_set.get("mode") != mode
+                    or question_set.get("expiresAt") < now
+                ):
+                    raise KeyError("question set not found")
+                if question_set.get("status") == "complete":
+                    if question_set.get("adjustment") == adjustment:
+                        return question_set
+                    raise AdjustmentAlreadyApplied("question set adjustment already applied")
+                updates = {
+                    "targetLevel": target_level,
+                    "expectedTargetLevel": target_level,
+                    "adjustment": adjustment,
+                    "effectiveLevel": effective_level,
+                    "effectiveLevelCode": effective_level_code,
+                    "status": "complete",
+                    "questionHash": question_hash,
+                    "questions": questions,
+                    "updatedAt": now,
+                }
+                transaction.update(set_ref, updates)
+                transaction.set(
+                    profile_ref,
+                    {
+                        "latestAdjustment": adjustment,
+                        "effectiveLevel": effective_level,
+                        "effectiveLevelCode": effective_level_code,
+                        "expectedTargetLevel": target_level,
+                        "targetLevel": target_level,
+                        "updatedAt": now,
+                    },
+                    merge=True,
+                )
+                return {**question_set, **updates}
+
+            return apply(transaction)
+
+        return await asyncio.to_thread(run)
 
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
@@ -438,6 +1122,7 @@ class FirestoreStateStore(StateStore):
         expires_at: datetime,
         auto_verify: bool,
         practice_credit_amount: int,
+        max_daily_reward_count: int,
     ) -> dict[str, Any]:
         def run() -> dict[str, Any]:
             transaction = self._client.transaction()
@@ -448,6 +1133,12 @@ class FirestoreStateStore(StateStore):
 
             @firestore.transactional
             def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                usage_snapshot = usage_ref.get(transaction=transaction)
+                usage = {**_usage_defaults(), **(usage_snapshot.to_dict() or {})}
+                if _counts_toward_daily_reward_quota(purpose):
+                    if usage["rewardCount"] >= max_daily_reward_count:
+                        raise UsageLimitExceeded("daily reward quota exhausted")
+                    usage["rewardCount"] += 1
                 reward = {
                     "nonce": nonce,
                     "uid": uid,
@@ -460,11 +1151,13 @@ class FirestoreStateStore(StateStore):
                     "createdAt": datetime.now(UTC),
                 }
                 if auto_verify and purpose is RewardPurpose.PRACTICE_CREDITS:
-                    usage_snapshot = usage_ref.get(transaction=transaction)
-                    usage = {**_usage_defaults(), **(usage_snapshot.to_dict() or {})}
                     usage["bonusRemaining"] += practice_credit_amount
-                    transaction.set(usage_ref, usage, merge=True)
                     reward["credited"] = True
+                transaction.set(
+                    usage_ref,
+                    {**usage, "uid": uid, "dateKey": date_key, "updatedAt": datetime.now(UTC)},
+                    merge=True,
+                )
                 transaction.set(reward_ref, reward)
                 return reward
 
