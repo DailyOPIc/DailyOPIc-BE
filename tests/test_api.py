@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.admob import VerifiedReward
-from app.services.ai import AIQuestionGenerationError
+from app.services.ai import AIQuestionGenerationError, AIServiceUnavailable
 
 
 USER_ID = "11111111-1111-4111-8111-111111111111"
@@ -33,6 +33,13 @@ class FailingQuestionAIService:
 
     async def generate_daily_pool(self, *args: object, **kwargs: object) -> object:
         raise AIQuestionGenerationError("forced failure")
+
+
+class FailingMockEvaluationAIService:
+    model = "test-model"
+
+    async def evaluate_mock(self, *args: object, **kwargs: object) -> object:
+        raise AIServiceUnavailable("forced evaluation failure")
 
 
 def _headers(request_id: str | None = None) -> dict[str, str]:
@@ -359,6 +366,79 @@ def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
         )
         assert response.status_code == 200, response.text
         assert len(response.json()["perQuestion"]) == 15
+
+
+def test_mock_ai_failure_rolls_back_reward_for_same_request_retry() -> None:
+    with TestClient(app) as client:
+        question_set = client.post(
+            "/v1/mock-exams",
+            headers=_headers(),
+            json={
+                "targetLevel": "IM2",
+                "background": {"travel": ["domestic"]},
+                "survey": {
+                    "status": "student",
+                    "residence": "family",
+                    "leisure": ["movies", "music", "cafes"],
+                    "hobbies": [],
+                    "sports": [],
+                    "travel": ["domestic_travel"],
+                },
+            },
+        ).json()
+        adjusted = client.post(
+            f"/v1/question-sets/{question_set['setId']}/adjustment",
+            headers=_headers(),
+            json={"adjustment": "same"},
+        )
+        assert adjusted.status_code == 200, adjusted.text
+        question_set = adjusted.json()
+        answers = [
+            {
+                "number": number,
+                "transcript": (
+                    f"This is my complete answer number {number}. "
+                    "I explain a reason and an example."
+                ),
+            }
+            for number in range(1, 16)
+        ]
+        reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "mock_result", "sessionHash": question_set["setHash"]},
+        ).json()
+        _verify_reward(client, reward["nonce"])
+        manifest = {
+            "targetLevel": "IM2",
+            "setId": question_set["setId"],
+            "rewardNonce": reward["nonce"],
+            "answers": answers,
+        }
+        request_id = str(uuid.uuid4())
+        working_ai_service = client.app.state.ai_service
+        client.app.state.ai_service = FailingMockEvaluationAIService()
+        try:
+            failed = client.post(
+                "/v1/evaluations/mock",
+                headers=_headers(request_id),
+                data={"manifest": json.dumps(manifest)},
+                files=_mock_audio_files(),
+            )
+        finally:
+            client.app.state.ai_service = working_ai_service
+        assert failed.status_code == 503
+        assert failed.json()["detail"]["code"] == "ai_unavailable"
+
+        retry = client.post(
+            "/v1/evaluations/mock",
+            headers=_headers(request_id),
+            data={"manifest": json.dumps(manifest)},
+            files=_mock_audio_files(),
+        )
+
+        assert retry.status_code == 200, retry.text
+        assert len(retry.json()["perQuestion"]) == 15
 
 
 def test_daily_reward_intent_quota_returns_402() -> None:

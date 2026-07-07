@@ -7,9 +7,12 @@ import pytest
 from app.models.api import (
     AudioMetrics,
     BackgroundProfile,
+    ConfidenceBand,
     DifficultyAdjustment,
+    EvaluationScores,
     GeneratedQuestion,
     OPIcLevel,
+    PerQuestionFeedback,
     QuestionType,
     SurveyQuestionType,
 )
@@ -50,6 +53,33 @@ class FakeResponses:
 class FakeOpenAIClient:
     def __init__(self, outputs: list[list[GeneratedQuestion]]) -> None:
         self.responses = FakeResponses(outputs)
+
+
+class FakeTextResponses:
+    def __init__(self, outputs: list[str]) -> None:
+        self.outputs = outputs
+        self.calls = 0
+        self.requests: list[dict[str, object]] = []
+
+    async def create(self, **kwargs: object) -> SimpleNamespace:
+        self.calls += 1
+        self.requests.append(kwargs)
+        return SimpleNamespace(
+            id=f"resp-{self.calls}",
+            output_text=self.outputs.pop(0),
+            usage=SimpleNamespace(
+                input_tokens=10,
+                input_tokens_details=SimpleNamespace(cached_tokens=2),
+                output_tokens=20,
+                output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+                total_tokens=30,
+            ),
+        )
+
+
+class FakeTextOpenAIClient:
+    def __init__(self, outputs: list[str]) -> None:
+        self.responses = FakeTextResponses(outputs)
 
 
 class GeneratedQuestionSetFixture:
@@ -159,6 +189,33 @@ def mock_front_generated_questions(prefix: str) -> list[GeneratedQuestion]:
     ]
 
 
+def mock_evaluation_json(per_question_count: int = 15) -> str:
+    payload = {
+        "predictedLevel": OPIcLevel.IM2.value,
+        "confidence": ConfidenceBand.MEDIUM.value,
+        "scores": EvaluationScores(
+            taskFulfillment=70,
+            grammar=68,
+            vocabulary=72,
+            discourse=66,
+            fluency=69,
+        ).model_dump(by_alias=True),
+        "strengths": ["질문에 맞춰 답변을 이어 갔습니다."],
+        "improvements": ["각 답변에 구체적인 예시를 더 연결하세요."],
+        "targetGap": "목표 등급을 위해 답변 구조와 세부 묘사를 보강하세요.",
+        "overallFeedback": "전체적으로 응답을 완주했으며, 문항별 핵심 근거를 더 구체화하면 좋습니다.",
+        "perQuestion": [
+            PerQuestionFeedback(
+                number=number,
+                feedback="핵심 답변 뒤에 이유와 예시를 보강하세요.",
+                sampleAnswer="I would give a clear answer and add one specific personal example.",
+            ).model_dump(by_alias=True)
+            for number in range(1, per_question_count + 1)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def test_openai_strict_schema_requires_nullable_question_fields() -> None:
     schema = openai_strict_json_schema(GeneratedQuestionsPayload.model_json_schema())
     question_schema = schema["$defs"]["GeneratedQuestion"]
@@ -262,6 +319,49 @@ async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() 
     assert {
         item["questionType"] for item in input_text["blueprint"]
     }.isdisjoint({value.value for value in forbidden})
+
+
+@pytest.mark.asyncio
+async def test_mock_evaluation_retries_when_per_question_validation_fails() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    questions = [
+        *FallbackQuestionGenerator(repository).mock_front(6, BackgroundProfile()),
+        *FallbackQuestionGenerator(repository).mock_tail(
+            effective_level=6,
+            background=BackgroundProfile(),
+        ),
+    ]
+    service._client = FakeTextOpenAIClient(  # type: ignore[assignment]
+        [mock_evaluation_json(per_question_count=14), mock_evaluation_json()]
+    )
+
+    result = await service.evaluate_mock(
+        questions=questions,
+        transcripts=[
+            f"Answer {number} with some supporting detail." for number in range(1, 16)
+        ],
+        target=OPIcLevel.IH,
+        metrics=[
+            AudioMetrics(
+                durationSeconds=30,
+                speakingSeconds=25,
+                silenceRatio=0.1,
+                wordsPerMinute=100,
+            )
+            for _ in range(15)
+        ],
+    )
+
+    assert [item.number for item in result.per_question] == list(range(1, 16))
+    assert service._client.responses.calls == 2  # type: ignore[union-attr]
+    retry_request = service._client.responses.requests[1]  # type: ignore[union-attr]
+    assert "previous structured output failed backend validation" in str(
+        retry_request["instructions"]
+    )
+    assert "perQuestion must contain ordered numbers 1 through 15" in str(
+        retry_request["instructions"]
+    )
 
 
 @pytest.mark.asyncio
