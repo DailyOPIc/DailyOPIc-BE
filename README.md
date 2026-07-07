@@ -75,13 +75,140 @@ Firestore TTL은 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt` 
 
 ## 컨테이너와 Cloud Run 사용
 
-워크스페이스 루트에서 빌드합니다.
+DailyOPIc-BE 저장소 루트에서 빌드합니다.
 
 ```bash
-docker build -f DailyOPIc-BE/Dockerfile -t dailyopic-api .
+docker build -t dailyopic-api .
 ```
 
 Cloud Run은 request-based billing, 최소 인스턴스 `0`, timeout `300초`, 보수적인 최대 인스턴스 설정을 권장합니다. Health check는 `/health`를 사용하며 `status`, `mockAI`를 반환합니다.
+
+## GitHub Actions CI/CD
+
+`.github/workflows/deploy-cloud-run.yml`은 백엔드 저장소 루트(`DailyOPIc-BE`) 기준으로 실행됩니다.
+
+- `main` 대상 PR: `pytest -q`만 실행합니다.
+- `main` push 또는 PR merge: 테스트 통과 후 Docker 이미지를 빌드하고 Artifact Registry에 push한 뒤 Cloud Run `dailyopic-api`에 배포합니다.
+- 이미지 태그는 GitHub full SHA 기반 `sha-<github-sha>`를 사용합니다.
+- 배포 이미지 경로는 `asia-northeast3-docker.pkg.dev/opicmobile-45cd5/dailyopic/dailyopic-api:sha-<github-sha>`입니다.
+- 배포 후 workflow가 Cloud Run 서비스 URL의 `/health`를 호출해 새 revision 응답을 확인합니다.
+
+GitHub repository secrets에는 아래 값을 등록합니다.
+
+```text
+GCP_SA_KEY=<GitHub Actions deployer service account JSON key>
+GCP_PROJECT_ID=opicmobile-45cd5
+GCP_REGION=asia-northeast3
+CLOUD_RUN_SERVICE=dailyopic-api
+ARTIFACT_REGISTRY_REPOSITORY=dailyopic
+```
+
+현재 workflow는 적용이 쉬운 서비스 계정 키 JSON 방식(`GCP_SA_KEY`)을 사용합니다. 이 방식은 설정이 단순하지만 장기 key가 GitHub Secret에 저장되므로 key 유출 위험, 주기적인 rotation, 퇴사자/권한 변경 시 폐기 절차를 관리해야 합니다. 보안상 더 좋은 방식은 GitHub OIDC 기반 Workload Identity Federation입니다. WIF로 전환하면 JSON key 없이 GitHub Actions가 짧은 수명의 토큰으로 GCP 서비스 계정을 impersonate합니다. 전환 시 workflow의 `google-github-actions/auth` 설정을 `workload_identity_provider`, `service_account` 방식으로 바꾸고, secrets에는 아래 값을 사용합니다.
+
+```text
+GCP_WORKLOAD_IDENTITY_PROVIDER=<projects/.../locations/global/workloadIdentityPools/.../providers/...>
+GCP_SERVICE_ACCOUNT=github-actions-deployer@opicmobile-45cd5.iam.gserviceaccount.com
+```
+
+배포용 서비스 계정 예시는 아래와 같습니다.
+
+```text
+github-actions-deployer@opicmobile-45cd5.iam.gserviceaccount.com
+```
+
+필요한 API와 IAM 권한은 아래와 같습니다. Artifact Registry writer는 가능하면 프로젝트 전체가 아니라 `dailyopic` repository 단위로 부여합니다.
+
+```bash
+export PROJECT_ID=opicmobile-45cd5
+export REGION=asia-northeast3
+export REPO=dailyopic
+export DEPLOYER_SA="github-actions-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+export RUNTIME_SA="<cloud-run-runtime-service-account>"
+
+gcloud services enable \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  --project "$PROJECT_ID"
+
+gcloud artifacts repositories add-iam-policy-binding "$REPO" \
+  --location "$REGION" \
+  --member "serviceAccount:${DEPLOYER_SA}" \
+  --role roles/artifactregistry.writer \
+  --project "$PROJECT_ID"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${DEPLOYER_SA}" \
+  --role roles/run.admin
+
+gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
+  --member "serviceAccount:${DEPLOYER_SA}" \
+  --role roles/iam.serviceAccountUser \
+  --project "$PROJECT_ID"
+```
+
+Cloud Run runtime service account에는 운영 실행 권한이 별도로 필요합니다.
+
+- Firestore 접근: `roles/datastore.user`
+- Secret Manager에서 `OPENAI_API_KEY`를 주입하는 경우 해당 secret에 `roles/secretmanager.secretAccessor`
+
+Workload Identity Federation으로 전환할 때는 아래 API도 활성화합니다.
+
+```bash
+gcloud services enable \
+  iamcredentials.googleapis.com \
+  sts.googleapis.com \
+  --project "$PROJECT_ID"
+```
+
+배포 실패 시 먼저 GitHub Actions의 실패 step을 확인합니다.
+
+- `Authenticate to Google Cloud`: `GCP_SA_KEY` 누락, JSON key 오류, 비활성화된 서비스 계정
+- `Push Docker image`: Artifact Registry repository 경로 오류 또는 `roles/artifactregistry.writer` 부족
+- `Deploy to Cloud Run`: `roles/run.admin` 부족 또는 runtime service account에 대한 `roles/iam.serviceAccountUser` 부족
+- `Verify health endpoint`: revision 시작 실패, Cloud Run 인증 설정, 런타임 환경변수/Secret Manager/Firestore 권한 문제
+
+Cloud Run과 Artifact Registry 상태는 아래 명령으로 확인합니다.
+
+```bash
+gcloud run services logs read dailyopic-api \
+  --region asia-northeast3 \
+  --project opicmobile-45cd5 \
+  --limit 100
+
+gcloud run revisions list \
+  --service dailyopic-api \
+  --region asia-northeast3 \
+  --project opicmobile-45cd5
+
+gcloud artifacts docker images list \
+  asia-northeast3-docker.pkg.dev/opicmobile-45cd5/dailyopic/dailyopic-api \
+  --include-tags
+```
+
+배포 후 서비스 URL을 알고 있으면 직접 `/health`를 확인할 수 있습니다.
+
+```bash
+curl -fsS https://<cloud-run-host>/health
+```
+
+### 수동 배포 fallback
+
+GitHub Actions 배포가 실패하거나 긴급히 로컬에서 배포해야 할 때만 아래 명령을 사용합니다.
+
+```bash
+cd DailyOPIc-BE
+export PROJECT_ID=opicmobile-45cd5
+export REGION=asia-northeast3
+export SERVICE=dailyopic-api
+export REPO=dailyopic
+export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:$(date +%Y%m%d-%H%M%S)"
+gcloud config set project "$PROJECT_ID"
+gcloud builds submit . --tag "$IMAGE" && \
+gcloud run deploy "$SERVICE" \
+  --image "$IMAGE" \
+  --region "$REGION" \
+  --platform managed
+```
 
 AdMob 리워드 광고의 Server-side verification callback은 아래 주소로 설정합니다.
 
@@ -174,4 +301,4 @@ firebase emulators:exec --only firestore \
 - 서버에는 `ADMOB_REWARDED_AD_UNIT_ID=ca-app-pub-5460686409666356/7091483531`만 설정
 - AdMob SSV callback URL은 public HTTPS `https://<cloud-run-host>/v1/admob/ssv` 또는 개발용 HTTPS 터널로 설정
 - Firestore TTL을 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt`에 설정
-- `pytest`와 `docker build -f DailyOPIc-BE/Dockerfile -t dailyopic-api .` 통과 확인
+- `pytest`와 `docker build -t dailyopic-api .` 통과 확인
