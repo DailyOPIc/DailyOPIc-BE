@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.models.api import (
     AudioMetrics,
@@ -186,35 +186,74 @@ class AIService:
         self._repository = repository
         self._fallback = FallbackQuestionGenerator(repository)
 
+    @staticmethod
+    def _validation_error_messages(error: ValidationError) -> list[str]:
+        messages: list[str] = []
+        for item in error.errors(include_url=False):
+            location = ".".join(str(part) for part in item.get("loc", ()))
+            messages.append(
+                f"{location or '__root__'}: {item.get('msg', 'validation error')}"
+            )
+        return messages[:8]
+
     async def _structured(
-        self, *, instructions: str, input_text: str, schema: type[BaseModel]
+        self,
+        *,
+        instructions: str,
+        input_text: str,
+        schema: type[BaseModel],
+        max_attempts: int = 1,
     ) -> StructuredAIResult:
         if not self._client:
             raise AIServiceConfigurationError("OpenAI client is not configured")
+        validation_errors: list[str] = []
         try:
-            response = await self._client.responses.create(
-                model=self.model,
-                store=False,
-                reasoning={"effort": "low"},
-                instructions=instructions,
-                input=input_text,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": schema.__name__,
-                        "strict": True,
-                        "schema": openai_strict_json_schema(schema.model_json_schema()),
-                    }
-                },
-            )
-            usage = self._log_usage(response, schema.__name__)
-            if not response.output_text:
-                raise ValueError("OpenAI returned no structured output")
-            return StructuredAIResult(
-                payload=schema.model_validate_json(response.output_text),
-                response_id=getattr(response, "id", None),
-                usage=usage,
-            )
+            for attempt in range(1, max_attempts + 1):
+                attempt_instructions = instructions
+                if validation_errors:
+                    attempt_instructions = (
+                        f"{instructions}\n\n"
+                        "The previous structured output failed backend validation. "
+                        "Return a complete replacement JSON object only, and fix these errors: "
+                        f"{'; '.join(validation_errors)}"
+                    )
+                response = await self._client.responses.create(
+                    model=self.model,
+                    store=False,
+                    reasoning={"effort": "low"},
+                    instructions=attempt_instructions,
+                    input=input_text,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": schema.__name__,
+                            "strict": True,
+                            "schema": openai_strict_json_schema(schema.model_json_schema()),
+                        }
+                    },
+                )
+                usage = self._log_usage(response, schema.__name__)
+                if not response.output_text:
+                    raise ValueError("OpenAI returned no structured output")
+                try:
+                    return StructuredAIResult(
+                        payload=schema.model_validate_json(response.output_text),
+                        response_id=getattr(response, "id", None),
+                        usage=usage,
+                    )
+                except ValidationError as error:
+                    if attempt >= max_attempts:
+                        raise
+                    validation_errors = self._validation_error_messages(error)
+                    logger.warning(
+                        "OpenAI structured output failed validation; retrying. "
+                        "model=%s schema=%s attempt=%s errors=%s",
+                        self.model,
+                        schema.__name__,
+                        attempt,
+                        validation_errors,
+                    )
+            raise ValueError("OpenAI structured request exhausted attempts")
         except AIServiceError:
             raise
         except Exception as error:
@@ -1010,6 +1049,7 @@ class AIService:
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIPracticeResult,
+                max_attempts=2,
             )
             result = structured.payload
         assert isinstance(result, AIPracticeResult)
@@ -1085,10 +1125,14 @@ class AIService:
                     "Evaluate this complete 15-answer OPIc-style mock exam conservatively and holistically. "
                     "Determine predictedLevel before considering the target level. Use audio metrics only for delivery and fluency, "
                     "not pronunciation. Return compact Korean feedback. Each perQuestion feedback must be one short sentence, "
-                    "and each English sampleAnswer must be one or two sentences."
+                    "and each English sampleAnswer must be one or two sentences. Return exactly 15 perQuestion items, "
+                    "ordered with number 1 through 15, matching the input answer order. Do not omit, duplicate, or reorder "
+                    "perQuestion entries. Keep overallFeedback within 450 characters, each perQuestion feedback within "
+                    "180 characters, and each perQuestion sampleAnswer within 350 characters."
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIMockResult,
+                max_attempts=2,
             )
             result = structured.payload
         assert isinstance(result, AIMockResult)
