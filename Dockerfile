@@ -12,8 +12,8 @@ WORKDIR /app
 
 # Build from the workspace root:
 # docker build -f DailyOPIc-BE/Dockerfile -t dailyopic-api .
-COPY DailyOPIc-BE/pyproject.toml /app/pyproject.toml
-COPY DailyOPIc-BE/app /app/app
+COPY pyproject.toml /app/pyproject.toml
+COPY app /app/app
 
 RUN pip install --no-cache-dir .
 
