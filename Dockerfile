@@ -10,8 +10,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Build from the workspace root:
-# docker build -f DailyOPIc-BE/Dockerfile -t dailyopic-api .
+# Build from the DailyOPIc-BE repository root:
+# docker build -t dailyopic-api .
 COPY pyproject.toml /app/pyproject.toml
 COPY app /app/app
 
