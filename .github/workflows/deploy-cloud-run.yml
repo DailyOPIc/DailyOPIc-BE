@@ -49,6 +49,7 @@ jobs:
       REGION: ${{ secrets.GCP_REGION }}
       SERVICE: ${{ secrets.CLOUD_RUN_SERVICE }}
       REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_REPOSITORY }}
+      RUNTIME_SA: dailyopic-cloudrun@opicmobile-45cd5.iam.gserviceaccount.com
       IMAGE: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ARTIFACT_REGISTRY_REPOSITORY }}/${{ secrets.CLOUD_RUN_SERVICE }}:sha-${{ github.sha }}
 
     steps:
@@ -79,6 +80,7 @@ jobs:
             --region "${REGION}" \
             --platform managed \
             --project "${PROJECT_ID}" \
+            --service-account "${RUNTIME_SA}" \
             --quiet
 
       - name: Verify health endpoint
