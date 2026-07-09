@@ -9,7 +9,7 @@
 
 개발 서버와 운영 서버는 같은 구조로 실행합니다. 차이는 AI 호출만 `MOCK_AI`로 전환한다는 점입니다.
 
-- Firestore는 항상 사용합니다.
+- 상태 저장소는 기본 SQLite이며, `STATE_BACKEND`로 Firestore/memory를 선택할 수 있습니다(Firestore 코드는 그대로 유지). 자세한 전환 방법은 아래 "상태 저장소 백엔드 전환" 참고.
 - Firebase App Check는 항상 검증합니다.
 - Firebase Auth는 사용하지 않습니다.
 - 사용자 식별은 iOS Keychain에 저장된 UUID를 `X-DailyOPIc-User-ID` 헤더로 전달합니다.
@@ -47,6 +47,29 @@ MAX_DAILY_REWARD_COUNT=3
 
 실제 OpenAI 호출을 확인하려면 `.env`에 `MOCK_AI=false`, `OPENAI_API_KEY=<local shell secret>`을 설정합니다. API Key는 로그나 문서, 예시 env 파일에 기록하지 않습니다.
 `MOCK_AI=true`에서는 OpenAI를 호출하지 않고 catalog fallback 질문을 반환하므로 응답의 `fallbackUsed`가 `true`입니다.
+
+## 상태 저장소 백엔드 전환
+
+상태 저장소는 `StateStore` 추상화 뒤에 SQLite / Firestore / memory 구현이 있으며 **기본값은 SQLite**입니다. `.env`를 수정하지 않고, 실행 명령 앞에 `STATE_BACKEND` 환경변수를 붙여 전환합니다(환경변수가 `.env`보다 우선 적용).
+
+```bash
+# SQLite (기본, 파일 DB) — 실행 위치에 dailyopic.db 생성, 재시작해도 데이터 유지
+STATE_BACKEND=sqlite uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# SQLite + 파일 경로 고정 (항상 같은 위치에 저장)
+STATE_BACKEND=sqlite SQLITE_URL="sqlite:////절대/경로/dailyopic.db" \
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Firestore (기존 방식)
+STATE_BACKEND=firestore uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# memory (임시, 재시작 시 초기화 · 빠른 확인용)
+STATE_BACKEND=memory uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+`STATE_BACKEND`를 지정하지 않으면 SQLite로 동작합니다. 서버 시작 로그의 `DailyOPIc state backend=<값>`으로 현재 백엔드를 확인할 수 있습니다. 테스트(`pytest`)는 `tests/conftest.py`에서 인메모리 SQLite(`sqlite://`)로 고정되어 매 테스트가 격리됩니다.
+
+RDB 테이블은 Firestore 컬렉션과 1:1 대응하며(예: `questionSets` ↔ `question_sets`), 스키마 정의는 `app/models/db.py`, 매핑 상세는 `docs/domain-model.dbml`에 있습니다.
 
 ## 운영 설정
 
