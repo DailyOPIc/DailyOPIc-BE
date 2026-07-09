@@ -9,10 +9,10 @@ from app.models.api import (
     BackgroundProfile,
     BackgroundSurvey,
     DifficultyAdjustment,
+    ExamSection,
     GeneratedQuestion,
     OPIcLevel,
-    QuestionType,
-    SurveyQuestionType,
+    QuestionStyle,
 )
 from app.services.difficulty import adjusted_level, expected_target_level
 
@@ -139,7 +139,7 @@ class QuestionPatternRepository:
         *,
         topic_id: str,
         target_level: OPIcLevel,
-        question_types: list[SurveyQuestionType],
+        question_types: list[QuestionStyle],
         used_ids: set[str],
     ) -> dict[str, Any] | None:
         normalized = self.normalize_topic_id(topic_id)
@@ -155,7 +155,7 @@ class QuestionPatternRepository:
         *,
         category: str,
         target_level: OPIcLevel,
-        question_types: list[SurveyQuestionType] | None,
+        question_types: list[QuestionStyle] | None,
         used_ids: set[str],
     ) -> dict[str, Any] | None:
         return self._best_match(
@@ -178,7 +178,7 @@ class QuestionPatternRepository:
         self,
         *,
         target_level: OPIcLevel,
-        question_types: list[SurveyQuestionType] | None,
+        question_types: list[QuestionStyle] | None,
         used_ids: set[str],
         predicate: Any,
     ) -> dict[str, Any] | None:
@@ -187,7 +187,7 @@ class QuestionPatternRepository:
             item
             for item in self._patterns
             if predicate(item)
-            and (not accepted_types or item.get("questionType") in accepted_types)
+            and (not accepted_types or item.get("questionStyle") in accepted_types)
             and str(item.get("id", "")) not in used_ids
         ]
         candidates.sort(
@@ -214,12 +214,12 @@ class QuestionPatternRepository:
 
     @staticmethod
     def _question_type_rank(
-        item: dict[str, Any], question_types: list[SurveyQuestionType] | None
+        item: dict[str, Any], question_types: list[QuestionStyle] | None
     ) -> int:
         if not question_types:
             return 0
         try:
-            return [value.value for value in question_types].index(str(item.get("questionType")))
+            return [value.value for value in question_types].index(str(item.get("questionStyle")))
         except ValueError:
             return len(question_types)
 
@@ -227,9 +227,9 @@ class QuestionPatternRepository:
 def validate_mock_blueprint(questions: list[GeneratedQuestion]) -> None:
     if [item.number for item in questions] != list(range(1, 16)):
         raise ValueError("mock exam must contain ordered numbers 1 through 15")
-    if questions[0].type is not QuestionType.INTRODUCTION:
+    if questions[0].exam_section is not ExamSection.INTRODUCTION:
         raise ValueError("question 1 must be introduction")
-    if any(item.type is not QuestionType.SURVEY for item in questions[1:10]):
+    if any(item.exam_section is not ExamSection.SURVEY for item in questions[1:10]):
         raise ValueError("questions 2 through 10 must be survey-based")
     for start, end in [(2, 4), (5, 7), (8, 10)]:
         group = questions[start - 1 : end]
@@ -239,10 +239,10 @@ def validate_mock_blueprint(questions: list[GeneratedQuestion]) -> None:
             raise ValueError(f"questions {start}-{end} must share one comboId")
         if len(topic_ids) != 1 or None in topic_ids:
             raise ValueError(f"questions {start}-{end} must share one topicId")
-    if any(item.type is not QuestionType.ROLEPLAY for item in questions[10:12]):
+    if any(item.exam_section is not ExamSection.ROLEPLAY for item in questions[10:12]):
         raise ValueError("questions 11 and 12 must be roleplay")
-    tail_types = [item.type for item in questions[12:]]
-    if tail_types != [QuestionType.UNEXPECTED, QuestionType.COMPARISON, QuestionType.ADVANCED]:
+    tail_types = [item.exam_section for item in questions[12:]]
+    if tail_types != [ExamSection.UNEXPECTED, ExamSection.COMPARISON, ExamSection.ADVANCED]:
         raise ValueError("questions 13-15 must be unexpected, comparison, advanced")
 
 
@@ -251,7 +251,7 @@ def validate_practice_blueprint(questions: list[GeneratedQuestion]) -> None:
     if numbers not in [list(range(1, 8)), list(range(8, 11)), list(range(1, 11))]:
         raise ValueError("practice question numbering is invalid")
     if questions and questions[0].number == 1:
-        if questions[0].type is not QuestionType.INTRODUCTION:
+        if questions[0].exam_section is not ExamSection.INTRODUCTION:
             raise ValueError("practice question 1 must be introduction")
     complete = {item.number: item for item in questions}
     for start, end in [(2, 4), (5, 7)]:
@@ -260,7 +260,7 @@ def validate_practice_blueprint(questions: list[GeneratedQuestion]) -> None:
             continue
         if len(group) != 3:
             raise ValueError(f"practice questions {start}-{end} must be a full combo")
-        if any(item.type is not QuestionType.SURVEY for item in group):
+        if any(item.exam_section is not ExamSection.SURVEY for item in group):
             raise ValueError(f"practice questions {start}-{end} must be survey-based")
         if len({item.combo_id for item in group}) != 1 or group[0].combo_id is None:
             raise ValueError(f"practice questions {start}-{end} must share one comboId")
@@ -274,7 +274,7 @@ def validate_practice_blueprint(questions: list[GeneratedQuestion]) -> None:
 def validate_daily_pool(questions: list[GeneratedQuestion]) -> None:
     if [item.number for item in questions] != list(range(2, 16)):
         raise ValueError("daily pool must contain ordered numbers 2 through 15")
-    if any(item.type is QuestionType.INTRODUCTION for item in questions):
+    if any(item.exam_section is ExamSection.INTRODUCTION for item in questions):
         raise ValueError("daily pool must not include introduction questions")
     for item in questions:
         prompt = item.prompt.lower()
@@ -301,10 +301,10 @@ class FallbackQuestionGenerator:
 
     @staticmethod
     def _question_type(
-        reference: dict[str, Any], fallback: SurveyQuestionType
-    ) -> SurveyQuestionType:
+        reference: dict[str, Any], fallback: QuestionStyle
+    ) -> QuestionStyle:
         try:
-            return SurveyQuestionType(str(reference.get("questionType")))
+            return QuestionStyle(str(reference.get("questionStyle")))
         except (TypeError, ValueError):
             return fallback
 
@@ -322,80 +322,80 @@ class FallbackQuestionGenerator:
 
     @staticmethod
     def _level_question_type(
-        level: int, requested: SurveyQuestionType
-    ) -> SurveyQuestionType:
+        level: int, requested: QuestionStyle
+    ) -> QuestionStyle:
         if level <= 1 and requested not in {
-            SurveyQuestionType.DESCRIPTION,
-            SurveyQuestionType.ROUTINE,
+            QuestionStyle.DESCRIPTION,
+            QuestionStyle.ROUTINE,
         }:
-            return SurveyQuestionType.DESCRIPTION
+            return QuestionStyle.DESCRIPTION
         if level <= 2 and requested in {
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.OPINION,
-            SurveyQuestionType.ROLEPLAY,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.OPINION,
+            QuestionStyle.ROLEPLAY,
         }:
-            return SurveyQuestionType.PAST_EXPERIENCE
+            return QuestionStyle.PAST_EXPERIENCE
         if level <= 3 and requested in {
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.OPINION,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.OPINION,
         }:
-            return SurveyQuestionType.PAST_EXPERIENCE
-        if level <= 4 and requested is SurveyQuestionType.OPINION:
-            return SurveyQuestionType.COMPARISON
+            return QuestionStyle.PAST_EXPERIENCE
+        if level <= 4 and requested is QuestionStyle.OPINION:
+            return QuestionStyle.COMPARISON
         return requested
 
     @staticmethod
     def _broad_type_for_level(
-        level: int, requested: QuestionType, question_type: SurveyQuestionType
-    ) -> QuestionType:
-        if requested in {QuestionType.SURVEY, QuestionType.UNEXPECTED}:
+        level: int, requested: ExamSection, question_type: QuestionStyle
+    ) -> ExamSection:
+        if requested in {ExamSection.SURVEY, ExamSection.UNEXPECTED}:
             return requested
-        if requested is QuestionType.ADVANCED and question_type is SurveyQuestionType.COMPARISON:
-            return QuestionType.COMPARISON
+        if requested is ExamSection.ADVANCED and question_type is QuestionStyle.COMPARISON:
+            return ExamSection.COMPARISON
         if level <= 2 and requested in {
-            QuestionType.ROLEPLAY,
-            QuestionType.COMPARISON,
-            QuestionType.ADVANCED,
+            ExamSection.ROLEPLAY,
+            ExamSection.COMPARISON,
+            ExamSection.ADVANCED,
         }:
-            return QuestionType.UNEXPECTED
+            return ExamSection.UNEXPECTED
         return requested
 
     @staticmethod
     def _prompt_for_level(
-        *, level: int, question_type: SurveyQuestionType, topic_label: str
+        *, level: int, question_type: QuestionStyle, topic_label: str
     ) -> str:
         if level <= 1:
-            if question_type is SurveyQuestionType.ROUTINE:
+            if question_type is QuestionStyle.ROUTINE:
                 return f"What do you usually do when you enjoy {topic_label}."
             return f"Describe {topic_label} in your daily life."
         if level == 2:
-            if question_type is SurveyQuestionType.PAST_EXPERIENCE:
+            if question_type is QuestionStyle.PAST_EXPERIENCE:
                 return f"Tell me about a simple experience related to {topic_label}. Why do you remember it."
-            if question_type is SurveyQuestionType.ROUTINE:
+            if question_type is QuestionStyle.ROUTINE:
                 return f"What do you usually do when you spend time with {topic_label}. Give one simple reason."
             return f"Tell me about {topic_label}. Why do you like it."
         if level == 3:
-            if question_type is SurveyQuestionType.ROUTINE:
+            if question_type is QuestionStyle.ROUTINE:
                 return f"Explain your usual routine for {topic_label}. Give one reason why it fits your life."
             return f"Tell me about a memorable experience with {topic_label}. Explain why it was memorable."
         if level == 4:
-            if question_type is SurveyQuestionType.COMPARISON:
+            if question_type is QuestionStyle.COMPARISON:
                 return f"Compare your experience with {topic_label} now and in the past. Explain what has changed."
             return f"Tell me about a specific experience with {topic_label}. Explain the situation and why it mattered to you."
         if level == 5:
-            if question_type is SurveyQuestionType.ROLEPLAY:
+            if question_type is QuestionStyle.ROLEPLAY:
                 return f"You need information about {topic_label}. Call someone and explain your situation. Ask three detailed questions and confirm the next step."
-            if question_type is SurveyQuestionType.PROBLEM_SOLVING:
+            if question_type is QuestionStyle.PROBLEM_SOLVING:
                 return f"Describe a problem you experienced with {topic_label}. Explain how you handled it. Tell me what you learned from that experience."
-            if question_type is SurveyQuestionType.COMPARISON:
+            if question_type is QuestionStyle.COMPARISON:
                 return f"Compare two different experiences related to {topic_label}. Explain the main differences. Tell me which one was more meaningful and why."
             return f"Describe a detailed experience related to {topic_label}. Explain the background and the result. Tell me how that experience changed your thinking."
-        if question_type is SurveyQuestionType.OPINION:
+        if question_type is QuestionStyle.OPINION:
             return f"Discuss how {topic_label} influences people or society today. Explain both advantages and disadvantages. Predict one important change in the future."
-        if question_type is SurveyQuestionType.PROBLEM_SOLVING:
+        if question_type is QuestionStyle.PROBLEM_SOLVING:
             return f"Analyze a complex problem connected to {topic_label}. Explain why the problem matters to different people. Propose a realistic solution and discuss its limits."
-        if question_type is SurveyQuestionType.ROLEPLAY:
+        if question_type is QuestionStyle.ROLEPLAY:
             return f"You are handling a complicated situation involving {topic_label}. Explain the background clearly. Negotiate a solution and confirm responsibilities."
         return f"Discuss a complex experience related to {topic_label}. Explain how the situation developed. Analyze what it shows about people's choices or values."
 
@@ -408,19 +408,19 @@ class FallbackQuestionGenerator:
         self,
         *,
         number: int,
-        broad_type: QuestionType,
+        broad_type: ExamSection,
         combo_id: str | None,
         level: int,
         topic_id: str,
         category: str,
-        requested_type: SurveyQuestionType,
+        requested_type: QuestionStyle,
     ) -> GeneratedQuestion:
         question_type = self._level_question_type(level, requested_type)
         broad_type = self._broad_type_for_level(level, broad_type, question_type)
         topic_label = self._topic_label(topic_id)
         return GeneratedQuestion(
             number=number,
-            type=broad_type,
+            examSection=broad_type,
             comboId=combo_id,
             topic=topic_label,
             prompt=self._prompt_for_level(
@@ -430,7 +430,7 @@ class FallbackQuestionGenerator:
             ),
             difficulty=expected_target_level(level),
             rubricFocus=["task fulfillment", "organization", "supporting detail"],
-            questionType=question_type,
+            questionStyle=question_type,
             followUpPrompt=None,
             topicId=topic_id,
             category=category,
@@ -440,13 +440,13 @@ class FallbackQuestionGenerator:
     def _introduction(self, *, level: int) -> GeneratedQuestion:
         return GeneratedQuestion(
             number=1,
-            type=QuestionType.INTRODUCTION,
+            examSection=ExamSection.INTRODUCTION,
             comboId=None,
             topic="self introduction",
             prompt=self._intro_prompt(level),
             difficulty=expected_target_level(level),
             rubricFocus=["warm-up", "organization", "fluency"],
-            questionType=SurveyQuestionType.DESCRIPTION,
+            questionStyle=QuestionStyle.DESCRIPTION,
             followUpPrompt=None,
             topicId="self_introduction",
             category="introduction",
@@ -481,86 +481,86 @@ class FallbackQuestionGenerator:
         )
 
     @staticmethod
-    def _survey_sequence(target_level: OPIcLevel) -> list[SurveyQuestionType]:
+    def _survey_sequence(target_level: OPIcLevel) -> list[QuestionStyle]:
         if target_level in {OPIcLevel.IL, OPIcLevel.IM1}:
             return [
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.ROUTINE,
-                SurveyQuestionType.PAST_EXPERIENCE,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.ROUTINE,
+                QuestionStyle.PAST_EXPERIENCE,
             ]
         if target_level in {OPIcLevel.IM2, OPIcLevel.IM3}:
             return [
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.PAST_EXPERIENCE,
-                SurveyQuestionType.COMPARISON,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.PAST_EXPERIENCE,
+                QuestionStyle.COMPARISON,
             ]
         return [
-            SurveyQuestionType.DESCRIPTION,
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.OPINION,
+            QuestionStyle.DESCRIPTION,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.OPINION,
         ]
 
     @staticmethod
-    def _tail_sequence(target_level: OPIcLevel) -> list[SurveyQuestionType]:
+    def _tail_sequence(target_level: OPIcLevel) -> list[QuestionStyle]:
         if target_level in {OPIcLevel.IL, OPIcLevel.IM1}:
             return [
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.COMPARISON,
-                SurveyQuestionType.OPINION,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.COMPARISON,
+                QuestionStyle.OPINION,
             ]
         return [
-            SurveyQuestionType.PAST_EXPERIENCE,
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.OPINION,
+            QuestionStyle.PAST_EXPERIENCE,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.OPINION,
         ]
 
     @staticmethod
-    def _practice_sequence(target_level: OPIcLevel) -> list[SurveyQuestionType]:
+    def _practice_sequence(target_level: OPIcLevel) -> list[QuestionStyle]:
         if target_level in {OPIcLevel.IL, OPIcLevel.IM1}:
             return [
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.ROUTINE,
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.PAST_EXPERIENCE,
-                SurveyQuestionType.ROUTINE,
-                SurveyQuestionType.PAST_EXPERIENCE,
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.COMPARISON,
-                SurveyQuestionType.ROLEPLAY,
-                SurveyQuestionType.OPINION,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.ROUTINE,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.PAST_EXPERIENCE,
+                QuestionStyle.ROUTINE,
+                QuestionStyle.PAST_EXPERIENCE,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.COMPARISON,
+                QuestionStyle.ROLEPLAY,
+                QuestionStyle.OPINION,
             ]
         if target_level in {OPIcLevel.IM2, OPIcLevel.IM3}:
             return [
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.PAST_EXPERIENCE,
-                SurveyQuestionType.COMPARISON,
-                SurveyQuestionType.ROUTINE,
-                SurveyQuestionType.DESCRIPTION,
-                SurveyQuestionType.PROBLEM_SOLVING,
-                SurveyQuestionType.PAST_EXPERIENCE,
-                SurveyQuestionType.COMPARISON,
-                SurveyQuestionType.ROLEPLAY,
-                SurveyQuestionType.OPINION,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.PAST_EXPERIENCE,
+                QuestionStyle.COMPARISON,
+                QuestionStyle.ROUTINE,
+                QuestionStyle.DESCRIPTION,
+                QuestionStyle.PROBLEM_SOLVING,
+                QuestionStyle.PAST_EXPERIENCE,
+                QuestionStyle.COMPARISON,
+                QuestionStyle.ROLEPLAY,
+                QuestionStyle.OPINION,
             ]
         return [
-            SurveyQuestionType.DESCRIPTION,
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.OPINION,
-            SurveyQuestionType.PAST_EXPERIENCE,
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.ROLEPLAY,
-            SurveyQuestionType.OPINION,
-            SurveyQuestionType.DESCRIPTION,
+            QuestionStyle.DESCRIPTION,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.OPINION,
+            QuestionStyle.PAST_EXPERIENCE,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.ROLEPLAY,
+            QuestionStyle.OPINION,
+            QuestionStyle.DESCRIPTION,
         ]
 
     def _practice_topic(
-        self, question_type: SurveyQuestionType, offset: int
+        self, question_type: QuestionStyle, offset: int
     ) -> tuple[str, str]:
         candidates: list[tuple[str, str]] = []
         for item in self._repository.patterns:
-            if item.get("questionType") != question_type.value:
+            if item.get("questionStyle") != question_type.value:
                 continue
             category = str(item.get("category") or "")
             topic_id = str(item.get("topicId") or "")
@@ -593,12 +593,12 @@ class FallbackQuestionGenerator:
         self,
         *,
         number: int,
-        broad_type: QuestionType,
+        broad_type: ExamSection,
         combo_id: str | None,
         target_level: OPIcLevel,
         topic_id: str,
         category: str,
-        question_types: list[SurveyQuestionType],
+        question_types: list[QuestionStyle],
         fallback_prompt: str,
         used_ids: set[str],
     ) -> GeneratedQuestion:
@@ -621,13 +621,13 @@ class FallbackQuestionGenerator:
         question_type = self._question_type(reference, question_types[0])
         return GeneratedQuestion(
             number=number,
-            type=broad_type,
+            examSection=broad_type,
             comboId=combo_id,
             topic=str(reference.get("topic") or self._topic_label(topic_id)),
             prompt=self._prompt(reference, fallback_prompt),
             difficulty=target_level,
             rubricFocus=["task fulfillment", "organization", "supporting detail"],
-            questionType=question_type,
+            questionStyle=question_type,
             followUpPrompt=self._follow_up(reference),
             topicId=str(reference.get("topicId") or topic_id),
             category=str(reference.get("category") or category),
@@ -663,14 +663,14 @@ class FallbackQuestionGenerator:
         survey = self._survey_from_background(background)
         topic = self._survey_topics(survey)[2]
         sequence = [
-            SurveyQuestionType.PAST_EXPERIENCE,
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.OPINION,
+            QuestionStyle.PAST_EXPERIENCE,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.OPINION,
         ]
         return [
             self._generated_question(
                 number=number,
-                broad_type=QuestionType.UNEXPECTED,
+                broad_type=ExamSection.UNEXPECTED,
                 combo_id=None,
                 level=effective_level,
                 topic_id=topic if index == 0 else f"unexpected_{index + 1}_{topic}",
@@ -691,36 +691,36 @@ class FallbackQuestionGenerator:
         survey = survey or self._survey_from_background(background)
         topics = self._survey_topics(survey)
         sequence = [
-            SurveyQuestionType.DESCRIPTION,
-            SurveyQuestionType.ROUTINE,
-            SurveyQuestionType.PAST_EXPERIENCE,
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.ROLEPLAY,
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.OPINION,
-            SurveyQuestionType.DESCRIPTION,
-            SurveyQuestionType.PAST_EXPERIENCE,
-            SurveyQuestionType.COMPARISON,
-            SurveyQuestionType.ROLEPLAY,
-            SurveyQuestionType.PROBLEM_SOLVING,
-            SurveyQuestionType.OPINION,
-            SurveyQuestionType.ROUTINE,
+            QuestionStyle.DESCRIPTION,
+            QuestionStyle.ROUTINE,
+            QuestionStyle.PAST_EXPERIENCE,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.ROLEPLAY,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.OPINION,
+            QuestionStyle.DESCRIPTION,
+            QuestionStyle.PAST_EXPERIENCE,
+            QuestionStyle.COMPARISON,
+            QuestionStyle.ROLEPLAY,
+            QuestionStyle.PROBLEM_SOLVING,
+            QuestionStyle.OPINION,
+            QuestionStyle.ROUTINE,
         ]
         broad_types = [
-            QuestionType.SURVEY,
-            QuestionType.SURVEY,
-            QuestionType.SURVEY,
-            QuestionType.COMPARISON,
-            QuestionType.ROLEPLAY,
-            QuestionType.ROLEPLAY,
-            QuestionType.ADVANCED,
-            QuestionType.UNEXPECTED,
-            QuestionType.UNEXPECTED,
-            QuestionType.COMPARISON,
-            QuestionType.ROLEPLAY,
-            QuestionType.ROLEPLAY,
-            QuestionType.ADVANCED,
-            QuestionType.UNEXPECTED,
+            ExamSection.SURVEY,
+            ExamSection.SURVEY,
+            ExamSection.SURVEY,
+            ExamSection.COMPARISON,
+            ExamSection.ROLEPLAY,
+            ExamSection.ROLEPLAY,
+            ExamSection.ADVANCED,
+            ExamSection.UNEXPECTED,
+            ExamSection.UNEXPECTED,
+            ExamSection.COMPARISON,
+            ExamSection.ROLEPLAY,
+            ExamSection.ROLEPLAY,
+            ExamSection.ADVANCED,
+            ExamSection.UNEXPECTED,
         ]
         questions: list[GeneratedQuestion] = []
         for index, number in enumerate(range(2, 16)):
@@ -766,14 +766,14 @@ class FallbackQuestionGenerator:
         category: str,
     ) -> list[GeneratedQuestion]:
         sequence = [
-            SurveyQuestionType.DESCRIPTION,
-            SurveyQuestionType.ROUTINE,
-            SurveyQuestionType.PAST_EXPERIENCE,
+            QuestionStyle.DESCRIPTION,
+            QuestionStyle.ROUTINE,
+            QuestionStyle.PAST_EXPERIENCE,
         ]
         return [
             self._generated_question(
                 number=start + offset,
-                broad_type=QuestionType.SURVEY,
+                broad_type=ExamSection.SURVEY,
                 combo_id=combo_id,
                 level=level,
                 topic_id=topic_id,
@@ -829,11 +829,11 @@ class FallbackQuestionGenerator:
             )
         ]
         roleplay = [
-            (11, QuestionType.ROLEPLAY, "roleplay_service", SurveyQuestionType.ROLEPLAY),
-            (12, QuestionType.ROLEPLAY, "roleplay_problem", SurveyQuestionType.PROBLEM_SOLVING),
-            (13, QuestionType.UNEXPECTED, "unexpected_daily", SurveyQuestionType.PAST_EXPERIENCE),
-            (14, QuestionType.COMPARISON, "general_comparison", SurveyQuestionType.COMPARISON),
-            (15, QuestionType.ADVANCED, "general_opinion", SurveyQuestionType.OPINION),
+            (11, ExamSection.ROLEPLAY, "roleplay_service", QuestionStyle.ROLEPLAY),
+            (12, ExamSection.ROLEPLAY, "roleplay_problem", QuestionStyle.PROBLEM_SOLVING),
+            (13, ExamSection.UNEXPECTED, "unexpected_daily", QuestionStyle.PAST_EXPERIENCE),
+            (14, ExamSection.COMPARISON, "general_comparison", QuestionStyle.COMPARISON),
+            (15, ExamSection.ADVANCED, "general_opinion", QuestionStyle.OPINION),
         ]
         questions.extend(
             self._generated_question(
@@ -864,7 +864,7 @@ class FallbackQuestionGenerator:
         introduction = self._repository.by_category(
             category="introduction",
             target_level=target_level,
-            question_types=[SurveyQuestionType.DESCRIPTION],
+            question_types=[QuestionStyle.DESCRIPTION],
             used_ids=used_ids,
         )
         if introduction and (identifier := str(introduction.get("id", "")).strip()):
@@ -872,7 +872,7 @@ class FallbackQuestionGenerator:
         questions.append(
             GeneratedQuestion(
                 number=1,
-                type=QuestionType.INTRODUCTION,
+                examSection=ExamSection.INTRODUCTION,
                 comboId=None,
                 topic="self introduction",
                 prompt=self._prompt(
@@ -881,7 +881,7 @@ class FallbackQuestionGenerator:
                 ),
                 difficulty=target_level,
                 rubricFocus=["warm-up", "organization", "fluency"],
-                questionType=SurveyQuestionType.DESCRIPTION,
+                questionStyle=QuestionStyle.DESCRIPTION,
                 followUpPrompt=self._follow_up(introduction or {}),
                 topicId="self_introduction",
                 category="introduction",
@@ -896,7 +896,7 @@ class FallbackQuestionGenerator:
                 questions.append(
                     self._catalog_question(
                         number=number,
-                        broad_type=QuestionType.SURVEY,
+                        broad_type=ExamSection.SURVEY,
                         combo_id=f"survey-{group_index}",
                         target_level=target_level,
                         topic_id=topic_id,
@@ -913,14 +913,14 @@ class FallbackQuestionGenerator:
         roleplay_topics = ["roleplay_service", "roleplay_problem"]
         for index, topic_id in enumerate(roleplay_topics, start=11):
             role_types = (
-                [SurveyQuestionType.ROLEPLAY]
+                [QuestionStyle.ROLEPLAY]
                 if index == 11
-                else [SurveyQuestionType.PROBLEM_SOLVING, SurveyQuestionType.ROLEPLAY]
+                else [QuestionStyle.PROBLEM_SOLVING, QuestionStyle.ROLEPLAY]
             )
             questions.append(
                 self._catalog_question(
                     number=index,
-                    broad_type=QuestionType.ROLEPLAY,
+                    broad_type=ExamSection.ROLEPLAY,
                     combo_id="roleplay",
                     target_level=target_level,
                     topic_id=topic_id,
@@ -935,9 +935,9 @@ class FallbackQuestionGenerator:
             )
 
         tail_specs = [
-            (13, QuestionType.UNEXPECTED, "unexpected_daily", "unexpected"),
-            (14, QuestionType.COMPARISON, "general_comparison", "general"),
-            (15, QuestionType.ADVANCED, "general_opinion", "general"),
+            (13, ExamSection.UNEXPECTED, "unexpected_daily", "unexpected"),
+            (14, ExamSection.COMPARISON, "general_comparison", "general"),
+            (15, ExamSection.ADVANCED, "general_opinion", "general"),
         ]
         for (number, broad_type, topic_id, category), question_type in zip(tail_specs, tail_sequence):
             questions.append(

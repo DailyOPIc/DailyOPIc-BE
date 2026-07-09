@@ -18,7 +18,7 @@ class OPIcLevel(StrEnum):
     AL = "AL"
 
 
-class QuestionType(StrEnum):
+class ExamSection(StrEnum):
     INTRODUCTION = "introduction"
     SURVEY = "survey"
     UNEXPECTED = "unexpected"
@@ -39,7 +39,7 @@ class QuestionSetStatus(StrEnum):
     COMPLETE = "complete"
 
 
-class SurveyQuestionType(StrEnum):
+class QuestionStyle(StrEnum):
     DESCRIPTION = "description"
     ROUTINE = "routine"
     PAST_EXPERIENCE = "past_experience"
@@ -112,13 +112,13 @@ class GeneratedQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     number: int = Field(ge=1, le=15)
-    type: QuestionType
+    exam_section: ExamSection = Field(alias="examSection")
     combo_id: str | None = Field(default=None, alias="comboId")
     topic: str = Field(min_length=2, max_length=80)
     prompt: str = Field(min_length=8, max_length=700)
     difficulty: OPIcLevel
     rubric_focus: list[str] = Field(alias="rubricFocus", min_length=1, max_length=6)
-    question_type: SurveyQuestionType | None = Field(default=None, alias="questionType")
+    question_style: QuestionStyle | None = Field(default=None, alias="questionStyle")
     follow_up_prompt: str | None = Field(default=None, alias="followUpPrompt", max_length=500)
     topic_id: str | None = Field(default=None, alias="topicId", max_length=80)
     category: str | None = Field(default=None, max_length=80)
@@ -199,11 +199,9 @@ class TargetLevelResponse(BaseModel):
     previous_target_level: OPIcLevel | None = Field(
         default=None, alias="previousTargetLevel"
     )
-    initial_level: int = Field(alias="initialLevel", ge=1, le=6)
-    previous_initial_level: int | None = Field(default=None, alias="previousInitialLevel")
-    latest_adjustment: DifficultyAdjustment = Field(alias="latestAdjustment")
-    effective_level: int = Field(alias="effectiveLevel", ge=1, le=6)
-    effective_level_code: str = Field(alias="effectiveLevelCode")
+    before_adjust: int = Field(alias="beforeAdjust", ge=1, le=6)
+    previous_before_adjust: int | None = Field(default=None, alias="previousBeforeAdjust")
+    after_adjust: int = Field(alias="afterAdjust", ge=1, le=6)
     changed: bool
     reward_consumed: bool = Field(alias="rewardConsumed")
 

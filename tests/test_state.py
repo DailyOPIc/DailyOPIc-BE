@@ -20,9 +20,7 @@ async def test_question_set_is_bound_to_user_and_mode() -> None:
         initial_level=5,
         adjustment=None,
         effective_level=5,
-        effective_level_code="5-5",
         status="awaiting_adjustment",
-        front_question_count=7,
         background={},
         survey=None,
         question_hash="hash-1",
@@ -154,6 +152,29 @@ async def test_target_level_change_requires_verified_reward_and_consumes_it() ->
         await store.set_target_level(
             uid="u1", target_level="IM3", reward_nonce="target-level-nonce-123456"
         )
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_document_preserves_chosen_level() -> None:
+    store = InMemoryStateStore()
+    # 구버전 문서: beforeAdjust/afterAdjust 이전 스키마 (initialLevel 사용).
+    # targetLevel은 조정 후(harder) 레벨 기준으로 저장돼 있어 역산하면 6이 나오지만,
+    # 사용자가 실제 고른 값은 initialLevel=5 이다.
+    store._profiles["legacy-user"] = {
+        "uid": "legacy-user",
+        "initialLevel": 5,
+        "latestAdjustment": "harder",
+        "targetLevel": "AL",
+        "effectiveLevel": 6,
+        "effectiveLevelCode": "5-6",
+    }
+
+    profile = await store.get_learning_profile("legacy-user")
+
+    assert profile is not None
+    assert profile["beforeAdjust"] == 5
+    assert profile["afterAdjust"] == 6
+    assert profile["latestAdjustment"] == "harder"
 
 
 @pytest.mark.asyncio

@@ -171,7 +171,7 @@ def test_daily_pool_is_archived_and_refresh_consumes_practice_token() -> None:
         assert first.status_code == 200, first.text
         first_set = first.json()
         assert [item["number"] for item in first_set["questions"]] == list(range(2, 16))
-        assert all(item["type"] != "introduction" for item in first_set["questions"])
+        assert all(item["examSection"] != "introduction" for item in first_set["questions"])
 
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["freeRemaining"] == 3
