@@ -24,14 +24,12 @@ async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
     await store.save_question_set(
         uid=uid,
         set_id=set_id,
-        mode="practice",
+        mode="daily",
         target_level="IH",
         initial_level=5,
         adjustment=None,
         effective_level=5,
-        effective_level_code="5-5",
         status="awaiting_adjustment",
-        front_question_count=7,
         background={},
         survey=None,
         question_hash="hash-1",
@@ -39,11 +37,11 @@ async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
     )
 
-    saved = await store.get_question_set(uid=uid, set_id=set_id, mode="practice")
+    saved = await store.get_question_set(uid=uid, set_id=set_id, mode="daily")
 
     assert saved is not None
     assert saved["questionHash"] == "hash-1"
-    assert await store.get_question_set(uid=f"{uid}-other", set_id=set_id, mode="practice") is None
+    assert await store.get_question_set(uid=f"{uid}-other", set_id=set_id, mode="daily") is None
     assert await store.get_question_set(uid=uid, set_id=set_id, mode="mock") is None
 
 
