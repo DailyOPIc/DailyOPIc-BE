@@ -11,6 +11,7 @@ os.environ.update(
         "FREE_PRACTICE_LIMIT": "3",
         "REWARD_PRACTICE_CREDITS": "1",
         "MAX_DAILY_REWARD_COUNT": "3",
+        "STATE_BACKEND": "sqlite",
     }
 )
 

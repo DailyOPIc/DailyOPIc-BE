@@ -15,7 +15,8 @@ from app.services.ai import AIService
 from app.services.audio import AudioMetricsService
 from app.services.auth import AuthService
 from app.services.questions import QuestionPatternRepository
-from app.services.state import FirestoreStateStore
+from app.services.sql_store import SqlAlchemyStateStore
+from app.services.state import FirestoreStateStore, InMemoryStateStore, StateStore
 
 
 QUESTION_PATTERN_FILE = Path("app/data/question_patterns.json")
@@ -23,6 +24,17 @@ REQUEST_RESULT_TTL_HOURS = 24
 AUDIO_MAX_SECONDS = 180
 AUDIO_MAX_BYTES = 4 * 1024 * 1024
 logger = logging.getLogger(__name__)
+
+
+def build_state_store(settings) -> StateStore:
+    backend = (settings.state_backend or "sqlite").lower()
+    if backend == "firestore":
+        return FirestoreStateStore(settings.firebase_project_id)
+    if backend == "memory":
+        return InMemoryStateStore()
+    if backend == "sqlite":
+        return SqlAlchemyStateStore(settings.sqlite_url)
+    raise ValueError(f"unknown STATE_BACKEND: {settings.state_backend}")
 
 
 @asynccontextmanager
@@ -38,7 +50,8 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.request_result_ttl_hours = REQUEST_RESULT_TTL_HOURS
     app.state.auth_service = AuthService(settings)
-    app.state.state_store = FirestoreStateStore(settings.firebase_project_id)
+    app.state.state_store = build_state_store(settings)
+    logger.info("DailyOPIc state backend=%s", settings.state_backend)
     app.state.audio_service = AudioMetricsService(
         max_bytes=AUDIO_MAX_BYTES,
         max_seconds=AUDIO_MAX_SECONDS,

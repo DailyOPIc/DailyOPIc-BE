@@ -11,6 +11,7 @@ dependencies = [
   "openai>=1.75,<2",
   "firebase-admin>=6.7,<8",
   "google-cloud-firestore>=2.20,<3",
+  "sqlalchemy>=2.0,<3",
   "httpx>=0.28,<1",
   "cryptography>=44,<46",
 ]

@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     free_practice_limit: int = 3
     reward_practice_credits: int = 1
     max_daily_reward_count: int = 3
+    # 상태 저장소 백엔드: sqlite(기본) | firestore | memory
+    state_backend: str = "sqlite"
+    # SQLAlchemy 접속 URL (state_backend=sqlite일 때 사용)
+    sqlite_url: str = "sqlite:///dailyopic.db"
 
     @model_validator(mode="after")
     def validate_required_settings(self) -> "Settings":
