@@ -12,6 +12,8 @@ os.environ.update(
         "REWARD_PRACTICE_CREDITS": "1",
         "MAX_DAILY_REWARD_COUNT": "3",
         "STATE_BACKEND": "sqlite",
+        # 파일이 아닌 인메모리 SQLite → 테스트마다 새 DB로 격리 보장
+        "SQLITE_URL": "sqlite://",
     }
 )
 
@@ -19,10 +21,8 @@ os.environ.update(
 @pytest.fixture(autouse=True)
 def app_test_runtime(monkeypatch: pytest.MonkeyPatch):
     from app.config import get_settings
-    from app.services.state import InMemoryStateStore
 
     get_settings.cache_clear()
-    monkeypatch.setattr("app.main.FirestoreStateStore", lambda project_id: InMemoryStateStore())
     monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: None)
     yield
     get_settings.cache_clear()

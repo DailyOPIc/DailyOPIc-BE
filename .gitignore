@@ -4,3 +4,7 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# 로컬 SQLite 상태 저장소 (STATE_BACKEND=sqlite 실행 시 생성)
+*.db
+dailyopic.db
