@@ -203,7 +203,7 @@ async def _ensure_initial_level(
         except RewardNotVerified as error:
             _target_level_change_required(str(error))
         return
-    if int(profile["initialLevel"]) != initial_level:
+    if int(profile["beforeAdjust"]) != initial_level:
         _target_level_change_required(
             "Self Assessment 단계를 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
         )
@@ -219,7 +219,7 @@ def _daily_record_matches(
 ) -> bool:
     return (
         record.get("source") == "free"
-        and record.get("dateKey") == date_key
+        and record.get("date") == date_key
         and int(record.get("initialLevel") or 0) == initial_level
         and _stable_json(record.get("background")) == _stable_json(background)
         and _stable_json(record.get("survey")) == _stable_json(survey)
@@ -234,7 +234,6 @@ async def _create_daily_pool(
     adjustment: DifficultyAdjustment,
     source: str,
     date_key: str,
-    pool_index: int,
     set_id: str | None = None,
 ) -> QuestionSetResponse:
     initial_level = _request_initial_level(payload)
@@ -244,10 +243,10 @@ async def _create_daily_pool(
     uid_hash = _uid_hash(user.uid)
     history = await request.app.state.state_store.get_question_history(
         uid=user.uid,
-        mode="practice",
+        mode="daily",
     )
     logger.info(
-        "question generation requested mode=practice kind=daily_pool uidHash=%s "
+        "question generation requested mode=daily kind=daily_pool uidHash=%s "
         "initialLevel=%s adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s "
         "source=%s mockAI=%s model=%s recentSetCount=%s recentTopicCount=%s "
         "recentPromptCount=%s",
@@ -273,7 +272,7 @@ async def _create_daily_pool(
         )
     except AIQuestionGenerationError as error:
         logger.exception(
-            "question generation failed mode=practice kind=daily_pool uidHash=%s "
+            "question generation failed mode=daily kind=daily_pool uidHash=%s "
             "initialLevel=%s adjustment=%s model=%s",
             uid_hash,
             initial_level,
@@ -295,14 +294,12 @@ async def _create_daily_pool(
     await request.app.state.state_store.save_question_set(
         uid=user.uid,
         set_id=saved_set_id,
-        mode="practice",
+        mode="daily",
         target_level=expected_level.value,
         initial_level=initial_level,
         adjustment=adjustment.value,
         effective_level=effective_level,
-        effective_level_code=effective_level_code(initial_level, adjustment),
         status=QuestionSetStatus.COMPLETE.value,
-        front_question_count=0,
         background=payload.background.model_dump(mode="json"),
         survey=payload.survey.model_dump(mode="json") if payload.survey else None,
         question_hash=set_hash,
@@ -310,11 +307,10 @@ async def _create_daily_pool(
         expires_at=datetime.now(UTC) + timedelta(days=2),
         source=source,
         date_key=date_key,
-        pool_index=pool_index,
     )
     await request.app.state.state_store.record_question_history(
         uid=user.uid,
-        mode="practice",
+        mode="daily",
         set_hash=set_hash,
         questions=serialized,
     )
@@ -322,7 +318,7 @@ async def _create_daily_pool(
     prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
     usage = generation.usage
     logger.info(
-        "question generation succeeded mode=practice kind=daily_pool uidHash=%s "
+        "question generation succeeded mode=daily kind=daily_pool uidHash=%s "
         "initialLevel=%s adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s "
         "provider=%s model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s "
         "source=%s topicIds=%s promptHashes=%s inputTokens=%s cachedInputTokens=%s "
@@ -442,9 +438,7 @@ async def _create_question_set(
         initial_level=initial_level,
         adjustment=None,
         effective_level=effective_level,
-        effective_level_code=effective_level_code(initial_level, DifficultyAdjustment.SAME),
         status=QuestionSetStatus.AWAITING_ADJUSTMENT.value,
-        front_question_count=7,
         background=payload.background.model_dump(mode="json"),
         survey=getattr(payload, "survey", None).model_dump(mode="json")
         if getattr(payload, "survey", None)
@@ -519,11 +513,9 @@ async def update_target_level(
     return TargetLevelResponse(
         targetLevel=result["targetLevel"],
         previousTargetLevel=result["previousTargetLevel"],
-        initialLevel=result["initialLevel"],
-        previousInitialLevel=result["previousInitialLevel"],
-        latestAdjustment=result["latestAdjustment"],
-        effectiveLevel=result["effectiveLevel"],
-        effectiveLevelCode=result["effectiveLevelCode"],
+        beforeAdjust=result["beforeAdjust"],
+        previousBeforeAdjust=result["previousBeforeAdjust"],
+        afterAdjust=result["afterAdjust"],
         changed=result["changed"],
         rewardConsumed=result["rewardConsumed"],
     )
@@ -541,7 +533,7 @@ async def create_practice_set(
     existing = await request.app.state.state_store.get_question_set(
         uid=user.uid,
         set_id=free_set_id,
-        mode="practice",
+        mode="daily",
     )
     background = payload.background.model_dump(mode="json")
     survey = payload.survey.model_dump(mode="json") if payload.survey else None
@@ -563,7 +555,6 @@ async def create_practice_set(
         adjustment=DifficultyAdjustment.SAME,
         source="free",
         date_key=date_key,
-        pool_index=0,
         set_id=free_set_id,
     )
 
@@ -596,7 +587,6 @@ async def refresh_practice_set(
             adjustment=payload.adjustment,
             source="token",
             date_key=date_key,
-            pool_index=int(datetime.now(UTC).timestamp()),
         )
         await request.app.state.state_store.finalize_request(
             request_id,
@@ -625,7 +615,7 @@ async def apply_question_set_adjustment(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> QuestionSetResponse:
-    mode = "practice"
+    mode = "daily"
     record = await request.app.state.state_store.get_question_set(
         uid=user.uid, set_id=set_id, mode=mode
     )
@@ -728,7 +718,6 @@ async def apply_question_set_adjustment(
             mode=mode,
             adjustment=payload.adjustment.value,
             effective_level=effective_level,
-            effective_level_code=code,
             target_level=expected_level.value,
             question_hash=set_hash,
             questions=serialized,
@@ -935,12 +924,12 @@ async def evaluate_practice(
     request_id = _request_id(idempotency_key)
     try:
         question_set = await request.app.state.state_store.get_question_set(
-            uid=user.uid, set_id=set_id, mode="practice"
+            uid=user.uid, set_id=set_id, mode="daily"
         )
         if not question_set:
             raise ValueError("question set not found")
         target = request.app.state.level_adapter.validate_python(
-            question_set.get("expectedTargetLevel") or question_set.get("targetLevel")
+            question_set.get("targetLevel")
         )
         questions = QUESTION_LIST.validate_python(question_set["questions"])
     except (ValueError, ValidationError) as error:
@@ -1029,7 +1018,7 @@ async def evaluate_mock(
         if not question_set:
             raise ValueError("question set not found")
         target = request.app.state.level_adapter.validate_python(
-            question_set.get("expectedTargetLevel") or question_set.get("targetLevel")
+            question_set.get("targetLevel")
         )
         questions = QUESTION_LIST.validate_python(question_set["questions"])
         question_hash = str(question_set["questionHash"])

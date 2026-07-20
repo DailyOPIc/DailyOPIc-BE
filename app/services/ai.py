@@ -16,13 +16,13 @@ from app.models.api import (
     ConfidenceBand,
     DifficultyAdjustment,
     EvaluationScores,
+    ExamSection,
     GeneratedQuestion,
     MockEvaluation,
     OPIcLevel,
     PerQuestionFeedback,
     PracticeEvaluation,
-    QuestionType,
-    SurveyQuestionType,
+    QuestionStyle,
 )
 from app.services.questions import (
     FallbackQuestionGenerator,
@@ -516,10 +516,10 @@ class AIService:
     def _blueprint_item(question: GeneratedQuestion) -> dict[str, Any]:
         return {
             "number": question.number,
-            "type": question.type.value,
+            "examSection": question.exam_section.value,
             "comboId": question.combo_id,
-            "questionType": (
-                question.question_type.value if question.question_type else None
+            "questionStyle": (
+                question.question_style.value if question.question_style else None
             ),
             "difficulty": question.difficulty.value,
             "estimatedLevel": (
@@ -553,7 +553,7 @@ class AIService:
             return [
                 "Q2-Q15 randomized Daily practice prompts only",
                 "No Q1, no introduction, and no self-introduction",
-                "Copy each blueprint type and questionType exactly; comboId remains null",
+                "Copy each blueprint examSection and questionStyle exactly; comboId remains null",
             ]
         if mode == "mock" and stage == "front":
             return [
@@ -723,8 +723,8 @@ class AIService:
         ):
             return questions
         if any(
-            actual.type is QuestionType.INTRODUCTION
-            and expected.type is not QuestionType.INTRODUCTION
+            actual.exam_section is ExamSection.INTRODUCTION
+            and expected.exam_section is not ExamSection.INTRODUCTION
             for expected, actual in zip(blueprint, questions)
         ):
             return questions
@@ -732,9 +732,9 @@ class AIService:
         normalized: list[GeneratedQuestion] = []
         mismatches: list[str] = []
         metadata_fields = [
-            "type",
+            "exam_section",
             "combo_id",
-            "question_type",
+            "question_style",
             "difficulty",
             "estimated_level",
             "category",
@@ -767,7 +767,7 @@ class AIService:
         base = (
             "You create OPIc-style speaking test questions. "
             "Output must strictly match the provided JSON schema. "
-            "Follow the blueprint exactly for number, type, comboId, questionType, difficulty, estimatedLevel, and category. "
+            "Follow the blueprint exactly for number, examSection, comboId, questionStyle, difficulty, estimatedLevel, and category. "
             "Do not invent or change blueprint metadata. "
             "Only make topic, topicId, prompt, followUpPrompt, and rubricFocus fresh and natural. "
             "topic must be a short label under 40 characters, such as 'Self Introduction' or 'Coffee Shops'. "
@@ -808,7 +808,7 @@ class AIService:
                 + "Generate only questions numbered Q2 through Q15. "
                 + "Never include self-introduction, 'Introduce yourself', warm-up, or hint-like follow-up content. "
                 + "The questions are independent practice prompts, not a mock exam combo sequence. "
-                + "Daily independence does not change the metadata: keep type exactly as the blueprint says, "
+                + "Daily independence does not change the metadata: keep examSection exactly as the blueprint says, "
                 + "including roleplay, comparison, and advanced. "
                 + "Use varied survey-based and unexpected topics, and make each prompt clearly different from forbidden.promptTexts."
             )
@@ -871,13 +871,13 @@ class AIService:
         for expected, actual in zip(blueprint, questions):
             if actual.number != expected.number:
                 raise ValueError("generated question number does not match blueprint")
-            if actual.type != expected.type:
-                raise ValueError("generated question type does not match blueprint")
+            if actual.exam_section != expected.exam_section:
+                raise ValueError("generated question examSection does not match blueprint")
             if actual.combo_id != expected.combo_id:
                 raise ValueError("generated question comboId does not match blueprint")
-            if actual.question_type != expected.question_type:
+            if actual.question_style != expected.question_style:
                 raise ValueError(
-                    "generated question questionType does not match blueprint"
+                    "generated question questionStyle does not match blueprint"
                 )
             if actual.difficulty != expected.difficulty:
                 raise ValueError(
@@ -894,30 +894,30 @@ class AIService:
     def _validate_level_rules(
         cls, simulation_level: int, questions: list[GeneratedQuestion]
     ) -> None:
-        forbidden: set[SurveyQuestionType] = set()
+        forbidden: set[QuestionStyle] = set()
 
         if simulation_level <= 1:
             forbidden = {
-                SurveyQuestionType.COMPARISON,
-                SurveyQuestionType.PROBLEM_SOLVING,
-                SurveyQuestionType.OPINION,
-                SurveyQuestionType.ROLEPLAY,
+                QuestionStyle.COMPARISON,
+                QuestionStyle.PROBLEM_SOLVING,
+                QuestionStyle.OPINION,
+                QuestionStyle.ROLEPLAY,
             }
         elif simulation_level == 2:
             forbidden = {
-                SurveyQuestionType.COMPARISON,
-                SurveyQuestionType.PROBLEM_SOLVING,
-                SurveyQuestionType.OPINION,
-                SurveyQuestionType.ROLEPLAY,
+                QuestionStyle.COMPARISON,
+                QuestionStyle.PROBLEM_SOLVING,
+                QuestionStyle.OPINION,
+                QuestionStyle.ROLEPLAY,
             }
         elif simulation_level == 3:
             forbidden = {
-                SurveyQuestionType.PROBLEM_SOLVING,
-                SurveyQuestionType.OPINION,
+                QuestionStyle.PROBLEM_SOLVING,
+                QuestionStyle.OPINION,
             }
 
         for item in questions:
-            if item.question_type in forbidden:
+            if item.question_style in forbidden:
                 raise ValueError("generated question type is too difficult for level")
 
             sentence_count = cls._sentence_count(item.prompt)

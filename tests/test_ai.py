@@ -13,8 +13,8 @@ from app.models.api import (
     GeneratedQuestion,
     OPIcLevel,
     PerQuestionFeedback,
-    QuestionType,
-    SurveyQuestionType,
+    ExamSection,
+    QuestionStyle,
 )
 from app.services.ai import (
     AIQuestionGenerationError,
@@ -97,18 +97,18 @@ class GeneratedQuestionSetFixture:
 
 def practice_questions(prefix: str) -> list[GeneratedQuestion]:
     sequence = [
-        (1, QuestionType.INTRODUCTION, None, SurveyQuestionType.DESCRIPTION, f"{prefix}_intro"),
-        (2, QuestionType.SURVEY, "daily-a", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_a"),
-        (3, QuestionType.SURVEY, "daily-a", SurveyQuestionType.ROUTINE, f"{prefix}_topic_a"),
-        (4, QuestionType.SURVEY, "daily-a", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_a"),
-        (5, QuestionType.SURVEY, "daily-b", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_b"),
-        (6, QuestionType.SURVEY, "daily-b", SurveyQuestionType.ROUTINE, f"{prefix}_topic_b"),
-        (7, QuestionType.SURVEY, "daily-b", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_b"),
+        (1, ExamSection.INTRODUCTION, None, QuestionStyle.DESCRIPTION, f"{prefix}_intro"),
+        (2, ExamSection.SURVEY, "daily-a", QuestionStyle.DESCRIPTION, f"{prefix}_topic_a"),
+        (3, ExamSection.SURVEY, "daily-a", QuestionStyle.ROUTINE, f"{prefix}_topic_a"),
+        (4, ExamSection.SURVEY, "daily-a", QuestionStyle.PAST_EXPERIENCE, f"{prefix}_topic_a"),
+        (5, ExamSection.SURVEY, "daily-b", QuestionStyle.DESCRIPTION, f"{prefix}_topic_b"),
+        (6, ExamSection.SURVEY, "daily-b", QuestionStyle.ROUTINE, f"{prefix}_topic_b"),
+        (7, ExamSection.SURVEY, "daily-b", QuestionStyle.PAST_EXPERIENCE, f"{prefix}_topic_b"),
     ]
     return [
         GeneratedQuestion(
             number=number,
-            type=broad_type,
+            examSection=broad_type,
             comboId=combo_id,
             topic=f"{prefix} topic {number}",
             prompt=(
@@ -118,10 +118,10 @@ def practice_questions(prefix: str) -> list[GeneratedQuestion]:
             ),
             difficulty=OPIcLevel.IH,
             rubricFocus=["task fulfillment", "organization"],
-            questionType=question_type,
+            questionStyle=question_type,
             followUpPrompt=None,
             topicId=topic_id,
-            category="survey" if broad_type is QuestionType.SURVEY else "introduction",
+            category="survey" if broad_type is ExamSection.SURVEY else "introduction",
             estimatedLevel=OPIcLevel.IH,
         )
         for number, broad_type, combo_id, question_type, topic_id in sequence
@@ -130,14 +130,14 @@ def practice_questions(prefix: str) -> list[GeneratedQuestion]:
 
 def practice_tail_questions(prefix: str) -> list[GeneratedQuestion]:
     sequence = [
-        (8, QuestionType.UNEXPECTED, None, SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_tail_a"),
-        (9, QuestionType.UNEXPECTED, None, SurveyQuestionType.COMPARISON, f"{prefix}_tail_b"),
-        (10, QuestionType.UNEXPECTED, None, SurveyQuestionType.OPINION, f"{prefix}_tail_c"),
+        (8, ExamSection.UNEXPECTED, None, QuestionStyle.PAST_EXPERIENCE, f"{prefix}_tail_a"),
+        (9, ExamSection.UNEXPECTED, None, QuestionStyle.COMPARISON, f"{prefix}_tail_b"),
+        (10, ExamSection.UNEXPECTED, None, QuestionStyle.OPINION, f"{prefix}_tail_c"),
     ]
     return [
         GeneratedQuestion(
             number=number,
-            type=broad_type,
+            examSection=broad_type,
             comboId=combo_id,
             topic=f"{prefix} tail {number}",
             prompt=(
@@ -147,7 +147,7 @@ def practice_tail_questions(prefix: str) -> list[GeneratedQuestion]:
             ),
             difficulty=OPIcLevel.AL,
             rubricFocus=["task fulfillment", "organization"],
-            questionType=question_type,
+            questionStyle=question_type,
             followUpPrompt=None,
             topicId=topic_id,
             category="unexpected",
@@ -159,17 +159,17 @@ def practice_tail_questions(prefix: str) -> list[GeneratedQuestion]:
 
 def mock_front_generated_questions(prefix: str) -> list[GeneratedQuestion]:
     sequence = [
-        (2, QuestionType.SURVEY, "survey-1", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_a"),
-        (3, QuestionType.SURVEY, "survey-1", SurveyQuestionType.ROUTINE, f"{prefix}_topic_a"),
-        (4, QuestionType.SURVEY, "survey-1", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_a"),
-        (5, QuestionType.SURVEY, "survey-2", SurveyQuestionType.DESCRIPTION, f"{prefix}_topic_b"),
-        (6, QuestionType.SURVEY, "survey-2", SurveyQuestionType.ROUTINE, f"{prefix}_topic_b"),
-        (7, QuestionType.SURVEY, "survey-2", SurveyQuestionType.PAST_EXPERIENCE, f"{prefix}_topic_b"),
+        (2, ExamSection.SURVEY, "survey-1", QuestionStyle.DESCRIPTION, f"{prefix}_topic_a"),
+        (3, ExamSection.SURVEY, "survey-1", QuestionStyle.ROUTINE, f"{prefix}_topic_a"),
+        (4, ExamSection.SURVEY, "survey-1", QuestionStyle.PAST_EXPERIENCE, f"{prefix}_topic_a"),
+        (5, ExamSection.SURVEY, "survey-2", QuestionStyle.DESCRIPTION, f"{prefix}_topic_b"),
+        (6, ExamSection.SURVEY, "survey-2", QuestionStyle.ROUTINE, f"{prefix}_topic_b"),
+        (7, ExamSection.SURVEY, "survey-2", QuestionStyle.PAST_EXPERIENCE, f"{prefix}_topic_b"),
     ]
     return [
         GeneratedQuestion(
             number=number,
-            type=broad_type,
+            examSection=broad_type,
             comboId=combo_id,
             topic=f"{prefix} mock topic {number}",
             prompt=(
@@ -179,7 +179,7 @@ def mock_front_generated_questions(prefix: str) -> list[GeneratedQuestion]:
             ),
             difficulty=OPIcLevel.AL,
             rubricFocus=["task fulfillment", "organization"],
-            questionType=question_type,
+            questionStyle=question_type,
             followUpPrompt=None,
             topicId=topic_id,
             category="survey",
@@ -306,18 +306,18 @@ async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() 
     )
 
     forbidden = {
-        SurveyQuestionType.COMPARISON,
-        SurveyQuestionType.PROBLEM_SOLVING,
-        SurveyQuestionType.OPINION,
-        SurveyQuestionType.ROLEPLAY,
+        QuestionStyle.COMPARISON,
+        QuestionStyle.PROBLEM_SOLVING,
+        QuestionStyle.OPINION,
+        QuestionStyle.ROLEPLAY,
     }
     assert [item.number for item in result.questions] == list(range(8, 16))
-    assert {item.question_type for item in result.questions}.isdisjoint(forbidden)
+    assert {item.question_style for item in result.questions}.isdisjoint(forbidden)
     request = service._client.responses.requests[0]  # type: ignore[union-attr]
     input_text = json.loads(str(request["input"]))
     assert input_text["effectiveLevel"] == 2
     assert {
-        item["questionType"] for item in input_text["blueprint"]
+        item["questionStyle"] for item in input_text["blueprint"]
     }.isdisjoint({value.value for value in forbidden})
 
 
@@ -378,7 +378,7 @@ async def test_daily_pool_normalizes_model_metadata_to_blueprint() -> None:
     generated = [
         item.model_copy(
             update={
-                "type": QuestionType.SURVEY,
+                "exam_section": ExamSection.SURVEY,
                 "category": "model_selected",
             }
         )
@@ -390,7 +390,7 @@ async def test_daily_pool_normalizes_model_metadata_to_blueprint() -> None:
 
     assert service._client.responses.calls == 1  # type: ignore[union-attr]
     assert [item.number for item in result.questions] == list(range(2, 16))
-    assert [item.type for item in result.questions] == [item.type for item in expected]
+    assert [item.exam_section for item in result.questions] == [item.exam_section for item in expected]
     assert [item.category for item in result.questions] == [
         item.category for item in expected
     ]
