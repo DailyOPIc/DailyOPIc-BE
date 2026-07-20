@@ -962,6 +962,9 @@ class FirestoreStateStore(StateStore):
                     "questionHash": question_hash,
                     "questions": questions,
                     "updatedAt": now,
+                    # 구 문서를 부분 업데이트할 때 제거된 저장 필드가 남지 않도록 명시 삭제
+                    "dateKey": firestore.DELETE_FIELD,
+                    **{field: firestore.DELETE_FIELD for field in _LEGACY_QUESTION_SET_FIELDS},
                 }
                 transaction.update(set_ref, updates)
                 transaction.set(
@@ -1014,7 +1017,13 @@ class FirestoreStateStore(StateStore):
                     raise UsageLimitExceeded("daily practice quota exhausted")
                 transaction.set(
                     usage_ref,
-                    {**usage, "uid": uid, "date": date_key, "updatedAt": datetime.now(UTC)},
+                    {
+                        **usage,
+                        "uid": uid,
+                        "date": date_key,
+                        "dateKey": firestore.DELETE_FIELD,  # 구 필드 제거
+                        "updatedAt": datetime.now(UTC),
+                    },
                     merge=True,
                 )
                 transaction.set(
@@ -1169,7 +1178,13 @@ class FirestoreStateStore(StateStore):
                     reward["credited"] = True
                 transaction.set(
                     usage_ref,
-                    {**usage, "uid": uid, "date": date_key, "updatedAt": datetime.now(UTC)},
+                    {
+                        **usage,
+                        "uid": uid,
+                        "date": date_key,
+                        "dateKey": firestore.DELETE_FIELD,  # 구 필드 제거
+                        "updatedAt": datetime.now(UTC),
+                    },
                     merge=True,
                 )
                 transaction.set(reward_ref, reward)

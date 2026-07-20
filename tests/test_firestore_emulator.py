@@ -224,3 +224,72 @@ async def test_firestore_target_level_change_consumes_verified_reward() -> None:
 
     with pytest.raises(RewardNotVerified):
         await store.set_target_level(uid=uid, target_level="IM3", reward_nonce=nonce)
+
+
+@pytest.mark.asyncio
+async def test_firestore_adjustment_removes_legacy_question_set_fields() -> None:
+    uid = f"legacy-adj-{uuid.uuid4()}"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    set_id = f"legacy-adj-set-{uuid.uuid4()}"
+
+    store._client.collection("questionSets").document(set_id).set(
+        {
+            "uid": uid,
+            "setId": set_id,
+            "mode": "mock",
+            "targetLevel": "IM2",
+            "expectedTargetLevel": "IM2",
+            "initialLevel": 4,
+            "adjustment": None,
+            "effectiveLevel": 4,
+            "effectiveLevelCode": "4-4",
+            "status": "awaiting_adjustment",
+            "frontQuestionCount": 7,
+            "poolIndex": 0,
+            "background": {},
+            "survey": None,
+            "questionHash": "legacy-hash",
+            "questions": [],
+            "source": "free",
+            "dateKey": "20260101",
+            "expiresAt": datetime.now(UTC) + timedelta(days=1),
+            "createdAt": datetime.now(UTC),
+            "updatedAt": datetime.now(UTC),
+        }
+    )
+
+    await store.apply_question_set_adjustment(
+        uid=uid,
+        set_id=set_id,
+        mode="mock",
+        adjustment="same",
+        effective_level=4,
+        target_level="IM2",
+        question_hash="new-hash",
+        questions=[],
+    )
+
+    raw = store._client.collection("questionSets").document(set_id).get().to_dict()
+    # 부분 업데이트 후에도 제거 대상 필드가 실제로 사라져야 한다
+    for legacy in ("expectedTargetLevel", "effectiveLevelCode", "frontQuestionCount", "poolIndex", "dateKey"):
+        assert legacy not in raw
+    assert raw["questionHash"] == "new-hash"
+
+
+@pytest.mark.asyncio
+async def test_firestore_reserve_practice_removes_legacy_usage_date_key() -> None:
+    uid = f"legacy-usage-{uuid.uuid4()}"
+    date_key = "20260622"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    usage_id = FirestoreStateStore._usage_id(uid, date_key)
+
+    # 구 스키마 usage 문서(dateKey 보유)를 직접 저장
+    store._client.collection("dailyUsage").document(usage_id).set(
+        {"uid": uid, "dateKey": date_key, "freeUsed": 0, "bonusRemaining": 0, "rewardCount": 0}
+    )
+
+    await store.reserve_practice(uid, date_key, f"{uid}-req", 3)
+
+    raw = store._client.collection("dailyUsage").document(usage_id).get().to_dict()
+    assert raw["date"] == date_key
+    assert "dateKey" not in raw
