@@ -41,8 +41,74 @@ async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
 
     assert saved is not None
     assert saved["questionHash"] == "hash-1"
+    # 저장 스키마(변경 반영 후) 검증: 신 필드 존재, 구 필드 부재
+    assert saved["mode"] == "daily"
+    for legacy in ("expectedTargetLevel", "effectiveLevelCode", "frontQuestionCount", "poolIndex", "dateKey"):
+        assert legacy not in saved
     assert await store.get_question_set(uid=f"{uid}-other", set_id=set_id, mode="daily") is None
     assert await store.get_question_set(uid=uid, set_id=set_id, mode="mock") is None
+
+
+@pytest.mark.asyncio
+async def test_firestore_legacy_question_set_is_normalized_on_read() -> None:
+    uid = f"legacy-{uuid.uuid4()}"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    set_id = f"legacy-set-{uuid.uuid4()}"
+
+    # 배포 전 스키마 문서를 client로 직접 저장 (mode=practice, type/questionType, dateKey)
+    store._client.collection("questionSets").document(set_id).set(
+        {
+            "uid": uid,
+            "setId": set_id,
+            "mode": "practice",
+            "targetLevel": "IM1",
+            "expectedTargetLevel": "IM1",
+            "initialLevel": 3,
+            "adjustment": None,
+            "effectiveLevel": 3,
+            "effectiveLevelCode": "3-3",
+            "status": "complete",
+            "frontQuestionCount": 0,
+            "poolIndex": 0,
+            "background": {},
+            "survey": None,
+            "questionHash": "legacy-hash",
+            "questions": [
+                {
+                    "number": 2,
+                    "type": "survey",
+                    "comboId": "daily-a",
+                    "topic": "movies",
+                    "prompt": "Describe the movies you usually enjoy.",
+                    "difficulty": "IM1",
+                    "rubricFocus": ["task fulfillment"],
+                    "questionType": "description",
+                    "followUpPrompt": None,
+                    "topicId": "movies",
+                    "category": "daily",
+                    "estimatedLevel": "IM1",
+                }
+            ],
+            "source": "free",
+            "dateKey": "20260101",
+            "expiresAt": datetime.now(UTC) + timedelta(days=1),
+            "createdAt": datetime.now(UTC),
+            "updatedAt": datetime.now(UTC),
+        }
+    )
+
+    # 구 mode=practice 문서를 mode=daily 요청으로 조회 (dual-read) + read-time 정규화
+    record = await store.get_question_set(uid=uid, set_id=set_id, mode="daily")
+
+    assert record is not None
+    assert record["mode"] == "daily"
+    assert record["date"] == "20260101"
+    assert "dateKey" not in record
+    question = record["questions"][0]
+    assert question["examSection"] == "survey"
+    assert question["questionStyle"] == "description"
+    assert "type" not in question
+    assert "questionType" not in question
 
 
 @pytest.mark.asyncio

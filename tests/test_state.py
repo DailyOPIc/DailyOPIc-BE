@@ -1,9 +1,55 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import TypeAdapter
 
-from app.models.api import RewardPurpose
+from app.models.api import GeneratedQuestion, RewardPurpose
 from app.services.state import InMemoryStateStore, RewardNotVerified, UsageLimitExceeded
+
+
+_QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
+
+
+def _legacy_question_set(*, mode: str) -> dict:
+    """배포 전 스키마의 questionSets 문서 (type/questionType/dateKey/제거된 필드 포함)."""
+    return {
+        "uid": "u1",
+        "setId": "legacy-set",
+        "mode": mode,
+        "targetLevel": "IM1",
+        "expectedTargetLevel": "IM1",
+        "initialLevel": 3,
+        "adjustment": None,
+        "effectiveLevel": 3,
+        "effectiveLevelCode": "3-3",
+        "status": "complete",
+        "frontQuestionCount": 0,
+        "poolIndex": 0,
+        "background": {},
+        "survey": None,
+        "questionHash": "legacy-hash",
+        "questions": [
+            {
+                "number": 2,
+                "type": "survey",
+                "comboId": "daily-a",
+                "topic": "movies",
+                "prompt": "Describe the movies you usually enjoy.",
+                "difficulty": "IM1",
+                "rubricFocus": ["task fulfillment"],
+                "questionType": "description",
+                "followUpPrompt": None,
+                "topicId": "movies",
+                "category": "daily",
+                "estimatedLevel": "IM1",
+            }
+        ],
+        "source": "free",
+        "dateKey": "20260101",
+        "expiresAt": datetime.now(UTC) + timedelta(days=1),
+        "createdAt": datetime.now(UTC),
+        "updatedAt": datetime.now(UTC),
+    }
 
 
 @pytest.mark.asyncio
@@ -175,6 +221,47 @@ async def test_legacy_profile_document_preserves_chosen_level() -> None:
     assert profile["beforeAdjust"] == 5
     assert profile["afterAdjust"] == 6
     assert profile["latestAdjustment"] == "harder"
+
+
+@pytest.mark.asyncio
+async def test_legacy_daily_question_set_is_normalized_on_read() -> None:
+    store = InMemoryStateStore()
+    # 배포 전 daily 세트: mode="practice", dateKey, 제거된 필드, 구 type/questionType
+    store._question_sets["legacy-set"] = _legacy_question_set(mode="practice")
+
+    record = await store.get_question_set(uid="u1", set_id="legacy-set", mode="daily")
+
+    assert record is not None
+    assert record["mode"] == "daily"
+    assert record["date"] == "20260101"
+    assert "dateKey" not in record
+    for legacy in ("expectedTargetLevel", "effectiveLevelCode", "frontQuestionCount", "poolIndex"):
+        assert legacy not in record
+    question = record["questions"][0]
+    assert question["examSection"] == "survey"
+    assert question["questionStyle"] == "description"
+    assert "type" not in question
+    assert "questionType" not in question
+    # 정규화 후 현재 DTO 검증을 통과해야 한다
+    _QUESTION_LIST.validate_python(record["questions"])
+
+
+@pytest.mark.asyncio
+async def test_legacy_mock_question_set_is_normalized_on_read() -> None:
+    store = InMemoryStateStore()
+    # 배포 전 mock 세트: mode="mock"(불변)이라 조회는 되고 구 필드로 검증이 깨지던 케이스
+    store._question_sets["legacy-set"] = _legacy_question_set(mode="mock")
+
+    record = await store.get_question_set(uid="u1", set_id="legacy-set", mode="mock")
+
+    assert record is not None
+    assert record["mode"] == "mock"
+    question = record["questions"][0]
+    assert question["examSection"] == "survey"
+    assert question["questionStyle"] == "description"
+    assert "type" not in question
+    assert "questionType" not in question
+    _QUESTION_LIST.validate_python(record["questions"])
 
 
 @pytest.mark.asyncio

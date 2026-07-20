@@ -158,6 +158,52 @@ class StateStore(ABC):
     ) -> dict[str, Any]: ...
 
 
+_DAILY_MODE_ALIASES = frozenset({"daily", "practice"})
+_LEGACY_QUESTION_SET_FIELDS = (
+    "expectedTargetLevel",
+    "effectiveLevelCode",
+    "frontQuestionCount",
+    "poolIndex",
+)
+
+
+def _mode_matches(stored: object, requested: str) -> bool:
+    """배포 전 저장된 문서 호환: daily 요청은 구 practice 값도 매칭."""
+    if stored == requested:
+        return True
+    return requested == "daily" and stored in _DAILY_MODE_ALIASES
+
+
+def _normalize_legacy_question(question: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(question)
+    if "examSection" not in normalized and "type" in normalized:
+        normalized["examSection"] = normalized["type"]
+    normalized.pop("type", None)
+    if "questionStyle" not in normalized and "questionType" in normalized:
+        normalized["questionStyle"] = normalized["questionType"]
+    normalized.pop("questionType", None)
+    return normalized
+
+
+def _normalize_legacy_question_set(record: dict[str, Any]) -> dict[str, Any]:
+    """구 스키마 questionSets 문서를 현재 필드로 정규화 (read-time, 멱등)."""
+    normalized = dict(record)
+    if normalized.get("mode") == "practice":
+        normalized["mode"] = "daily"
+    if "date" not in normalized and "dateKey" in normalized:
+        normalized["date"] = normalized["dateKey"]
+    normalized.pop("dateKey", None)
+    for legacy in _LEGACY_QUESTION_SET_FIELDS:
+        normalized.pop(legacy, None)
+    questions = normalized.get("questions")
+    if isinstance(questions, list):
+        normalized["questions"] = [
+            _normalize_legacy_question(item) if isinstance(item, dict) else item
+            for item in questions
+        ]
+    return normalized
+
+
 def _usage_defaults() -> dict[str, int]:
     return {"freeUsed": 0, "bonusRemaining": 0, "rewardCount": 0}
 
@@ -327,11 +373,11 @@ class InMemoryStateStore(StateStore):
             if (
                 not question_set
                 or question_set["uid"] != uid
-                or question_set["mode"] != mode
+                or not _mode_matches(question_set["mode"], mode)
                 or question_set["expiresAt"] < datetime.now(UTC)
             ):
                 return None
-            return deepcopy(question_set)
+            return _normalize_legacy_question_set(deepcopy(question_set))
 
     async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
         async with self._lock:
@@ -451,7 +497,7 @@ class InMemoryStateStore(StateStore):
             if (
                 not question_set
                 or question_set["uid"] != uid
-                or question_set["mode"] != mode
+                or not _mode_matches(question_set["mode"], mode)
                 or question_set["expiresAt"] < datetime.now(UTC)
             ):
                 raise KeyError("question set not found")
@@ -713,11 +759,11 @@ class FirestoreStateStore(StateStore):
             if (
                 not value
                 or value.get("uid") != uid
-                or value.get("mode") != mode
+                or not _mode_matches(value.get("mode"), mode)
                 or value.get("expiresAt") < datetime.now(UTC)
             ):
                 return None
-            return value
+            return _normalize_legacy_question_set(value)
 
         return await asyncio.to_thread(read)
 
@@ -900,7 +946,7 @@ class FirestoreStateStore(StateStore):
                 if (
                     not question_set
                     or question_set.get("uid") != uid
-                    or question_set.get("mode") != mode
+                    or not _mode_matches(question_set.get("mode"), mode)
                     or question_set.get("expiresAt") < now
                 ):
                     raise KeyError("question set not found")

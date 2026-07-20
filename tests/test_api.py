@@ -524,3 +524,34 @@ def test_mock_evaluation_rejects_unverified_reward() -> None:
 
     assert response.status_code == 402
     assert response.json()["detail"]["code"] == "mock_reward_required"
+
+
+def test_response_contract_uses_renamed_fields() -> None:
+    with TestClient(app) as client:
+        question_set = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"initialLevel": 4, "background": {"interests": ["news"]}},
+        )
+        assert question_set.status_code == 200, question_set.text
+        question = question_set.json()["questions"][0]
+        assert "examSection" in question
+        assert "questionStyle" in question
+        assert "type" not in question
+        assert "questionType" not in question
+
+        target = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"initialLevel": 4},
+        )
+        assert target.status_code == 200, target.text
+        body = target.json()
+        assert "beforeAdjust" in body
+        assert "previousBeforeAdjust" in body
+        assert "afterAdjust" in body
+        assert "initialLevel" not in body
+        assert "previousInitialLevel" not in body
+        assert "effectiveLevel" not in body
+        assert "effectiveLevelCode" not in body
+        assert "latestAdjustment" not in body
