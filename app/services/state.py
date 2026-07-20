@@ -15,7 +15,6 @@ from google.cloud import firestore
 from app.models.api import DifficultyAdjustment, RewardPurpose
 from app.services.difficulty import (
     adjusted_level,
-    effective_level_code,
     expected_target_level,
     initial_level_from_target,
 )
@@ -57,9 +56,7 @@ class StateStore(ABC):
         initial_level: int,
         adjustment: str | None,
         effective_level: int,
-        effective_level_code: str,
         status: str,
-        front_question_count: int,
         background: dict[str, Any],
         survey: dict[str, Any] | None,
         question_hash: str,
@@ -67,7 +64,6 @@ class StateStore(ABC):
         expires_at: datetime,
         source: str | None = None,
         date_key: str | None = None,
-        pool_index: int | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -111,7 +107,6 @@ class StateStore(ABC):
         mode: str,
         adjustment: str,
         effective_level: int,
-        effective_level_code: str,
         target_level: str,
         question_hash: str,
         questions: list[dict[str, Any]],
@@ -161,6 +156,52 @@ class StateStore(ABC):
         transaction_id: str,
         practice_credit_amount: int,
     ) -> dict[str, Any]: ...
+
+
+_DAILY_MODE_ALIASES = frozenset({"daily", "practice"})
+_LEGACY_QUESTION_SET_FIELDS = (
+    "expectedTargetLevel",
+    "effectiveLevelCode",
+    "frontQuestionCount",
+    "poolIndex",
+)
+
+
+def _mode_matches(stored: object, requested: str) -> bool:
+    """배포 전 저장된 문서 호환: daily 요청은 구 practice 값도 매칭."""
+    if stored == requested:
+        return True
+    return requested == "daily" and stored in _DAILY_MODE_ALIASES
+
+
+def _normalize_legacy_question(question: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(question)
+    if "examSection" not in normalized and "type" in normalized:
+        normalized["examSection"] = normalized["type"]
+    normalized.pop("type", None)
+    if "questionStyle" not in normalized and "questionType" in normalized:
+        normalized["questionStyle"] = normalized["questionType"]
+    normalized.pop("questionType", None)
+    return normalized
+
+
+def _normalize_legacy_question_set(record: dict[str, Any]) -> dict[str, Any]:
+    """구 스키마 questionSets 문서를 현재 필드로 정규화 (read-time, 멱등)."""
+    normalized = dict(record)
+    if normalized.get("mode") == "practice":
+        normalized["mode"] = "daily"
+    if "date" not in normalized and "dateKey" in normalized:
+        normalized["date"] = normalized["dateKey"]
+    normalized.pop("dateKey", None)
+    for legacy in _LEGACY_QUESTION_SET_FIELDS:
+        normalized.pop(legacy, None)
+    questions = normalized.get("questions")
+    if isinstance(questions, list):
+        normalized["questions"] = [
+            _normalize_legacy_question(item) if isinstance(item, dict) else item
+            for item in questions
+        ]
+    return normalized
 
 
 def _usage_defaults() -> dict[str, int]:
@@ -223,26 +264,26 @@ def _counts_toward_daily_reward_quota(purpose: RewardPurpose) -> bool:
 def _profile_from_value(profile: dict[str, Any] | None) -> dict[str, Any] | None:
     if not profile:
         return None
-    initial_level = profile.get("initialLevel")
-    if initial_level is None:
-        initial_level = initial_level_from_target(profile.get("targetLevel"))
-    if initial_level is None:
+    before_adjust = profile.get("beforeAdjust")
+    if before_adjust is None:
+        before_adjust = profile.get("initialLevel")  # 레거시 문서: 사용자가 고른 원본 값
+    if before_adjust is None:
+        before_adjust = initial_level_from_target(profile.get("targetLevel"))
+    if before_adjust is None:
         return None
-    initial_level = int(initial_level)
+    before_adjust = int(before_adjust)
     latest_adjustment = str(
         profile.get("latestAdjustment") or DifficultyAdjustment.SAME.value
     )
-    effective_level = adjusted_level(initial_level, latest_adjustment)
+    after_adjust = adjusted_level(before_adjust, latest_adjustment)
     target_level = str(
-        profile.get("expectedTargetLevel") or expected_target_level(effective_level).value
+        profile.get("targetLevel") or expected_target_level(after_adjust).value
     )
     return {
         **profile,
-        "initialLevel": initial_level,
+        "beforeAdjust": before_adjust,
         "latestAdjustment": latest_adjustment,
-        "effectiveLevel": effective_level,
-        "effectiveLevelCode": effective_level_code(initial_level, latest_adjustment),
-        "expectedTargetLevel": target_level,
+        "afterAdjust": after_adjust,
         "targetLevel": target_level,
     }
 
@@ -256,12 +297,11 @@ def _target_change_response(
     return {
         "targetLevel": profile["targetLevel"],
         "previousTargetLevel": previous["targetLevel"] if previous else None,
-        "initialLevel": profile["initialLevel"],
-        "previousInitialLevel": previous["initialLevel"] if previous else None,
+        "beforeAdjust": profile["beforeAdjust"],
+        "previousBeforeAdjust": previous["beforeAdjust"] if previous else None,
         "latestAdjustment": profile["latestAdjustment"],
-        "effectiveLevel": profile["effectiveLevel"],
-        "effectiveLevelCode": profile["effectiveLevelCode"],
-        "changed": previous is None or previous["initialLevel"] != profile["initialLevel"],
+        "afterAdjust": profile["afterAdjust"],
+        "changed": previous is None or previous["beforeAdjust"] != profile["beforeAdjust"],
         "rewardConsumed": reward_consumed,
     }
 
@@ -295,9 +335,7 @@ class InMemoryStateStore(StateStore):
         initial_level: int,
         adjustment: str | None,
         effective_level: int,
-        effective_level_code: str,
         status: str,
-        front_question_count: int,
         background: dict[str, Any],
         survey: dict[str, Any] | None,
         question_hash: str,
@@ -305,7 +343,6 @@ class InMemoryStateStore(StateStore):
         expires_at: datetime,
         source: str | None = None,
         date_key: str | None = None,
-        pool_index: int | None = None,
     ) -> None:
         async with self._lock:
             self._question_sets[set_id] = {
@@ -313,20 +350,16 @@ class InMemoryStateStore(StateStore):
                 "setId": set_id,
                 "mode": mode,
                 "targetLevel": target_level,
-                "expectedTargetLevel": target_level,
                 "initialLevel": initial_level,
                 "adjustment": adjustment,
                 "effectiveLevel": effective_level,
-                "effectiveLevelCode": effective_level_code,
                 "status": status,
-                "frontQuestionCount": front_question_count,
                 "background": deepcopy(background),
                 "survey": deepcopy(survey),
                 "questionHash": question_hash,
                 "questions": deepcopy(questions),
                 "source": source,
-                "dateKey": date_key,
-                "poolIndex": pool_index,
+                "date": date_key,
                 "expiresAt": expires_at,
                 "createdAt": datetime.now(UTC),
                 "updatedAt": datetime.now(UTC),
@@ -340,11 +373,11 @@ class InMemoryStateStore(StateStore):
             if (
                 not question_set
                 or question_set["uid"] != uid
-                or question_set["mode"] != mode
+                or not _mode_matches(question_set["mode"], mode)
                 or question_set["expiresAt"] < datetime.now(UTC)
             ):
                 return None
-            return deepcopy(question_set)
+            return _normalize_legacy_question_set(deepcopy(question_set))
 
     async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
         async with self._lock:
@@ -392,7 +425,7 @@ class InMemoryStateStore(StateStore):
             now = datetime.now(UTC)
             previous = _profile_from_value(self._profiles.get(uid))
             reward_consumed = False
-            if previous and previous["initialLevel"] != initial_level:
+            if previous and previous["beforeAdjust"] != initial_level:
                 reward = self._rewards.get(reward_nonce or "")
                 if (
                     not reward
@@ -413,7 +446,7 @@ class InMemoryStateStore(StateStore):
             profile = _profile_from_value(
                 {
                     "uid": uid,
-                    "initialLevel": initial_level,
+                    "beforeAdjust": initial_level,
                     "latestAdjustment": DifficultyAdjustment.SAME.value,
                     "createdAt": created_at,
                     "updatedAt": now,
@@ -423,11 +456,9 @@ class InMemoryStateStore(StateStore):
             self._profiles[uid] = {
                 "uid": uid,
                 "targetLevel": profile["targetLevel"],
-                "expectedTargetLevel": profile["expectedTargetLevel"],
-                "initialLevel": profile["initialLevel"],
+                "beforeAdjust": profile["beforeAdjust"],
                 "latestAdjustment": profile["latestAdjustment"],
-                "effectiveLevel": profile["effectiveLevel"],
-                "effectiveLevelCode": profile["effectiveLevelCode"],
+                "afterAdjust": profile["afterAdjust"],
                 "createdAt": created_at,
                 "updatedAt": now,
             }
@@ -457,7 +488,6 @@ class InMemoryStateStore(StateStore):
         mode: str,
         adjustment: str,
         effective_level: int,
-        effective_level_code: str,
         target_level: str,
         question_hash: str,
         questions: list[dict[str, Any]],
@@ -467,7 +497,7 @@ class InMemoryStateStore(StateStore):
             if (
                 not question_set
                 or question_set["uid"] != uid
-                or question_set["mode"] != mode
+                or not _mode_matches(question_set["mode"], mode)
                 or question_set["expiresAt"] < datetime.now(UTC)
             ):
                 raise KeyError("question set not found")
@@ -478,10 +508,8 @@ class InMemoryStateStore(StateStore):
             question_set.update(
                 {
                     "targetLevel": target_level,
-                    "expectedTargetLevel": target_level,
                     "adjustment": adjustment,
                     "effectiveLevel": effective_level,
-                    "effectiveLevelCode": effective_level_code,
                     "status": "complete",
                     "questionHash": question_hash,
                     "questions": deepcopy(questions),
@@ -493,9 +521,7 @@ class InMemoryStateStore(StateStore):
                 self._profiles[uid] = {
                     **self._profiles[uid],
                     "latestAdjustment": adjustment,
-                    "effectiveLevel": effective_level,
-                    "effectiveLevelCode": effective_level_code,
-                    "expectedTargetLevel": target_level,
+                    "afterAdjust": effective_level,
                     "targetLevel": target_level,
                     "updatedAt": datetime.now(UTC),
                 }
@@ -516,6 +542,7 @@ class InMemoryStateStore(StateStore):
 
             usage_id = self._usage_id(uid, date_key)
             usage = self._usage.setdefault(usage_id, _usage_defaults())
+            usage["date"] = date_key
             if usage["freeUsed"] < free_limit:
                 usage["freeUsed"] += 1
                 source = "free"
@@ -613,6 +640,7 @@ class InMemoryStateStore(StateStore):
     ) -> dict[str, Any]:
         async with self._lock:
             usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
+            usage["date"] = date_key
             if _counts_toward_daily_reward_quota(purpose):
                 if usage["rewardCount"] >= max_daily_reward_count:
                     raise UsageLimitExceeded("daily reward quota exhausted")
@@ -690,9 +718,7 @@ class FirestoreStateStore(StateStore):
         initial_level: int,
         adjustment: str | None,
         effective_level: int,
-        effective_level_code: str,
         status: str,
-        front_question_count: int,
         background: dict[str, Any],
         survey: dict[str, Any] | None,
         question_hash: str,
@@ -700,7 +726,6 @@ class FirestoreStateStore(StateStore):
         expires_at: datetime,
         source: str | None = None,
         date_key: str | None = None,
-        pool_index: int | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._client.collection("questionSets").document(set_id).set,
@@ -709,20 +734,16 @@ class FirestoreStateStore(StateStore):
                 "setId": set_id,
                 "mode": mode,
                 "targetLevel": target_level,
-                "expectedTargetLevel": target_level,
                 "initialLevel": initial_level,
                 "adjustment": adjustment,
                 "effectiveLevel": effective_level,
-                "effectiveLevelCode": effective_level_code,
                 "status": status,
-                "frontQuestionCount": front_question_count,
                 "background": background,
                 "survey": survey,
                 "questionHash": question_hash,
                 "questions": questions,
                 "source": source,
-                "dateKey": date_key,
-                "poolIndex": pool_index,
+                "date": date_key,
                 "expiresAt": expires_at,
                 "createdAt": datetime.now(UTC),
                 "updatedAt": datetime.now(UTC),
@@ -738,11 +759,11 @@ class FirestoreStateStore(StateStore):
             if (
                 not value
                 or value.get("uid") != uid
-                or value.get("mode") != mode
+                or not _mode_matches(value.get("mode"), mode)
                 or value.get("expiresAt") < datetime.now(UTC)
             ):
                 return None
-            return value
+            return _normalize_legacy_question_set(value)
 
         return await asyncio.to_thread(read)
 
@@ -823,7 +844,7 @@ class FirestoreStateStore(StateStore):
                 profile = profile_snapshot.to_dict() if profile_snapshot.exists else {}
                 previous = _profile_from_value(profile)
                 reward_consumed = False
-                if previous and previous["initialLevel"] != initial_level:
+                if previous and previous["beforeAdjust"] != initial_level:
                     if reward_ref is None:
                         raise RewardNotVerified(
                             "verified target level change reward is required"
@@ -848,7 +869,7 @@ class FirestoreStateStore(StateStore):
                 updated_profile = _profile_from_value(
                     {
                         "uid": uid,
-                        "initialLevel": initial_level,
+                        "beforeAdjust": initial_level,
                         "latestAdjustment": DifficultyAdjustment.SAME.value,
                         "createdAt": profile.get("createdAt", now),
                         "updatedAt": now,
@@ -861,11 +882,9 @@ class FirestoreStateStore(StateStore):
                     {
                         "uid": uid,
                         "targetLevel": updated_profile["targetLevel"],
-                        "expectedTargetLevel": updated_profile["expectedTargetLevel"],
-                        "initialLevel": updated_profile["initialLevel"],
+                        "beforeAdjust": updated_profile["beforeAdjust"],
                         "latestAdjustment": updated_profile["latestAdjustment"],
-                        "effectiveLevel": updated_profile["effectiveLevel"],
-                        "effectiveLevelCode": updated_profile["effectiveLevelCode"],
+                        "afterAdjust": updated_profile["afterAdjust"],
                         "createdAt": profile.get("createdAt", now),
                         "updatedAt": now,
                     },
@@ -910,7 +929,6 @@ class FirestoreStateStore(StateStore):
         mode: str,
         adjustment: str,
         effective_level: int,
-        effective_level_code: str,
         target_level: str,
         question_hash: str,
         questions: list[dict[str, Any]],
@@ -928,7 +946,7 @@ class FirestoreStateStore(StateStore):
                 if (
                     not question_set
                     or question_set.get("uid") != uid
-                    or question_set.get("mode") != mode
+                    or not _mode_matches(question_set.get("mode"), mode)
                     or question_set.get("expiresAt") < now
                 ):
                     raise KeyError("question set not found")
@@ -938,23 +956,22 @@ class FirestoreStateStore(StateStore):
                     raise AdjustmentAlreadyApplied("question set adjustment already applied")
                 updates = {
                     "targetLevel": target_level,
-                    "expectedTargetLevel": target_level,
                     "adjustment": adjustment,
                     "effectiveLevel": effective_level,
-                    "effectiveLevelCode": effective_level_code,
                     "status": "complete",
                     "questionHash": question_hash,
                     "questions": questions,
                     "updatedAt": now,
+                    # 구 문서를 부분 업데이트할 때 제거된 저장 필드가 남지 않도록 명시 삭제
+                    "dateKey": firestore.DELETE_FIELD,
+                    **{field: firestore.DELETE_FIELD for field in _LEGACY_QUESTION_SET_FIELDS},
                 }
                 transaction.update(set_ref, updates)
                 transaction.set(
                     profile_ref,
                     {
                         "latestAdjustment": adjustment,
-                        "effectiveLevel": effective_level,
-                        "effectiveLevelCode": effective_level_code,
-                        "expectedTargetLevel": target_level,
+                        "afterAdjust": effective_level,
                         "targetLevel": target_level,
                         "updatedAt": now,
                     },
@@ -1000,7 +1017,13 @@ class FirestoreStateStore(StateStore):
                     raise UsageLimitExceeded("daily practice quota exhausted")
                 transaction.set(
                     usage_ref,
-                    {**usage, "uid": uid, "dateKey": date_key, "updatedAt": datetime.now(UTC)},
+                    {
+                        **usage,
+                        "uid": uid,
+                        "date": date_key,
+                        "dateKey": firestore.DELETE_FIELD,  # 구 필드 제거
+                        "updatedAt": datetime.now(UTC),
+                    },
                     merge=True,
                 )
                 transaction.set(
@@ -1155,7 +1178,13 @@ class FirestoreStateStore(StateStore):
                     reward["credited"] = True
                 transaction.set(
                     usage_ref,
-                    {**usage, "uid": uid, "dateKey": date_key, "updatedAt": datetime.now(UTC)},
+                    {
+                        **usage,
+                        "uid": uid,
+                        "date": date_key,
+                        "dateKey": firestore.DELETE_FIELD,  # 구 필드 제거
+                        "updatedAt": datetime.now(UTC),
+                    },
                     merge=True,
                 )
                 transaction.set(reward_ref, reward)

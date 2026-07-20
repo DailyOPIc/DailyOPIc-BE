@@ -1,9 +1,55 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import TypeAdapter
 
-from app.models.api import RewardPurpose
+from app.models.api import GeneratedQuestion, RewardPurpose
 from app.services.state import InMemoryStateStore, RewardNotVerified, UsageLimitExceeded
+
+
+_QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
+
+
+def _legacy_question_set(*, mode: str) -> dict:
+    """배포 전 스키마의 questionSets 문서 (type/questionType/dateKey/제거된 필드 포함)."""
+    return {
+        "uid": "u1",
+        "setId": "legacy-set",
+        "mode": mode,
+        "targetLevel": "IM1",
+        "expectedTargetLevel": "IM1",
+        "initialLevel": 3,
+        "adjustment": None,
+        "effectiveLevel": 3,
+        "effectiveLevelCode": "3-3",
+        "status": "complete",
+        "frontQuestionCount": 0,
+        "poolIndex": 0,
+        "background": {},
+        "survey": None,
+        "questionHash": "legacy-hash",
+        "questions": [
+            {
+                "number": 2,
+                "type": "survey",
+                "comboId": "daily-a",
+                "topic": "movies",
+                "prompt": "Describe the movies you usually enjoy.",
+                "difficulty": "IM1",
+                "rubricFocus": ["task fulfillment"],
+                "questionType": "description",
+                "followUpPrompt": None,
+                "topicId": "movies",
+                "category": "daily",
+                "estimatedLevel": "IM1",
+            }
+        ],
+        "source": "free",
+        "dateKey": "20260101",
+        "expiresAt": datetime.now(UTC) + timedelta(days=1),
+        "createdAt": datetime.now(UTC),
+        "updatedAt": datetime.now(UTC),
+    }
 
 
 @pytest.mark.asyncio
@@ -20,9 +66,7 @@ async def test_question_set_is_bound_to_user_and_mode() -> None:
         initial_level=5,
         adjustment=None,
         effective_level=5,
-        effective_level_code="5-5",
         status="awaiting_adjustment",
-        front_question_count=7,
         background={},
         survey=None,
         question_hash="hash-1",
@@ -154,6 +198,88 @@ async def test_target_level_change_requires_verified_reward_and_consumes_it() ->
         await store.set_target_level(
             uid="u1", target_level="IM3", reward_nonce="target-level-nonce-123456"
         )
+
+
+@pytest.mark.asyncio
+async def test_target_level_is_derived_so_changed_tracks_level() -> None:
+    # 리뷰 #5 확인: targetLevel은 독립 저장값이 아니라 beforeAdjust(레벨)에서 파생된다.
+    # 따라서 같은 레벨로 매핑되는 하위 등급(NL/IL 모두 레벨 1)은 targetLevel이
+    # 정규 등급(IL)으로 동일하게 나오고, changed 는 레벨 기준으로 일관되게 동작한다.
+    store = InMemoryStateStore()
+
+    first = await store.set_target_level(uid="u1", target_level="NL", reward_nonce=None)
+    assert first["changed"] is True
+    assert first["targetLevel"] == "IL"  # NL 요청이지만 레벨 1의 정규 등급으로 파생됨
+    assert first["beforeAdjust"] == 1
+
+    # 같은 레벨(1)로 매핑되는 다른 하위 등급 재요청 → 레벨 불변이라 changed=False
+    same_level = await store.set_target_level(uid="u1", target_level="IL", reward_nonce=None)
+    assert same_level["changed"] is False
+    assert same_level["targetLevel"] == "IL"
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_document_preserves_chosen_level() -> None:
+    store = InMemoryStateStore()
+    # 구버전 문서: beforeAdjust/afterAdjust 이전 스키마 (initialLevel 사용).
+    # targetLevel은 조정 후(harder) 레벨 기준으로 저장돼 있어 역산하면 6이 나오지만,
+    # 사용자가 실제 고른 값은 initialLevel=5 이다.
+    store._profiles["legacy-user"] = {
+        "uid": "legacy-user",
+        "initialLevel": 5,
+        "latestAdjustment": "harder",
+        "targetLevel": "AL",
+        "effectiveLevel": 6,
+        "effectiveLevelCode": "5-6",
+    }
+
+    profile = await store.get_learning_profile("legacy-user")
+
+    assert profile is not None
+    assert profile["beforeAdjust"] == 5
+    assert profile["afterAdjust"] == 6
+    assert profile["latestAdjustment"] == "harder"
+
+
+@pytest.mark.asyncio
+async def test_legacy_daily_question_set_is_normalized_on_read() -> None:
+    store = InMemoryStateStore()
+    # 배포 전 daily 세트: mode="practice", dateKey, 제거된 필드, 구 type/questionType
+    store._question_sets["legacy-set"] = _legacy_question_set(mode="practice")
+
+    record = await store.get_question_set(uid="u1", set_id="legacy-set", mode="daily")
+
+    assert record is not None
+    assert record["mode"] == "daily"
+    assert record["date"] == "20260101"
+    assert "dateKey" not in record
+    for legacy in ("expectedTargetLevel", "effectiveLevelCode", "frontQuestionCount", "poolIndex"):
+        assert legacy not in record
+    question = record["questions"][0]
+    assert question["examSection"] == "survey"
+    assert question["questionStyle"] == "description"
+    assert "type" not in question
+    assert "questionType" not in question
+    # 정규화 후 현재 DTO 검증을 통과해야 한다
+    _QUESTION_LIST.validate_python(record["questions"])
+
+
+@pytest.mark.asyncio
+async def test_legacy_mock_question_set_is_normalized_on_read() -> None:
+    store = InMemoryStateStore()
+    # 배포 전 mock 세트: mode="mock"(불변)이라 조회는 되고 구 필드로 검증이 깨지던 케이스
+    store._question_sets["legacy-set"] = _legacy_question_set(mode="mock")
+
+    record = await store.get_question_set(uid="u1", set_id="legacy-set", mode="mock")
+
+    assert record is not None
+    assert record["mode"] == "mock"
+    question = record["questions"][0]
+    assert question["examSection"] == "survey"
+    assert question["questionStyle"] == "description"
+    assert "type" not in question
+    assert "questionType" not in question
+    _QUESTION_LIST.validate_python(record["questions"])
 
 
 @pytest.mark.asyncio
