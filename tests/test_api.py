@@ -555,3 +555,148 @@ def test_response_contract_uses_renamed_fields() -> None:
         assert "effectiveLevel" not in body
         assert "effectiveLevelCode" not in body
         assert "latestAdjustment" not in body
+
+
+def _legacy_question(
+    number: int, exam_type: str, style: str, combo: str | None, topic_id: str
+) -> dict:
+    """배포 전 스키마의 개별 문제 (type/questionType 보유)."""
+    return {
+        "number": number,
+        "type": exam_type,
+        "comboId": combo,
+        "topic": topic_id.replace("_", " ")[:40] or "topic",
+        "prompt": f"Legacy question number {number} about {topic_id}.",
+        "difficulty": "IM2",
+        "rubricFocus": ["task fulfillment"],
+        "questionType": style,
+        "followUpPrompt": None,
+        "topicId": topic_id,
+        "category": "survey",
+        "estimatedLevel": "IM2",
+    }
+
+
+def _legacy_question_set_doc(*, uid: str, set_id: str, mode: str, questions: list) -> dict:
+    """배포 전 스키마의 questionSets 문서 (mode 구값 + 제거된 필드 + dateKey)."""
+    from datetime import UTC, datetime, timedelta
+
+    return {
+        "uid": uid,
+        "setId": set_id,
+        "mode": mode,
+        "targetLevel": "IM2",
+        "expectedTargetLevel": "IM2",
+        "initialLevel": 4,
+        "adjustment": None,
+        "effectiveLevel": 4,
+        "effectiveLevelCode": "4-4",
+        "status": "complete",
+        "frontQuestionCount": 7,
+        "poolIndex": 0,
+        "background": {},
+        "survey": None,
+        "questionHash": "legacy-hash",
+        "questions": questions,
+        "source": "free",
+        "dateKey": "20260101",
+        "expiresAt": datetime.now(UTC) + timedelta(days=1),
+        "createdAt": datetime.now(UTC),
+        "updatedAt": datetime.now(UTC),
+    }
+
+
+def test_legacy_documents_do_not_break_live_endpoints() -> None:
+    with TestClient(app) as client:
+        store = client.app.state.state_store
+
+        # (1) 조정 전 상태의 구 mock 프론트 세트 → adjustment 엔드포인트 (이전엔 500)
+        mock_front = [
+            _legacy_question(1, "introduction", "description", None, "self_introduction"),
+            _legacy_question(2, "survey", "description", "survey-1", "movies"),
+            _legacy_question(3, "survey", "routine", "survey-1", "movies"),
+            _legacy_question(4, "survey", "past_experience", "survey-1", "movies"),
+            _legacy_question(5, "survey", "description", "survey-2", "music"),
+            _legacy_question(6, "survey", "routine", "survey-2", "music"),
+            _legacy_question(7, "survey", "past_experience", "survey-2", "music"),
+        ]
+        front_doc = _legacy_question_set_doc(
+            uid=USER_ID, set_id="legacy-mock-front", mode="mock", questions=mock_front
+        )
+        front_doc["status"] = "awaiting_adjustment"
+        store._question_sets["legacy-mock-front"] = front_doc
+
+        adjusted = client.post(
+            "/v1/question-sets/legacy-mock-front/adjustment",
+            headers=_headers(),
+            json={"adjustment": "same"},
+        )
+        assert adjusted.status_code == 200, adjusted.text
+        assert len(adjusted.json()["questions"]) == 15
+
+        # (2) 구 완성 mock 세트 → evaluate_mock 검증 통과 (이전엔 401 invalid_set)
+        mock_full = [
+            _legacy_question(n, "survey", "description", None, f"topic_{n}")
+            for n in range(1, 16)
+        ]
+        store._question_sets["legacymockset123"] = _legacy_question_set_doc(
+            uid=USER_ID, set_id="legacymockset123", mode="mock", questions=mock_full
+        )
+        manifest = {
+            "setId": "legacymockset123",
+            "rewardNonce": "n" * 16,
+            "answers": [
+                {"number": n, "transcript": f"answer number {n}"} for n in range(1, 16)
+            ],
+        }
+        eval_mock = client.post(
+            "/v1/evaluations/mock",
+            headers=_headers(str(uuid.uuid4())),
+            data={"manifest": json.dumps(manifest)},
+        )
+        # 검증(구 필드 정규화)은 통과하고, 오디오 누락 단계에서 걸려야 한다 (401 invalid_set 아님)
+        assert eval_mock.status_code != 401, eval_mock.text
+        assert eval_mock.json()["detail"]["code"] != "invalid_set"
+        assert eval_mock.json()["detail"]["code"] == "missing_audio"
+
+        # (3) 구 daily 세트(mode=practice) → evaluate_practice dual-read (이전엔 401 invalid_set)
+        daily = [
+            _legacy_question(n, "survey", "description", None, f"daily_{n}")
+            for n in range(2, 16)
+        ]
+        store._question_sets["legacy-daily-set"] = _legacy_question_set_doc(
+            uid=USER_ID, set_id="legacy-daily-set", mode="practice", questions=daily
+        )
+        eval_practice = client.post(
+            "/v1/evaluations/practice",
+            headers=_headers(str(uuid.uuid4())),
+            data={
+                "setId": "legacy-daily-set",
+                "questionNumber": "2",
+                "transcript": "I usually enjoy this activity because it helps me relax and learn.",
+            },
+        )
+        assert eval_practice.status_code == 200, eval_practice.text
+
+
+def test_idempotent_cache_reuse_is_safe() -> None:
+    with TestClient(app) as client:
+        question_set = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"initialLevel": 4, "background": {"interests": ["news"]}},
+        ).json()
+        form = {
+            "setId": question_set["setId"],
+            "questionNumber": str(question_set["questions"][0]["number"]),
+            "transcript": "I read the news every morning to stay informed about the world.",
+        }
+        key = str(uuid.uuid4())
+        first = client.post("/v1/evaluations/practice", headers=_headers(key), data=form)
+        assert first.status_code == 200, first.text
+        second = client.post("/v1/evaluations/practice", headers=_headers(key), data=form)
+        assert second.status_code == 200, second.text
+        # 멱등 캐시 재사용: 동일 결과 + 구 필드 미포함
+        assert second.json() == first.json()
+        assert "type" not in second.json()
+        assert "questionType" not in second.json()

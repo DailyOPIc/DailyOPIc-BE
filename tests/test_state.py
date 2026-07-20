@@ -201,6 +201,24 @@ async def test_target_level_change_requires_verified_reward_and_consumes_it() ->
 
 
 @pytest.mark.asyncio
+async def test_target_level_is_derived_so_changed_tracks_level() -> None:
+    # 리뷰 #5 확인: targetLevel은 독립 저장값이 아니라 beforeAdjust(레벨)에서 파생된다.
+    # 따라서 같은 레벨로 매핑되는 하위 등급(NL/IL 모두 레벨 1)은 targetLevel이
+    # 정규 등급(IL)으로 동일하게 나오고, changed 는 레벨 기준으로 일관되게 동작한다.
+    store = InMemoryStateStore()
+
+    first = await store.set_target_level(uid="u1", target_level="NL", reward_nonce=None)
+    assert first["changed"] is True
+    assert first["targetLevel"] == "IL"  # NL 요청이지만 레벨 1의 정규 등급으로 파생됨
+    assert first["beforeAdjust"] == 1
+
+    # 같은 레벨(1)로 매핑되는 다른 하위 등급 재요청 → 레벨 불변이라 changed=False
+    same_level = await store.set_target_level(uid="u1", target_level="IL", reward_nonce=None)
+    assert same_level["changed"] is False
+    assert same_level["targetLevel"] == "IL"
+
+
+@pytest.mark.asyncio
 async def test_legacy_profile_document_preserves_chosen_level() -> None:
     store = InMemoryStateStore()
     # 구버전 문서: beforeAdjust/afterAdjust 이전 스키마 (initialLevel 사용).

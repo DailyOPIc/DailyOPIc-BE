@@ -20,6 +20,7 @@ async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
     uid = f"question-set-{uuid.uuid4()}"
     store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
     set_id = f"set-{uuid.uuid4()}"
+    date_key = "20260622"
 
     await store.save_question_set(
         uid=uid,
@@ -33,8 +34,25 @@ async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
         background={},
         survey=None,
         question_hash="hash-1",
-        questions=[{"number": 1, "prompt": "Please introduce yourself."}],
+        questions=[
+            {
+                "number": 2,
+                "examSection": "survey",
+                "comboId": "daily-a",
+                "topic": "movies",
+                "prompt": "Describe the movies you usually enjoy.",
+                "difficulty": "IH",
+                "rubricFocus": ["task fulfillment"],
+                "questionStyle": "description",
+                "followUpPrompt": None,
+                "topicId": "movies",
+                "category": "daily",
+                "estimatedLevel": "IH",
+            }
+        ],
         expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        source="free",
+        date_key=date_key,
     )
 
     saved = await store.get_question_set(uid=uid, set_id=set_id, mode="daily")
@@ -43,8 +61,14 @@ async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
     assert saved["questionHash"] == "hash-1"
     # 저장 스키마(변경 반영 후) 검증: 신 필드 존재, 구 필드 부재
     assert saved["mode"] == "daily"
+    assert saved["date"] == date_key
     for legacy in ("expectedTargetLevel", "effectiveLevelCode", "frontQuestionCount", "poolIndex", "dateKey"):
         assert legacy not in saved
+    question = saved["questions"][0]
+    assert question["examSection"] == "survey"
+    assert question["questionStyle"] == "description"
+    assert "type" not in question
+    assert "questionType" not in question
     assert await store.get_question_set(uid=f"{uid}-other", set_id=set_id, mode="daily") is None
     assert await store.get_question_set(uid=uid, set_id=set_id, mode="mock") is None
 
