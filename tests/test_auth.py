@@ -89,3 +89,41 @@ async def test_invalid_app_check_returns_403(monkeypatch: pytest.MonkeyPatch) ->
 
     assert error.value.status_code == 403
     assert error.value.detail["code"] == "invalid_app_check"
+
+
+@pytest.mark.asyncio
+async def test_production_requires_firebase_id_token() -> None:
+    service = AuthService(
+        Settings(
+            app_env="production",
+            mock_ai=False,
+            openai_api_key="test-key",
+            firebase_project_id="dailyopic-test",
+            admob_rewarded_ad_unit_id="ca-app-pub-5460686409666356/7091483531",
+        )
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await service.authenticate(USER_ID, "app-check-token")
+
+    assert error.value.status_code == 401
+    assert error.value.detail["code"] == "missing_id_token"
+
+
+@pytest.mark.asyncio
+async def test_firebase_uid_is_source_of_truth(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = AuthService(
+        Settings(
+            firebase_project_id="dailyopic-test",
+            admob_rewarded_ad_unit_id="ca-app-pub-5460686409666356/7091483531",
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.auth.auth.verify_id_token",
+        lambda token, check_revoked: {"uid": "firebase-user-123"},
+    )
+
+    user = await service.authenticate(USER_ID, "app-check-token", "Bearer valid-token")
+
+    assert user.uid == "firebase-user-123"
+    assert user.legacy_install_id == USER_ID

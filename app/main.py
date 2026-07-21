@@ -16,6 +16,12 @@ from app.services.audio import AudioMetricsService
 from app.services.auth import AuthService
 from app.services.questions import QuestionPatternRepository
 from app.services.state import FirestoreStateStore
+from app.services.telemetry import RequestTimer, emit, stable_hash
+from app.services.rate_limit import (
+    RateLimitExceeded,
+    SlidingWindowRateLimiter,
+    request_identity,
+)
 
 
 QUESTION_PATTERN_FILE = Path("app/data/question_patterns.json")
@@ -53,6 +59,7 @@ async def lifespan(app: FastAPI):
         expected_ad_unit=settings.admob_rewarded_ad_unit_id,
     )
     app.state.level_adapter = TypeAdapter(OPIcLevel)
+    app.state.rate_limiter = SlidingWindowRateLimiter()
     yield
 
 
@@ -61,4 +68,77 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def request_telemetry(request, call_next):
+    timer = RequestTimer()
+    request_id = request.headers.get("Idempotency-Key")
+    try:
+        response = await call_next(request)
+    except Exception:
+        emit(
+            "request_failed",
+            method=request.method,
+            path=request.url.path,
+            operationIdHash=stable_hash(request_id),
+            latencyMs=timer.latency_ms,
+        )
+        raise
+    emit(
+        "request_completed",
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        operationIdHash=stable_hash(request_id),
+        latencyMs=timer.latency_ms,
+    )
+    return response
+
+
+@app.middleware("http")
+async def endpoint_rate_limit(request, call_next):
+    if request.url.path in {"/health", "/v1/admob/ssv"}:
+        return await call_next(request)
+    settings = get_settings()
+    identity = request_identity(
+        request.headers.get("Authorization"),
+        request.headers.get("X-Firebase-AppCheck"),
+        request.client.host if request.client else None,
+    )
+    is_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+    is_ai = is_mutation and any(
+        segment in request.url.path
+        for segment in ("question-sets", "mock-exams", "evaluations")
+    )
+    limit = (
+        settings.ai_rate_limit_per_minute
+        if is_ai
+        else settings.mutation_rate_limit_per_minute
+        if is_mutation
+        else settings.read_rate_limit_per_minute
+    )
+    try:
+        await request.app.state.rate_limiter.check(
+            f"{identity}:{'ai' if is_ai else request.method}",
+            limit=limit,
+        )
+    except RateLimitExceeded as error:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(error.retry_after)},
+            content={
+                "detail": {
+                    "code": "rate_limited",
+                    "message": "Too many requests. Please retry later.",
+                    "retryable": True,
+                    "retryAfterSeconds": error.retry_after,
+                }
+            },
+        )
+    return await call_next(request)
+
+
 app.include_router(router)

@@ -26,6 +26,16 @@ def test_real_ai_requires_openai_api_key() -> None:
         )
 
 
+def test_production_rejects_mock_ai() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            app_env="production",
+            mock_ai=True,
+            firebase_project_id="dailyopic-test",
+            admob_rewarded_ad_unit_id="ca-app-pub-5460686409666356/7091483531",
+        )
+
+
 @pytest.mark.parametrize(
     "values",
     [

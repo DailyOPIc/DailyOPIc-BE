@@ -149,7 +149,7 @@ def test_practice_quota_and_reward_flow() -> None:
         assert usage["bonusRemaining"] == 0
 
 
-def test_daily_pool_is_archived_and_refresh_consumes_practice_token() -> None:
+def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota() -> None:
     with TestClient(app) as client:
         payload = {
             "initialLevel": 5,
@@ -184,10 +184,20 @@ def test_daily_pool_is_archived_and_refresh_consumes_practice_token() -> None:
         assert archived.status_code == 200, archived.text
         assert archived.json()["setId"] == first_set["setId"]
 
+        refresh_reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "practice_refresh"},
+        ).json()
+        _verify_reward(client, refresh_reward["nonce"])
         refreshed = client.post(
             "/v1/question-sets/practice/refresh",
-            headers=_headers(),
-            json={**payload, "adjustment": "harder"},
+            headers={**_headers(), "Idempotency-Key": "daily-refresh-test-1"},
+            json={
+                **payload,
+                "adjustment": "harder",
+                "rewardNonce": refresh_reward["nonce"],
+            },
         )
         assert refreshed.status_code == 200, refreshed.text
         refreshed_set = refreshed.json()
@@ -196,7 +206,8 @@ def test_daily_pool_is_archived_and_refresh_consumes_practice_token() -> None:
         assert [item["number"] for item in refreshed_set["questions"]] == list(range(2, 16))
 
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 2
+        assert usage["freeRemaining"] == 3
+        assert usage["dailyRefreshRemaining"] == 2
 
         response = client.post(
             "/v1/evaluations/practice",
@@ -322,7 +333,7 @@ def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
         assert question_set["isComplete"] is False
         adjusted = client.post(
             f"/v1/question-sets/{question_set['setId']}/adjustment",
-            headers=_headers(),
+            headers=_headers("mock-adjustment-e2e-1"),
             json={"adjustment": "same"},
         )
         assert adjusted.status_code == 200, adjusted.text
@@ -365,7 +376,7 @@ def test_mock_requires_reward_and_returns_fifteen_feedback_items() -> None:
             files=_mock_audio_files(),
         )
         assert response.status_code == 200, response.text
-        assert len(response.json()["perQuestion"]) == 15
+        assert response.json()["perQuestion"] == []
 
 
 def test_mock_ai_failure_rolls_back_reward_for_same_request_retry() -> None:
@@ -388,7 +399,7 @@ def test_mock_ai_failure_rolls_back_reward_for_same_request_retry() -> None:
         ).json()
         adjusted = client.post(
             f"/v1/question-sets/{question_set['setId']}/adjustment",
-            headers=_headers(),
+            headers=_headers("mock-adjustment-retry-1"),
             json={"adjustment": "same"},
         )
         assert adjusted.status_code == 200, adjusted.text
@@ -438,7 +449,107 @@ def test_mock_ai_failure_rolls_back_reward_for_same_request_retry() -> None:
         )
 
         assert retry.status_code == 200, retry.text
-        assert len(retry.json()["perQuestion"]) == 15
+        assert retry.json()["perQuestion"] == []
+
+
+def test_mock_session_v2_requires_three_verified_gates_and_resumes() -> None:
+    payload = {
+        "initialLevel": 4,
+        "background": {"travel": ["domestic"]},
+        "survey": {
+            "status": "student",
+            "residence": "family",
+            "leisure": ["movies", "music", "cafes"],
+            "hobbies": [],
+            "sports": [],
+            "travel": ["domestic_travel"],
+        },
+    }
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-create-1"),
+            json=payload,
+        )
+        assert created.status_code == 200, created.text
+        session = created.json()
+        assert session["stage"] == "awaiting_start_ad"
+        assert session["questionSet"] is None
+
+        without_reward = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/start",
+            headers=_headers("mock-session-start-invalid-1"),
+            json={"rewardNonce": "x" * 16},
+        )
+        assert without_reward.status_code == 402
+        current = client.get("/v1/mock-exams/current", headers=_headers()).json()
+        assert current["stage"] == "awaiting_start_ad"
+
+        start_reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "mock_start", "sessionHash": session["sessionHash"]},
+        ).json()
+        _verify_reward(client, start_reward["nonce"])
+        started = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/start",
+            headers=_headers("mock-session-start-1"),
+            json={"rewardNonce": start_reward["nonce"]},
+        )
+        assert started.status_code == 200, started.text
+        session = started.json()
+        assert session["stage"] == "answering_front"
+        assert len(session["questionSet"]["questions"]) == 7
+
+        adjustment_reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={
+                "purpose": "mock_adjustment",
+                "sessionHash": session["sessionHash"],
+            },
+        ).json()
+        _verify_reward(client, adjustment_reward["nonce"])
+        adjusted = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/adjustment",
+            headers=_headers("mock-session-adjustment-1"),
+            json={"adjustment": "same", "rewardNonce": adjustment_reward["nonce"]},
+        )
+        assert adjusted.status_code == 200, adjusted.text
+        session = adjusted.json()
+        assert session["stage"] == "answering_tail"
+        assert len(session["questionSet"]["questions"]) == 15
+
+        result_reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "mock_result", "sessionHash": session["sessionHash"]},
+        ).json()
+        _verify_reward(client, result_reward["nonce"])
+        manifest = {
+            "setId": session["setId"],
+            "rewardNonce": result_reward["nonce"],
+            "answers": [
+                {
+                    "number": number,
+                    "transcript": f"Complete answer {number} with a reason and example.",
+                }
+                for number in range(1, 16)
+            ],
+        }
+        evaluated = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/evaluate",
+            headers=_headers("mock-session-evaluate-1"),
+            data={"manifest": json.dumps(manifest)},
+            files=_mock_audio_files(),
+        )
+        assert evaluated.status_code == 200, evaluated.text
+        assert evaluated.json()["perQuestion"] == []
+        completed = client.get("/v1/mock-exams/current", headers=_headers()).json()
+        assert completed["stage"] == "completed"
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["mockAvailable"] is False
+        assert usage["mockSessionStage"] == "completed"
 
 
 def test_daily_reward_intent_quota_returns_402() -> None:
@@ -450,6 +561,7 @@ def test_daily_reward_intent_quota_returns_402() -> None:
                 json={"purpose": "practice_credits"},
             )
             assert response.status_code == 200, response.text
+            _verify_reward(client, response.json()["nonce"])
 
         blocked = client.post(
             "/v1/ad-rewards/intents",
@@ -470,6 +582,7 @@ def test_target_level_change_intent_is_not_blocked_by_practice_reward_quota() ->
                 json={"purpose": "practice_credits"},
             )
             assert response.status_code == 200, response.text
+            _verify_reward(client, response.json()["nonce"])
 
         response = client.post(
             "/v1/ad-rewards/intents",
@@ -628,7 +741,7 @@ def test_legacy_documents_do_not_break_live_endpoints() -> None:
 
         adjusted = client.post(
             "/v1/question-sets/legacy-mock-front/adjustment",
-            headers=_headers(),
+            headers=_headers("legacy-adjustment-1"),
             json={"adjustment": "same"},
         )
         assert adjusted.status_code == 200, adjusted.text
