@@ -13,8 +13,72 @@ from app.services.state import (
     UsageLimitExceeded,
 )
 
-
 _QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
+
+
+@pytest.mark.asyncio
+async def test_firestore_contention_retry_starts_a_fresh_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    delays: list[float] = []
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            try:
+                raise state_module.Aborted("Transaction lock timeout.")
+            except state_module.Aborted as cause:
+                raise ValueError("Failed to commit transaction") from cause
+        return "reserved"
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(state_module.random, "uniform", lambda _start, _end: 0.0)
+    monkeypatch.setattr(state_module.asyncio, "sleep", record_sleep)
+
+    result = await state_module._run_with_firestore_contention_retry(operation)
+
+    assert result == "reserved"
+    assert calls == 3
+    assert delays == pytest.approx([0.05, 0.1])
+
+
+@pytest.mark.asyncio
+async def test_firestore_contention_retry_does_not_retry_other_errors() -> None:
+    calls = 0
+
+    def operation() -> None:
+        nonlocal calls
+        calls += 1
+        raise ValueError("invalid payload")
+
+    with pytest.raises(ValueError, match="invalid payload"):
+        await state_module._run_with_firestore_contention_retry(operation)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_keyed_lock_pool_serializes_same_key_and_releases_entries() -> None:
+    pool = state_module._KeyedLockPool()
+    active = 0
+    maximum_active = 0
+
+    async def worker() -> None:
+        nonlocal active, maximum_active
+        async with pool.hold("same-resource"):
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await state_module.asyncio.sleep(0)
+            active -= 1
+
+    await state_module.asyncio.gather(*(worker() for _ in range(20)))
+
+    assert maximum_active == 1
+    assert pool._entries == {}
 
 
 def test_firestore_emulator_client_does_not_require_adc(
@@ -152,7 +216,9 @@ async def test_question_set_is_bound_to_user_and_mode() -> None:
 
     assert saved is not None
     assert saved["questionHash"] == "hash-1"
-    assert await store.get_question_set(uid="u2", set_id="set-1", mode="practice") is None
+    assert (
+        await store.get_question_set(uid="u2", set_id="set-1", mode="practice") is None
+    )
     assert await store.get_question_set(uid="u1", set_id="set-1", mode="mock") is None
 
 
@@ -187,7 +253,9 @@ async def test_question_history_records_recent_hashes_and_trims() -> None:
 async def test_three_free_then_bonus_credits() -> None:
     store = InMemoryStateStore()
     for index in range(3):
-        reservation = await store.reserve_practice("u1", "20260622", f"request-{index}", 3)
+        reservation = await store.reserve_practice(
+            "u1", "20260622", f"request-{index}", 3
+        )
         assert reservation.source == "free"
 
     with pytest.raises(UsageLimitExceeded):
@@ -228,14 +296,18 @@ async def test_mock_reward_is_bound_and_single_use() -> None:
     )
     await store.reserve_mock("u1", "mock-request-1", "mock-nonce-123456789", "hash-1")
     with pytest.raises(RewardNotVerified):
-        await store.reserve_mock("u1", "mock-request-2", "mock-nonce-123456789", "hash-1")
+        await store.reserve_mock(
+            "u1", "mock-request-2", "mock-nonce-123456789", "hash-1"
+        )
 
 
 @pytest.mark.asyncio
 async def test_target_level_change_requires_verified_reward_and_consumes_it() -> None:
     store = InMemoryStateStore()
 
-    initial = await store.set_target_level(uid="u1", target_level="IH", reward_nonce=None)
+    initial = await store.set_target_level(
+        uid="u1", target_level="IH", reward_nonce=None
+    )
     assert initial["changed"] is True
     assert initial["rewardConsumed"] is False
     assert await store.get_target_level("u1") == "IH"
@@ -287,7 +359,9 @@ async def test_target_level_is_derived_so_changed_tracks_level() -> None:
     assert first["beforeAdjust"] == 1
 
     # 같은 레벨(1)로 매핑되는 다른 하위 등급 재요청 → 레벨 불변이라 changed=False
-    same_level = await store.set_target_level(uid="u1", target_level="IL", reward_nonce=None)
+    same_level = await store.set_target_level(
+        uid="u1", target_level="IL", reward_nonce=None
+    )
     assert same_level["changed"] is False
     assert same_level["targetLevel"] == "IL"
 
@@ -327,7 +401,12 @@ async def test_legacy_daily_question_set_is_normalized_on_read() -> None:
     assert record["mode"] == "daily"
     assert record["date"] == "20260101"
     assert "dateKey" not in record
-    for legacy in ("expectedTargetLevel", "effectiveLevelCode", "frontQuestionCount", "poolIndex"):
+    for legacy in (
+        "expectedTargetLevel",
+        "effectiveLevelCode",
+        "frontQuestionCount",
+        "poolIndex",
+    ):
         assert legacy not in record
     question = record["questions"][0]
     assert question["examSection"] == "survey"

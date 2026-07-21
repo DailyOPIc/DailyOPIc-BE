@@ -145,10 +145,14 @@ async def test_firestore_legacy_question_set_is_normalized_on_read() -> None:
 async def test_firestore_transaction_allows_exactly_three_parallel_free_uses() -> None:
     uid = f"emulator-{uuid.uuid4()}"
     date_key = "20260622"
-    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    stores = [
+        FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+        for _ in range(4)
+    ]
 
     async def reserve(index: int) -> bool:
         try:
+            store = stores[index % len(stores)]
             await store.reserve_practice(uid, date_key, f"{uid}-request-{index}", 3)
             return True
         except UsageLimitExceeded:
@@ -156,7 +160,7 @@ async def test_firestore_transaction_allows_exactly_three_parallel_free_uses() -
 
     results = await asyncio.gather(*(reserve(index) for index in range(10)))
     assert sum(results) == 3
-    usage = await store.get_usage(uid, date_key)
+    usage = await stores[0].get_usage(uid, date_key)
     assert usage["freeUsed"] == 3
 
 
@@ -245,10 +249,14 @@ async def test_firestore_pending_reward_does_not_change_quota_and_ssv_is_idempot
 async def test_firestore_operation_lease_allows_only_one_parallel_owner() -> None:
     uid = f"operation-{uuid.uuid4()}"
     operation_id = str(uuid.uuid4())
-    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    stores = [
+        FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+        for _ in range(4)
+    ]
 
-    async def reserve() -> str:
+    async def reserve(index: int) -> str:
         try:
+            store = stores[index % len(stores)]
             result = await store.reserve_operation(
                 uid=uid,
                 operation="mock.adjustment",
@@ -259,11 +267,11 @@ async def test_firestore_operation_lease_allows_only_one_parallel_owner() -> Non
         except RequestAlreadyProcessing:
             return "processing"
 
-    results = await asyncio.gather(*(reserve() for _ in range(20)))
+    results = await asyncio.gather(*(reserve(index) for index in range(20)))
 
     assert results.count("new") == 1
     assert results.count("processing") == 19
-    operation = await store.get_operation(uid=uid, operation_id=operation_id)
+    operation = await stores[0].get_operation(uid=uid, operation_id=operation_id)
     assert operation is not None
     assert operation["status"] == "processing"
 
