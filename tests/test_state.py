@@ -17,6 +17,51 @@ from app.services.state import (
 _QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
 
 
+@pytest.mark.asyncio
+async def test_firestore_contention_retry_starts_a_fresh_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    delays: list[float] = []
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            try:
+                raise state_module.Aborted("Transaction lock timeout.")
+            except state_module.Aborted as cause:
+                raise ValueError("Failed to commit transaction") from cause
+        return "reserved"
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(state_module.random, "uniform", lambda _start, _end: 0.0)
+    monkeypatch.setattr(state_module.asyncio, "sleep", record_sleep)
+
+    result = await state_module._run_with_firestore_contention_retry(operation)
+
+    assert result == "reserved"
+    assert calls == 3
+    assert delays == pytest.approx([0.05, 0.1])
+
+
+@pytest.mark.asyncio
+async def test_firestore_contention_retry_does_not_retry_other_errors() -> None:
+    calls = 0
+
+    def operation() -> None:
+        nonlocal calls
+        calls += 1
+        raise ValueError("invalid payload")
+
+    with pytest.raises(ValueError, match="invalid payload"):
+        await state_module._run_with_firestore_contention_retry(operation)
+
+    assert calls == 1
+
+
 def test_firestore_emulator_client_does_not_require_adc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

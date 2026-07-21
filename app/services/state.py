@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import random
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 import firebase_admin
 from firebase_admin import firestore as admin_firestore
+from google.api_core.exceptions import Aborted
 from google.auth.credentials import AnonymousCredentials
 from google.cloud import firestore
 
@@ -21,6 +24,38 @@ from app.services.difficulty import (
     initial_level_from_target,
 )
 from app.services.questions import prompt_hash
+
+
+_T = TypeVar("_T")
+_FIRESTORE_CONTENTION_ATTEMPTS = 5
+_FIRESTORE_CONTENTION_BASE_DELAY_SECONDS = 0.05
+
+
+def _is_firestore_contention(error: BaseException) -> bool:
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        if isinstance(current, Aborted):
+            return True
+        visited.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _run_with_firestore_contention_retry(
+    operation: Callable[[], _T],
+    *,
+    attempts: int = _FIRESTORE_CONTENTION_ATTEMPTS,
+) -> _T:
+    for attempt in range(attempts):
+        try:
+            return await asyncio.to_thread(operation)
+        except (Aborted, ValueError) as error:
+            if not _is_firestore_contention(error) or attempt == attempts - 1:
+                raise
+            base_delay = _FIRESTORE_CONTENTION_BASE_DELAY_SECONDS * (2**attempt)
+            await asyncio.sleep(base_delay + random.uniform(0, base_delay))
+    raise RuntimeError("unreachable Firestore retry state")
 
 
 class UsageLimitExceeded(RuntimeError):
@@ -1148,7 +1183,9 @@ class FirestoreStateStore(StateStore):
         payload_hash: str,
     ) -> Reservation:
         def run() -> Reservation:
-            transaction = self._client.transaction(max_attempts=20)
+            # A fresh outer transaction with jitter avoids synchronized retries
+            # when many identical operation requests contend on this one document.
+            transaction = self._client.transaction(max_attempts=5)
             ref = self._client.collection("operationRequests").document(
                 self._operation_id(uid, operation, operation_id)
             )
@@ -1185,7 +1222,7 @@ class FirestoreStateStore(StateStore):
 
             return apply(transaction)
 
-        return await asyncio.to_thread(run)
+        return await _run_with_firestore_contention_retry(run)
 
     async def complete_operation(
         self,
