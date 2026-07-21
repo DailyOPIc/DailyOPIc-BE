@@ -16,32 +16,6 @@ from app.services.state import (
 _QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
 
 
-def test_firestore_emulator_client_does_not_require_adc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    client = object()
-
-    def make_client(**kwargs):
-        captured.update(kwargs)
-        return client
-
-    monkeypatch.setenv("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080")
-    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
-    monkeypatch.setattr(state_module.firestore, "Client", make_client)
-    monkeypatch.setattr(
-        state_module.admin_firestore,
-        "client",
-        lambda: pytest.fail("Firebase Admin client must not be used for the emulator"),
-    )
-
-    store = FirestoreStateStore("dailyopic-test")
-
-    assert store._client is client
-    assert captured["project"] == "dailyopic-test"
-    assert isinstance(captured["credentials"], state_module.AnonymousCredentials)
-
-
 @pytest.mark.asyncio
 async def test_firestore_contention_retry_starts_a_fresh_transaction(
     monkeypatch: pytest.MonkeyPatch,
@@ -85,6 +59,26 @@ async def test_firestore_contention_retry_does_not_retry_other_errors() -> None:
         await state_module._run_with_firestore_contention_retry(operation)
 
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_keyed_lock_pool_serializes_same_key_and_releases_entries() -> None:
+    pool = state_module._KeyedLockPool()
+    active = 0
+    maximum_active = 0
+
+    async def worker() -> None:
+        nonlocal active, maximum_active
+        async with pool.hold("same-resource"):
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await state_module.asyncio.sleep(0)
+            active -= 1
+
+    await state_module.asyncio.gather(*(worker() for _ in range(20)))
+
+    assert maximum_active == 1
+    assert pool._entries == {}
 
 
 def test_firestore_emulator_client_does_not_require_adc(

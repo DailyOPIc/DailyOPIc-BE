@@ -5,7 +5,8 @@ import hashlib
 import os
 import random
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,7 +14,7 @@ from typing import Any, TypeVar
 
 import firebase_admin
 from firebase_admin import firestore as admin_firestore
-from google.api_core.exceptions import Aborted
+from google.api_core.exceptions import Aborted, AlreadyExists
 from google.auth.credentials import AnonymousCredentials
 from google.cloud import firestore
 
@@ -55,6 +56,36 @@ async def _run_with_firestore_contention_retry(
             base_delay = _FIRESTORE_CONTENTION_BASE_DELAY_SECONDS * (2**attempt)
             await asyncio.sleep(base_delay + random.uniform(0, base_delay))
     raise RuntimeError("unreachable Firestore retry state")
+
+
+@dataclass(slots=True)
+class _KeyedLockEntry:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+class _KeyedLockPool:
+    def __init__(self) -> None:
+        self._guard = asyncio.Lock()
+        self._entries: dict[str, _KeyedLockEntry] = {}
+
+    @asynccontextmanager
+    async def hold(self, key: str) -> AsyncIterator[None]:
+        async with self._guard:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _KeyedLockEntry(lock=asyncio.Lock())
+                self._entries[key] = entry
+            entry.users += 1
+
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            async with self._guard:
+                entry.users -= 1
+                if entry.users == 0 and self._entries.get(key) is entry:
+                    self._entries.pop(key, None)
 
 
 class UsageLimitExceeded(RuntimeError):
@@ -1061,6 +1092,7 @@ class InMemoryStateStore(StateStore):
 
 class FirestoreStateStore(StateStore):
     def __init__(self, project_id: str | None = None) -> None:
+        self._transaction_locks = _KeyedLockPool()
         # The Firestore emulator is intentionally unauthenticated.  Firebase Admin's
         # client still resolves Application Default Credentials before connecting,
         # which breaks clean CI runners even when FIRESTORE_EMULATOR_HOST is set.
@@ -1205,13 +1237,31 @@ class FirestoreStateStore(StateStore):
         operation_id: str,
         payload_hash: str,
     ) -> Reservation:
+        ref = self._client.collection("operationRequests").document(
+            self._operation_id(uid, operation, operation_id)
+        )
+        now = datetime.now(UTC)
+        initial_record = {
+            "uid": uid,
+            "operation": operation,
+            "operationId": operation_id,
+            "payloadHash": payload_hash,
+            "status": "processing",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+
+        def create() -> Reservation:
+            ref.create(initial_record)
+            return Reservation("new")
+
+        try:
+            return await _run_with_firestore_contention_retry(create)
+        except AlreadyExists:
+            pass
+
         def run() -> Reservation:
-            # A fresh outer transaction with jitter avoids synchronized retries
-            # when many identical operation requests contend on this one document.
             transaction = self._client.transaction(max_attempts=5)
-            ref = self._client.collection("operationRequests").document(
-                self._operation_id(uid, operation, operation_id)
-            )
 
             @firestore.transactional
             def apply(transaction: firestore.Transaction) -> Reservation:
@@ -1245,7 +1295,20 @@ class FirestoreStateStore(StateStore):
 
             return apply(transaction)
 
-        return await _run_with_firestore_contention_retry(run)
+        lock_key = f"operation:{ref.id}"
+        async with self._transaction_locks.hold(lock_key):
+            snapshot = await asyncio.to_thread(ref.get)
+            existing = snapshot.to_dict() or {}
+            if snapshot.exists:
+                if existing.get("payloadHash") != payload_hash:
+                    raise IdempotencyConflict(
+                        "idempotency key payload does not match"
+                    )
+                if existing.get("status") == "completed":
+                    return Reservation("cached", result=existing.get("result"))
+                if existing.get("status") == "processing":
+                    raise RequestAlreadyProcessing("operation is already processing")
+            return await _run_with_firestore_contention_retry(run)
 
     async def complete_operation(
         self,
@@ -1604,10 +1667,12 @@ class FirestoreStateStore(StateStore):
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
     ) -> Reservation:
+        usage_id = self._usage_id(uid, date_key)
+
         def run() -> Reservation:
-            transaction = self._client.transaction(max_attempts=20)
+            transaction = self._client.transaction(max_attempts=5)
             usage_ref = self._client.collection("dailyUsage").document(
-                self._usage_id(uid, date_key)
+                usage_id
             )
             request_ref = self._client.collection("aiRequests").document(request_id)
 
@@ -1660,7 +1725,8 @@ class FirestoreStateStore(StateStore):
 
             return apply(transaction)
 
-        return await asyncio.to_thread(run)
+        async with self._transaction_locks.hold(f"practice:{usage_id}"):
+            return await _run_with_firestore_contention_retry(run)
 
     async def reserve_mock(
         self,
