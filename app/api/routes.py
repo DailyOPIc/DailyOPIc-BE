@@ -28,11 +28,18 @@ from pydantic import TypeAdapter, ValidationError
 from app.models.api import (
     BackgroundProfile,
     BackgroundSurvey,
+    CapabilitiesResponse,
+    CapabilityQuotaPolicy,
     DifficultyAdjustment,
     GeneratedQuestion,
     MockEvaluation,
     MockEvaluationManifest,
     MockExamRequest,
+    MockSessionAdjustmentRequest,
+    MockSessionResponse,
+    MockSessionRewardRequest,
+    MockSessionStage,
+    OperationResponse,
     PracticeEvaluation,
     PracticeRefreshRequest,
     PracticeSetRequest,
@@ -47,7 +54,11 @@ from app.models.api import (
     UsageResponse,
 )
 from app.services.admob import SSVVerificationError
-from app.services.ai import AIQuestionGenerationError, AIServiceError
+from app.services.ai import (
+    AIQuestionGenerationError,
+    AIServiceError,
+    QuestionGenerationResult,
+)
 from app.services.audio import AudioValidationError
 from app.services.auth import CurrentUser, current_user
 from app.services.difficulty import (
@@ -59,6 +70,8 @@ from app.services.difficulty import (
 from app.services.questions import prompt_hash, question_set_hash
 from app.services.state import (
     AdjustmentAlreadyApplied,
+    IdempotencyConflict,
+    InvalidSessionTransition,
     RequestAlreadyProcessing,
     RewardNotVerified,
     UsageLimitExceeded,
@@ -70,10 +83,39 @@ router = APIRouter()
 KST = ZoneInfo("Asia/Seoul")
 QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
+MOCK_AUDIO_AGGREGATE_MAX_BYTES = 30 * 1024 * 1024
+
+
+@router.get("/v1/capabilities", response_model=CapabilitiesResponse)
+async def capabilities(request: Request) -> CapabilitiesResponse:
+    settings = request.app.state.settings
+    return CapabilitiesResponse(
+        minimumSupportedAppVersion=settings.minimum_supported_app_version,
+        questionGenerationV2=settings.question_generation_v2_enabled,
+        mockSessionV2=settings.mock_session_v2_enabled,
+        evaluationRubricV2=settings.evaluation_rubric_v2_enabled,
+        practiceRefresh=settings.practice_refresh_enabled,
+        guideSchemaVersion=settings.guide_schema_version,
+        quotaPolicy=CapabilityQuotaPolicy(
+            dailyAnalysisFree=settings.free_practice_limit,
+            dailyRefreshRewards=settings.max_daily_reward_count,
+            mockSessionsPerDay=1,
+            mockRewardGates=3,
+        ),
+    )
 
 
 def _date_key() -> str:
     return datetime.now(KST).strftime("%Y%m%d")
+
+
+def _next_reset() -> datetime:
+    return (datetime.now(KST) + timedelta(days=1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
 
 def _request_id(value: str | None) -> str:
@@ -98,6 +140,54 @@ def _daily_free_set_id(uid: str, date_key: str) -> str:
 
 def _stable_json(value: dict[str, object] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _payload_hash(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+async def _reserve_operation(
+    request: Request,
+    user: CurrentUser,
+    *,
+    operation: str,
+    operation_id: str,
+    payload: object,
+):
+    try:
+        return await request.app.state.state_store.reserve_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            payload_hash=_payload_hash(payload),
+        )
+    except IdempotencyConflict as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "idempotency_conflict",
+                "message": str(error),
+                "operationId": operation_id,
+            },
+        ) from error
+    except RequestAlreadyProcessing as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "request_processing",
+                "message": str(error),
+                "operationId": operation_id,
+                "retryable": True,
+            },
+            headers={"Retry-After": "2"},
+        ) from error
 
 
 def _reward_response(reward: dict[str, object], user_uid: str) -> RewardIntentResponse:
@@ -144,14 +234,16 @@ def _question_set_response(
     adjustment: DifficultyAdjustment | None,
     effective_level: int,
     status_value: QuestionSetStatus,
+    generation_metadata: dict[str, object] | None = None,
 ) -> QuestionSetResponse:
+    metadata = generation_metadata or {}
     return QuestionSetResponse(
         setId=set_id,
         setHash=set_hash,
         questions=questions,
-        modelVersion=model_version,
-        generatedAt=datetime.now(UTC),
-        fallbackUsed=fallback_used,
+        modelVersion=str(metadata.get("modelVersion") or model_version),
+        generatedAt=metadata.get("generatedAt") or datetime.now(UTC),
+        fallbackUsed=bool(metadata.get("fallbackUsed", fallback_used)),
         initialLevel=initial_level,
         adjustment=adjustment,
         effectiveLevel=effective_level,
@@ -164,7 +256,64 @@ def _question_set_response(
         if status_value is QuestionSetStatus.AWAITING_ADJUSTMENT
         else None,
         isComplete=status_value is QuestionSetStatus.COMPLETE,
+        provider=str(metadata.get("provider") or "openai"),
+        fallbackReason=metadata.get("fallbackReason"),
+        fallbackQuestionNumbers=list(metadata.get("fallbackQuestionNumbers") or []),
+        retryCount=int(metadata.get("retryCount") or 0),
+        promptVersion=metadata.get("promptVersion"),
+        schemaVersion=metadata.get("schemaVersion"),
+        serverDateKey=str(metadata.get("serverDateKey") or _date_key()),
     )
+
+
+async def _mock_session_response(
+    request: Request,
+    user: CurrentUser,
+    record: dict[str, object],
+) -> MockSessionResponse:
+    question_set = None
+    set_id = record.get("setId")
+    if set_id:
+        stored = await request.app.state.state_store.get_question_set(
+            uid=user.uid,
+            set_id=str(set_id),
+            mode="mock",
+        )
+        if stored:
+            question_set = _question_set_response_from_record(
+                stored,
+                model_version=request.app.state.ai_service.model,
+            )
+    return MockSessionResponse(
+        sessionId=str(record["sessionId"]),
+        sessionHash=str(record["sessionHash"]),
+        serverDateKey=str(record["date"]),
+        stage=str(record["stage"]),
+        resetsAt=record["resetsAt"],
+        setId=str(set_id) if set_id else None,
+        setHash=str(record.get("setHash")) if record.get("setHash") else None,
+        adjustment=record.get("adjustment"),
+        questionSet=question_set,
+    )
+
+
+def _generation_metadata(
+    generation: QuestionGenerationResult,
+    *,
+    model_version: str,
+) -> dict[str, object]:
+    return {
+        "modelVersion": model_version,
+        "generatedAt": datetime.now(UTC),
+        "fallbackUsed": generation.fallback_used,
+        "provider": generation.provider,
+        "fallbackReason": generation.fallback_reason,
+        "fallbackQuestionNumbers": list(generation.fallback_question_numbers),
+        "retryCount": generation.retry_count,
+        "promptVersion": generation.prompt_version,
+        "schemaVersion": generation.schema_version,
+        "serverDateKey": _date_key(),
+    }
 
 
 def _question_set_response_from_record(
@@ -180,12 +329,13 @@ def _question_set_response_from_record(
         set_id=str(record["setId"]),
         set_hash=str(record["questionHash"]),
         questions=questions,
-        model_version=model_version,
-        fallback_used=False,
+        model_version=str(record.get("modelVersion") or model_version),
+        fallback_used=bool(record.get("fallbackUsed", False)),
         initial_level=int(record["initialLevel"]),
         adjustment=adjustment,
         effective_level=int(record["effectiveLevel"]),
         status_value=status_value,
+        generation_metadata=record,
     )
 
 
@@ -291,6 +441,10 @@ async def _create_daily_pool(
     saved_set_id = set_id or str(uuid.uuid4())
     serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
     set_hash = question_set_hash(serialized)
+    generation_metadata = _generation_metadata(
+        generation,
+        model_version=request.app.state.ai_service.model,
+    )
     await request.app.state.state_store.save_question_set(
         uid=user.uid,
         set_id=saved_set_id,
@@ -307,6 +461,7 @@ async def _create_daily_pool(
         expires_at=datetime.now(UTC) + timedelta(days=2),
         source=source,
         date_key=date_key,
+        generation_metadata=generation_metadata,
     )
     await request.app.state.state_store.record_question_history(
         uid=user.uid,
@@ -314,14 +469,13 @@ async def _create_daily_pool(
         set_hash=set_hash,
         questions=serialized,
     )
-    topic_ids = [str(item.get("topicId") or "") for item in serialized]
     prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
     usage = generation.usage
     logger.info(
         "question generation succeeded mode=daily kind=daily_pool uidHash=%s "
         "initialLevel=%s adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s "
         "provider=%s model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s "
-        "source=%s topicIds=%s promptHashes=%s inputTokens=%s cachedInputTokens=%s "
+        "source=%s promptHashes=%s inputTokens=%s cachedInputTokens=%s "
         "outputTokens=%s reasoningTokens=%s totalTokens=%s",
         uid_hash,
         initial_level,
@@ -334,7 +488,6 @@ async def _create_daily_pool(
         generation.fallback_used,
         set_hash,
         source,
-        topic_ids,
         prompt_hashes,
         usage.input_tokens if usage else None,
         usage.cached_input_tokens if usage else None,
@@ -352,15 +505,44 @@ async def _create_daily_pool(
         adjustment=adjustment,
         effective_level=effective_level,
         status_value=QuestionSetStatus.COMPLETE,
+        generation_metadata=generation_metadata,
     )
 
 
 @router.get("/health")
-async def health(request: Request) -> dict[str, str | bool]:
-    return {
-        "status": "ok",
-        "mockAI": request.app.state.settings.mock_ai,
-    }
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/v1/operations/{operation_id}", response_model=OperationResponse)
+async def operation_status(
+    operation_id: str,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> OperationResponse:
+    if not REQUEST_ID_PATTERN.fullmatch(operation_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_operation_id"},
+        )
+    record = await request.app.state.state_store.get_operation(
+        uid=user.uid,
+        operation_id=operation_id,
+    )
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "operation_not_found"},
+        )
+    operation_state = str(record.get("status") or "processing")
+    return OperationResponse(
+        operationId=operation_id,
+        operation=str(record.get("operation") or "unknown"),
+        status=operation_state,
+        result=record.get("result"),
+        retryable=operation_state in {"processing", "recoverable_failed"},
+        updatedAt=record.get("updatedAt"),
+    )
 
 
 async def _create_question_set(
@@ -369,6 +551,8 @@ async def _create_question_set(
     payload: PracticeSetRequest,
     *,
     mode: str,
+    set_id: str | None = None,
+    date_key: str | None = None,
 ) -> QuestionSetResponse:
     initial_level = _request_initial_level(payload)
     effective_level = initial_level
@@ -427,9 +611,13 @@ async def _create_question_set(
             },
         ) from error
     questions = generation.questions
-    set_id = str(uuid.uuid4())
+    set_id = set_id or str(uuid.uuid4())
     serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
     set_hash = question_set_hash(serialized)
+    generation_metadata = _generation_metadata(
+        generation,
+        model_version=request.app.state.ai_service.model,
+    )
     await request.app.state.state_store.save_question_set(
         uid=user.uid,
         set_id=set_id,
@@ -447,6 +635,9 @@ async def _create_question_set(
         questions=serialized,
         expires_at=datetime.now(UTC)
         + timedelta(seconds=86_400 if mode == "practice" else 7 * 86_400),
+        source="daily" if date_key else None,
+        date_key=date_key,
+        generation_metadata=generation_metadata,
     )
     await request.app.state.state_store.record_question_history(
         uid=user.uid,
@@ -454,13 +645,12 @@ async def _create_question_set(
         set_hash=set_hash,
         questions=serialized,
     )
-    topic_ids = [str(item.get("topicId") or "") for item in serialized]
     prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
     usage = generation.usage
     logger.info(
         "question generation succeeded mode=%s stage=front uidHash=%s initialLevel=%s "
         "adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s provider=%s "
-        "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s topicIds=%s "
+        "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s "
         "promptHashes=%s inputTokens=%s cachedInputTokens=%s outputTokens=%s "
         "reasoningTokens=%s totalTokens=%s",
         mode,
@@ -474,7 +664,6 @@ async def _create_question_set(
         generation.openai_response_id,
         generation.fallback_used,
         set_hash,
-        topic_ids,
         prompt_hashes,
         usage.input_tokens if usage else None,
         usage.cached_input_tokens if usage else None,
@@ -492,6 +681,7 @@ async def _create_question_set(
         adjustment=None,
         effective_level=effective_level,
         status_value=QuestionSetStatus.AWAITING_ADJUSTMENT,
+        generation_metadata=generation_metadata,
     )
 
 
@@ -537,26 +727,48 @@ async def create_practice_set(
     )
     background = payload.background.model_dump(mode="json")
     survey = payload.survey.model_dump(mode="json") if payload.survey else None
-    if existing and _daily_record_matches(
-        existing,
-        initial_level=initial_level,
-        background=background,
-        survey=survey,
-        date_key=date_key,
-    ):
+    if existing:
         return _question_set_response_from_record(
             existing,
             model_version=request.app.state.ai_service.model,
         )
-    return await _create_daily_pool(
+    operation = "daily_free_generation"
+    operation_id = f"daily-{date_key}"
+    reservation = await _reserve_operation(
         request,
         user,
-        payload,
-        adjustment=DifficultyAdjustment.SAME,
-        source="free",
-        date_key=date_key,
-        set_id=free_set_id,
+        operation=operation,
+        operation_id=operation_id,
+        payload={"date": date_key},
     )
+    if reservation.status == "cached" and reservation.result:
+        return QuestionSetResponse.model_validate(reservation.result)
+    try:
+        response = await _create_daily_pool(
+            request,
+            user,
+            payload,
+            adjustment=DifficultyAdjustment.SAME,
+            source="free",
+            date_key=date_key,
+            set_id=free_set_id,
+        )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=response.model_dump(by_alias=True, mode="json"),
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except Exception:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise
 
 
 @router.post("/v1/question-sets/practice/refresh", response_model=QuestionSetResponse)
@@ -564,20 +776,47 @@ async def refresh_practice_set(
     payload: PracticeRefreshRequest,
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> QuestionSetResponse:
-    request_id = str(uuid.uuid4())
+    operation_id = _request_id(idempotency_key)
+    operation = "daily_refresh_generation"
     date_key = _date_key()
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload=payload.model_dump(by_alias=True, mode="json"),
+    )
+    if reservation.status == "cached" and reservation.result:
+        return QuestionSetResponse.model_validate(reservation.result)
+    request_id = hashlib.sha256(
+        f"{user.uid}:{operation}:{operation_id}".encode()
+    ).hexdigest()
     try:
-        await request.app.state.state_store.reserve_practice(
+        await request.app.state.state_store.reserve_mock(
             user.uid,
-            date_key,
             request_id,
-            request.app.state.settings.free_practice_limit,
+            payload.reward_nonce,
+            None,
+            RewardPurpose.PRACTICE_REFRESH,
         )
-    except UsageLimitExceeded as error:
+    except RewardNotVerified as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"code": "practice_quota_exhausted", "message": str(error)},
+            detail={"code": "practice_refresh_reward_required", "message": str(error)},
+        ) from error
+    except RequestAlreadyProcessing as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "request_processing", "operationId": operation_id},
+            headers={"Retry-After": "2"},
         ) from error
     try:
         response = await _create_daily_pool(
@@ -593,9 +832,22 @@ async def refresh_practice_set(
             {"setId": response.set_id, "setHash": response.set_hash},
             request.app.state.request_result_ttl_hours,
         )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=response.model_dump(by_alias=True, mode="json"),
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
         return response
     except Exception:
         await request.app.state.state_store.fail_request(request_id)
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
         raise
 
 
@@ -605,7 +857,416 @@ async def create_mock_exam(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> QuestionSetResponse:
-    return await _create_question_set(request, user, payload, mode="mock")
+    date_key = _date_key()
+    set_id = hashlib.sha256(f"{user.uid}:mock:{date_key}".encode()).hexdigest()
+    existing = await request.app.state.state_store.get_question_set(
+        uid=user.uid,
+        set_id=set_id,
+        mode="mock",
+    )
+    if existing:
+        return _question_set_response_from_record(
+            existing,
+            model_version=request.app.state.ai_service.model,
+        )
+    operation = "mock_daily_generation"
+    operation_id = f"mock-{date_key}"
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload={"date": date_key},
+    )
+    if reservation.status == "cached" and reservation.result:
+        return QuestionSetResponse.model_validate(reservation.result)
+    try:
+        response = await _create_question_set(
+            request,
+            user,
+            payload,
+            mode="mock",
+            set_id=set_id,
+            date_key=date_key,
+        )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=response.model_dump(by_alias=True, mode="json"),
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except Exception:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise
+
+
+@router.post("/v1/mock-exams/sessions", response_model=MockSessionResponse)
+async def create_mock_session(
+    payload: MockExamRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> MockSessionResponse:
+    if not request.app.state.settings.mock_session_v2_enabled:
+        raise HTTPException(status_code=404, detail={"code": "feature_disabled"})
+    operation_id = _request_id(idempotency_key)
+    date_key = _date_key()
+    initial_level = _request_initial_level(payload)
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation="mock_session_create",
+        operation_id=operation_id,
+        payload={"date": date_key, "initialLevel": initial_level},
+    )
+    if reservation.status == "cached" and reservation.result:
+        return MockSessionResponse.model_validate(reservation.result)
+    session_id = hashlib.sha256(f"{user.uid}:mock-session:{date_key}".encode()).hexdigest()
+    session_hash = hashlib.sha256(f"{session_id}:reward-gates".encode()).hexdigest()
+    record = await request.app.state.state_store.create_or_get_mock_session(
+        uid=user.uid,
+        session_id=session_id,
+        session_hash=session_hash,
+        date_key=date_key,
+        initial_level=initial_level,
+        background=payload.background.model_dump(mode="json"),
+        survey=payload.survey.model_dump(mode="json") if payload.survey else None,
+        resets_at=_next_reset(),
+    )
+    response = await _mock_session_response(request, user, record)
+    await request.app.state.state_store.complete_operation(
+        uid=user.uid,
+        operation="mock_session_create",
+        operation_id=operation_id,
+        result=response.model_dump(by_alias=True, mode="json"),
+        ttl_hours=request.app.state.request_result_ttl_hours,
+    )
+    return response
+
+
+@router.get("/v1/mock-exams/current", response_model=MockSessionResponse)
+async def current_mock_session(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> MockSessionResponse:
+    record = await request.app.state.state_store.get_mock_session(
+        uid=user.uid,
+        date_key=_date_key(),
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail={"code": "mock_session_not_found"})
+    return await _mock_session_response(request, user, record)
+
+
+@router.post("/v1/mock-exams/{session_id}/start", response_model=MockSessionResponse)
+async def start_mock_session(
+    session_id: str,
+    payload: MockSessionRewardRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> MockSessionResponse:
+    operation_id = _request_id(idempotency_key)
+    record = await request.app.state.state_store.get_mock_session(
+        uid=user.uid,
+        session_id=session_id,
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail={"code": "mock_session_not_found"})
+    if record.get("date") != _date_key():
+        raise HTTPException(status_code=409, detail={"code": "mock_session_expired"})
+    if record.get("stage") not in {
+        MockSessionStage.AWAITING_START_AD.value,
+        MockSessionStage.GENERATING_FRONT.value,
+    }:
+        return await _mock_session_response(request, user, record)
+    operation = "mock_session_start"
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload={"sessionId": session_id, "rewardNonce": payload.reward_nonce},
+    )
+    if reservation.status == "cached" and reservation.result:
+        return MockSessionResponse.model_validate(reservation.result)
+    try:
+        record = await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={MockSessionStage.AWAITING_START_AD.value},
+            stage=MockSessionStage.GENERATING_FRONT.value,
+        )
+    except InvalidSessionTransition:
+        current = await request.app.state.state_store.get_mock_session(
+            uid=user.uid, session_id=session_id
+        )
+        if current and current.get("stage") not in {
+            MockSessionStage.AWAITING_START_AD.value,
+            MockSessionStage.GENERATING_FRONT.value,
+        }:
+            response = await _mock_session_response(request, user, current)
+            await request.app.state.state_store.complete_operation(
+                uid=user.uid,
+                operation=operation,
+                operation_id=operation_id,
+                result=response.model_dump(by_alias=True, mode="json"),
+                ttl_hours=request.app.state.request_result_ttl_hours,
+            )
+            return response
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "mock_session_processing", "operationId": operation_id},
+            headers={"Retry-After": "2"},
+        )
+    reward_request_id = hashlib.sha256(
+        f"{user.uid}:{session_id}:start".encode()
+    ).hexdigest()
+    try:
+        await request.app.state.state_store.reserve_mock(
+            user.uid,
+            reward_request_id,
+            payload.reward_nonce,
+            str(record["sessionHash"]),
+            RewardPurpose.MOCK_START,
+        )
+        mock_payload = MockExamRequest(
+            initialLevel=int(record["initialLevel"]),
+            background=BackgroundProfile.model_validate(record.get("background") or {}),
+            survey=(
+                BackgroundSurvey.model_validate(record["survey"])
+                if record.get("survey")
+                else None
+            ),
+        )
+        set_id = hashlib.sha256(f"{session_id}:questions".encode()).hexdigest()
+        question_set = await _create_question_set(
+            request,
+            user,
+            mock_payload,
+            mode="mock",
+            set_id=set_id,
+            date_key=str(record["date"]),
+        )
+        record = await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={MockSessionStage.GENERATING_FRONT.value},
+            stage=MockSessionStage.ANSWERING_FRONT.value,
+            updates={
+                "setId": question_set.set_id,
+                "setHash": question_set.set_hash,
+                "startRewardNonce": payload.reward_nonce,
+            },
+        )
+        response = await _mock_session_response(request, user, record)
+        await request.app.state.state_store.finalize_request(
+            reward_request_id,
+            {"sessionId": session_id, "stage": record["stage"]},
+            request.app.state.request_result_ttl_hours,
+        )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=response.model_dump(by_alias=True, mode="json"),
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except RewardNotVerified as error:
+        await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={MockSessionStage.GENERATING_FRONT.value},
+            stage=MockSessionStage.AWAITING_START_AD.value,
+        )
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "mock_start_reward_required", "message": str(error)},
+        ) from error
+    except Exception:
+        await request.app.state.state_store.fail_request(reward_request_id)
+        try:
+            await request.app.state.state_store.transition_mock_session(
+                uid=user.uid,
+                session_id=session_id,
+                expected_stages={MockSessionStage.GENERATING_FRONT.value},
+                stage=MockSessionStage.AWAITING_START_AD.value,
+            )
+        except (KeyError, InvalidSessionTransition):
+            pass
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise
+
+
+@router.post(
+    "/v1/mock-exams/{session_id}/adjustment",
+    response_model=MockSessionResponse,
+)
+async def adjust_mock_session(
+    session_id: str,
+    payload: MockSessionAdjustmentRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> MockSessionResponse:
+    operation_id = _request_id(idempotency_key)
+    record = await request.app.state.state_store.get_mock_session(
+        uid=user.uid, session_id=session_id
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail={"code": "mock_session_not_found"})
+    if record.get("stage") in {
+        MockSessionStage.ANSWERING_TAIL.value,
+        MockSessionStage.AWAITING_RESULT_AD.value,
+        MockSessionStage.EVALUATING.value,
+        MockSessionStage.COMPLETED.value,
+    }:
+        if record.get("adjustment") != payload.adjustment.value:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "adjustment_already_applied"},
+            )
+        return await _mock_session_response(request, user, record)
+    operation = "mock_session_adjustment"
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload=payload.model_dump(by_alias=True, mode="json"),
+    )
+    if reservation.status == "cached" and reservation.result:
+        return MockSessionResponse.model_validate(reservation.result)
+    try:
+        record = await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={
+                MockSessionStage.ANSWERING_FRONT.value,
+                MockSessionStage.AWAITING_ADJUSTMENT_AD.value,
+            },
+            stage=MockSessionStage.GENERATING_TAIL.value,
+        )
+    except InvalidSessionTransition as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "invalid_mock_session_stage", "message": str(error)},
+        ) from error
+    reward_request_id = hashlib.sha256(
+        f"{user.uid}:{session_id}:adjustment".encode()
+    ).hexdigest()
+    try:
+        await request.app.state.state_store.reserve_mock(
+            user.uid,
+            reward_request_id,
+            payload.reward_nonce,
+            str(record["sessionHash"]),
+            RewardPurpose.MOCK_ADJUSTMENT,
+        )
+        await apply_question_set_adjustment(
+            str(record["setId"]),
+            QuestionSetAdjustmentRequest(adjustment=payload.adjustment),
+            request,
+            user,
+            f"session-adjust-{session_id}",
+        )
+        stored_set = await request.app.state.state_store.get_question_set(
+            uid=user.uid,
+            set_id=str(record["setId"]),
+            mode="mock",
+        )
+        if not stored_set:
+            raise KeyError("mock question set not found")
+        record = await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={MockSessionStage.GENERATING_TAIL.value},
+            stage=MockSessionStage.ANSWERING_TAIL.value,
+            updates={
+                "setHash": stored_set["questionHash"],
+                "adjustment": payload.adjustment.value,
+                "adjustmentRewardNonce": payload.reward_nonce,
+            },
+        )
+        response = await _mock_session_response(request, user, record)
+        await request.app.state.state_store.finalize_request(
+            reward_request_id,
+            {"sessionId": session_id, "stage": record["stage"]},
+            request.app.state.request_result_ttl_hours,
+        )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=response.model_dump(by_alias=True, mode="json"),
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except RewardNotVerified as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "mock_adjustment_reward_required", "message": str(error)},
+        ) from error
+    except Exception:
+        await request.app.state.state_store.fail_request(reward_request_id)
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise
+    finally:
+        current = await request.app.state.state_store.get_mock_session(
+            uid=user.uid, session_id=session_id
+        )
+        if current and current.get("stage") == MockSessionStage.GENERATING_TAIL.value:
+            try:
+                await request.app.state.state_store.transition_mock_session(
+                    uid=user.uid,
+                    session_id=session_id,
+                    expected_stages={MockSessionStage.GENERATING_TAIL.value},
+                    stage=MockSessionStage.AWAITING_ADJUSTMENT_AD.value,
+                )
+            except InvalidSessionTransition:
+                pass
 
 
 @router.post("/v1/question-sets/{set_id}/adjustment", response_model=QuestionSetResponse)
@@ -614,7 +1275,9 @@ async def apply_question_set_adjustment(
     payload: QuestionSetAdjustmentRequest,
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> QuestionSetResponse:
+    _request_id(idempotency_key)
     mode = "daily"
     record = await request.app.state.state_store.get_question_set(
         uid=user.uid, set_id=set_id, mode=mode
@@ -637,10 +1300,22 @@ async def apply_question_set_adjustment(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
-                "code": "adjustment_already_applied",
-                "message": "This question set already has a different adjustment.",
+                "code": "question_set_complete",
+                "message": "This question set is complete and cannot be adjusted again.",
             },
         )
+
+    operation = "question_set_adjustment"
+    operation_id = f"adjust-{set_id}"
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload={"setId": set_id, "adjustment": payload.adjustment.value},
+    )
+    if reservation.status == "cached" and reservation.result:
+        return QuestionSetResponse.model_validate(reservation.result)
 
     initial_level = int(record["initialLevel"])
     effective_level = adjusted_level(initial_level, payload.adjustment)
@@ -690,6 +1365,12 @@ async def apply_question_set_adjustment(
                 history=history,
             )
     except AIQuestionGenerationError as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
         logger.exception(
             "question generation failed mode=%s stage=tail uidHash=%s initialLevel=%s "
             "adjustment=%s model=%s",
@@ -711,8 +1392,23 @@ async def apply_question_set_adjustment(
     questions = [*existing_questions, *generation.questions]
     serialized = [item.model_dump(by_alias=True, mode="json") for item in questions]
     set_hash = question_set_hash(serialized)
+    generation_metadata = _generation_metadata(
+        generation,
+        model_version=request.app.state.ai_service.model,
+    )
+    if record.get("fallbackUsed"):
+        generation_metadata["fallbackUsed"] = True
+        generation_metadata["provider"] = (
+            "catalog" if generation.provider == "catalog" else "mixed"
+        )
+        generation_metadata["fallbackQuestionNumbers"] = sorted(
+            {
+                *[int(value) for value in record.get("fallbackQuestionNumbers", [])],
+                *generation.fallback_question_numbers,
+            }
+        )
     try:
-        await request.app.state.state_store.apply_question_set_adjustment(
+        stored_record = await request.app.state.state_store.apply_question_set_adjustment(
             uid=user.uid,
             set_id=set_id,
             mode=mode,
@@ -721,30 +1417,47 @@ async def apply_question_set_adjustment(
             target_level=expected_level.value,
             question_hash=set_hash,
             questions=serialized,
+            generation_metadata=generation_metadata,
         )
     except AdjustmentAlreadyApplied as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "adjustment_already_applied", "message": str(error)},
         ) from error
     except KeyError as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
         raise HTTPException(
             status_code=404,
             detail={"code": "question_set_not_found"},
         ) from error
+    canonical_questions = QUESTION_LIST.validate_python(stored_record["questions"])
+    canonical_serialized = [
+        item.model_dump(by_alias=True, mode="json") for item in canonical_questions
+    ]
+    canonical_set_hash = str(stored_record["questionHash"])
     await request.app.state.state_store.record_question_history(
         uid=user.uid,
         mode=mode,
-        set_hash=set_hash,
-        questions=serialized,
+        set_hash=canonical_set_hash,
+        questions=canonical_serialized,
     )
-    topic_ids = [str(item.get("topicId") or "") for item in serialized]
     prompt_hashes = [prompt_hash(str(item.get("prompt") or ""))[:16] for item in serialized]
     usage = generation.usage
     logger.info(
         "question generation succeeded mode=%s stage=tail uidHash=%s initialLevel=%s "
         "adjustment=%s effectiveLevelCode=%s expectedTargetLevel=%s provider=%s "
-        "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s topicIds=%s "
+        "model=%s openaiResponseId=%s fallbackUsed=%s setHash=%s "
         "promptHashes=%s inputTokens=%s cachedInputTokens=%s outputTokens=%s "
         "reasoningTokens=%s totalTokens=%s",
         mode,
@@ -758,7 +1471,6 @@ async def apply_question_set_adjustment(
         generation.openai_response_id,
         generation.fallback_used,
         set_hash,
-        topic_ids,
         prompt_hashes,
         usage.input_tokens if usage else None,
         usage.cached_input_tokens if usage else None,
@@ -766,17 +1478,18 @@ async def apply_question_set_adjustment(
         usage.reasoning_tokens if usage else None,
         usage.total_tokens if usage else None,
     )
-    return _question_set_response(
-        set_id=set_id,
-        set_hash=set_hash,
-        questions=questions,
+    response = _question_set_response_from_record(
+        stored_record,
         model_version=request.app.state.ai_service.model,
-        fallback_used=generation.fallback_used,
-        initial_level=initial_level,
-        adjustment=payload.adjustment,
-        effective_level=effective_level,
-        status_value=QuestionSetStatus.COMPLETE,
     )
+    await request.app.state.state_store.complete_operation(
+        uid=user.uid,
+        operation=operation,
+        operation_id=operation_id,
+        result=response.model_dump(by_alias=True, mode="json"),
+        ttl_hours=request.app.state.request_result_ttl_hours,
+    )
+    return response
 
 
 @router.get("/v1/usage", response_model=UsageResponse)
@@ -787,10 +1500,30 @@ async def usage(
     settings = request.app.state.settings
     date_key = _date_key()
     value = await request.app.state.state_store.get_usage(user.uid, date_key)
+    free_remaining = max(
+        0, settings.free_practice_limit - int(value.get("freeUsed", 0))
+    )
+    bonus_remaining = max(0, int(value.get("bonusRemaining", 0)))
+    resets_at = _next_reset()
+    mock_session = await request.app.state.state_store.get_mock_session(
+        uid=user.uid,
+        date_key=date_key,
+    )
     return UsageResponse(
         date=date_key,
-        freeRemaining=max(0, settings.free_practice_limit - int(value.get("freeUsed", 0))),
-        bonusRemaining=max(0, int(value.get("bonusRemaining", 0))),
+        freeRemaining=free_remaining,
+        bonusRemaining=bonus_remaining,
+        serverDateKey=date_key,
+        resetsAt=resets_at,
+        dailyAnalysisFreeRemaining=free_remaining,
+        dailyAnalysisRewardRemaining=bonus_remaining,
+        dailyRefreshRemaining=max(
+            0,
+            settings.max_daily_reward_count
+            - int(value.get("practiceRefreshRewardCount", 0)),
+        ),
+        mockAvailable=mock_session is None,
+        mockSessionStage=(str(mock_session["stage"]) if mock_session else None),
     )
 
 
@@ -882,6 +1615,7 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
             nonce=verified.nonce,
             transaction_id=verified.transaction_id,
             practice_credit_amount=request.app.state.settings.reward_practice_credits,
+            max_daily_reward_count=request.app.state.settings.max_daily_reward_count,
         )
         logger.info("[SSV] reward verified nonce=%s", verified.nonce)
         logger.info("[SSV] reward completed nonce=%s", verified.nonce)
@@ -892,7 +1626,7 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
             verified.user_id,
             reward.get("purpose"),
         )
-    except (SSVVerificationError, RewardNotVerified) as error:
+    except (SSVVerificationError, RewardNotVerified, UsageLimitExceeded) as error:
         error_text = str(error)
         if "required SSV parameters are missing" in error_text:
             logger.warning("[SSV] missing parameter client=%s keys=%s", client_host, query_keys)
@@ -911,6 +1645,7 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
 
 
 @router.post("/v1/evaluations/practice", response_model=PracticeEvaluation)
+@router.post("/v2/evaluations/practice", response_model=PracticeEvaluation)
 async def evaluate_practice(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
@@ -995,6 +1730,252 @@ def _audio_number(upload: UploadFile) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _validate_mock_audio_files(audio_files: list[UploadFile]) -> list[int]:
+    if len(audio_files) != 15:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "missing_audio", "message": "All 15 audio files are required."},
+        )
+    audio_numbers = [_audio_number(item) for item in audio_files]
+    if sorted(number for number in audio_numbers if number is not None) != list(
+        range(1, 16)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_audio_manifest",
+                "message": "Audio files must contain each answer number 1 through 15 exactly once.",
+            },
+        )
+    aggregate_size = sum(int(item.size or 0) for item in audio_files)
+    if aggregate_size > MOCK_AUDIO_AGGREGATE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "audio_payload_too_large",
+                "message": "Combined mock audio exceeds the 30 MB limit.",
+            },
+        )
+    return [int(number) for number in audio_numbers]
+
+
+@router.post("/v1/mock-exams/{session_id}/evaluate", response_model=MockEvaluation)
+async def evaluate_mock_session(
+    session_id: str,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    manifest_json: Annotated[str, Form(alias="manifest")],
+    audio_files: Annotated[list[UploadFile], File(alias="audioFiles")] = [],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> MockEvaluation:
+    operation_id = _request_id(idempotency_key)
+    try:
+        manifest = MockEvaluationManifest.model_validate_json(manifest_json)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_manifest", "message": str(error)},
+        ) from error
+    session = await request.app.state.state_store.get_mock_session(
+        uid=user.uid,
+        session_id=session_id,
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail={"code": "mock_session_not_found"})
+    if manifest.set_id != session.get("setId"):
+        raise HTTPException(status_code=409, detail={"code": "mock_session_set_mismatch"})
+    audio_numbers = _validate_mock_audio_files(audio_files)
+    operation = "mock_session_evaluation"
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload={
+            "sessionId": session_id,
+            "setId": manifest.set_id,
+            "rewardNonce": manifest.reward_nonce,
+            "answers": [item.model_dump(mode="json") for item in manifest.answers],
+        },
+    )
+    if reservation.status == "cached" and reservation.result:
+        return MockEvaluation.model_validate(reservation.result)
+    if session.get("stage") not in {
+        MockSessionStage.ANSWERING_TAIL.value,
+        MockSessionStage.AWAITING_RESULT_AD.value,
+    }:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "invalid_mock_session_stage", "stage": session.get("stage")},
+        )
+    try:
+        question_set = await request.app.state.state_store.get_question_set(
+            uid=user.uid,
+            set_id=manifest.set_id,
+            mode="mock",
+        )
+        if not question_set or question_set.get("status") != "complete":
+            raise ValueError("complete question set not found")
+        target = request.app.state.level_adapter.validate_python(
+            question_set.get("targetLevel")
+        )
+        questions = QUESTION_LIST.validate_python(question_set["questions"])
+    except (ValueError, ValidationError) as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "invalid_set", "message": str(error)},
+        ) from error
+    try:
+        await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={
+                MockSessionStage.ANSWERING_TAIL.value,
+                MockSessionStage.AWAITING_RESULT_AD.value,
+            },
+            stage=MockSessionStage.EVALUATING.value,
+        )
+    except InvalidSessionTransition as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "mock_session_processing", "message": str(error)},
+        ) from error
+    reward_request_id = hashlib.sha256(
+        f"{user.uid}:{session_id}:result".encode()
+    ).hexdigest()
+    try:
+        await request.app.state.state_store.reserve_mock(
+            user.uid,
+            reward_request_id,
+            manifest.reward_nonce,
+            str(session["sessionHash"]),
+            RewardPurpose.MOCK_RESULT,
+        )
+        files_by_number = {
+            number: item for number, item in zip(audio_numbers, audio_files)
+        }
+        metrics = await asyncio.gather(
+            *[
+                request.app.state.audio_service.analyze(
+                    files_by_number[answer.number], answer.transcript
+                )
+                for answer in manifest.answers
+            ]
+        )
+        result = await request.app.state.ai_service.evaluate_mock(
+            questions=questions,
+            transcripts=[item.transcript for item in manifest.answers],
+            target=target,
+            metrics=list(metrics),
+        )
+        serialized_result = result.model_dump(by_alias=True, mode="json")
+        await request.app.state.state_store.finalize_request(
+            reward_request_id,
+            serialized_result,
+            request.app.state.request_result_ttl_hours,
+        )
+        await request.app.state.state_store.transition_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            expected_stages={MockSessionStage.EVALUATING.value},
+            stage=MockSessionStage.COMPLETED.value,
+            updates={
+                "resultRewardNonce": manifest.reward_nonce,
+                "resultOperationId": operation_id,
+                "completedAt": datetime.now(UTC),
+            },
+        )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=serialized_result,
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
+        return result
+    except RewardNotVerified as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={"code": "mock_result_reward_required", "message": str(error)},
+        ) from error
+    except AudioValidationError as error:
+        await request.app.state.state_store.fail_request(reward_request_id)
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_audio", "message": str(error)},
+        ) from error
+    except AIServiceError as error:
+        await request.app.state.state_store.fail_request(reward_request_id)
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ai_unavailable",
+                "message": "AI feedback is temporarily unavailable. Please try again.",
+                "operationId": operation_id,
+                "retryable": True,
+            },
+        ) from error
+    except Exception:
+        await request.app.state.state_store.fail_request(reward_request_id)
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise
+    finally:
+        current = await request.app.state.state_store.get_mock_session(
+            uid=user.uid, session_id=session_id
+        )
+        if current and current.get("stage") == MockSessionStage.EVALUATING.value:
+            try:
+                await request.app.state.state_store.transition_mock_session(
+                    uid=user.uid,
+                    session_id=session_id,
+                    expected_stages={MockSessionStage.EVALUATING.value},
+                    stage=MockSessionStage.AWAITING_RESULT_AD.value,
+                )
+            except InvalidSessionTransition:
+                pass
+
+
 @router.post("/v1/evaluations/mock", response_model=MockEvaluation)
 async def evaluate_mock(
     request: Request,
@@ -1027,11 +2008,7 @@ async def evaluate_mock(
             status_code=401,
             detail={"code": "invalid_set", "message": str(error)},
         ) from error
-    if len(audio_files) != 15:
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "missing_audio", "message": "All 15 audio files are required."},
-        )
+    audio_numbers = _validate_mock_audio_files(audio_files)
     try:
         reservation = await request.app.state.state_store.reserve_mock(
             user.uid,
@@ -1050,9 +2027,7 @@ async def evaluate_mock(
         return MockEvaluation.model_validate(reservation.result)
 
     files_by_number = {
-        number: item
-        for item in audio_files
-        if (number := _audio_number(item)) is not None and 1 <= number <= 15
+        int(number): item for number, item in zip(audio_numbers, audio_files)
     }
     try:
         metrics = await asyncio.gather(

@@ -33,6 +33,12 @@ class DifficultyAdjustment(StrEnum):
     SAME = "same"
     HARDER = "harder"
 
+    @classmethod
+    def _missing_(cls, value: object) -> "DifficultyAdjustment | None":
+        if isinstance(value, str) and value.strip().lower() == "similar":
+            return cls.SAME
+        return None
+
 
 class QuestionSetStatus(StrEnum):
     AWAITING_ADJUSTMENT = "awaiting_adjustment"
@@ -48,11 +54,40 @@ class QuestionStyle(StrEnum):
     PROBLEM_SOLVING = "problem_solving"
     OPINION = "opinion"
 
+    @classmethod
+    def _missing_(cls, value: object) -> "QuestionStyle | None":
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "descriptive": cls.DESCRIPTION,
+            "pastexperience": cls.PAST_EXPERIENCE,
+            "experience": cls.PAST_EXPERIENCE,
+            "problemsolving": cls.PROBLEM_SOLVING,
+        }
+        return aliases.get(normalized.replace("_", ""))
+
 
 class ConfidenceBand(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class RubricBand(StrEnum):
+    FOUNDATION = "foundation"
+    DEVELOPING = "developing"
+    FUNCTIONAL = "functional"
+    STRONG = "strong"
+    ADVANCED = "advanced"
+
+
+class RubricDimension(StrEnum):
+    TASK_FULFILLMENT = "taskFulfillment"
+    GRAMMAR = "grammar"
+    VOCABULARY = "vocabulary"
+    DISCOURSE = "discourse"
+    FLUENCY = "fluency"
 
 
 class BackgroundProfile(BaseModel):
@@ -147,8 +182,31 @@ class MockExamRequest(PracticeSetRequest):
     survey: BackgroundSurvey | None = None
 
 
+class MockSessionStage(StrEnum):
+    AWAITING_START_AD = "awaiting_start_ad"
+    GENERATING_FRONT = "generating_front"
+    ANSWERING_FRONT = "answering_front"
+    AWAITING_ADJUSTMENT_AD = "awaiting_adjustment_ad"
+    GENERATING_TAIL = "generating_tail"
+    ANSWERING_TAIL = "answering_tail"
+    AWAITING_RESULT_AD = "awaiting_result_ad"
+    EVALUATING = "evaluating"
+    COMPLETED = "completed"
+
+
+class MockSessionRewardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reward_nonce: str = Field(alias="rewardNonce", min_length=16)
+
+
+class MockSessionAdjustmentRequest(MockSessionRewardRequest):
+    adjustment: DifficultyAdjustment
+
+
 class PracticeRefreshRequest(PracticeSetRequest):
     adjustment: DifficultyAdjustment = DifficultyAdjustment.SAME
+    reward_nonce: str = Field(alias="rewardNonce", min_length=16)
 
 
 class QuestionSetResponse(BaseModel):
@@ -170,6 +228,30 @@ class QuestionSetResponse(BaseModel):
         default=None, alias="requiresAdjustmentAfter"
     )
     is_complete: bool = Field(alias="isComplete")
+    provider: str = "openai"
+    fallback_reason: str | None = Field(default=None, alias="fallbackReason")
+    fallback_question_numbers: list[int] = Field(
+        default_factory=list,
+        alias="fallbackQuestionNumbers",
+    )
+    retry_count: int = Field(default=0, alias="retryCount", ge=0)
+    prompt_version: str | None = Field(default=None, alias="promptVersion")
+    schema_version: str | None = Field(default=None, alias="schemaVersion")
+    server_date_key: str | None = Field(default=None, alias="serverDateKey")
+
+
+class MockSessionResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_id: str = Field(alias="sessionId")
+    session_hash: str = Field(alias="sessionHash")
+    server_date_key: str = Field(alias="serverDateKey")
+    stage: MockSessionStage
+    resets_at: datetime = Field(alias="resetsAt")
+    set_id: str | None = Field(default=None, alias="setId")
+    set_hash: str | None = Field(default=None, alias="setHash")
+    adjustment: DifficultyAdjustment | None = None
+    question_set: QuestionSetResponse | None = Field(default=None, alias="questionSet")
 
 
 class QuestionSetAdjustmentRequest(BaseModel):
@@ -216,6 +298,15 @@ class EvaluationScores(BaseModel):
     fluency: int = Field(ge=0, le=100)
 
 
+class RubricAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dimension: RubricDimension
+    band: RubricBand
+    evidence: str = Field(min_length=1, max_length=240)
+    next_action: str = Field(alias="nextAction", min_length=1, max_length=240)
+
+
 class AudioMetrics(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -233,13 +324,19 @@ class PracticeEvaluation(BaseModel):
     scores: EvaluationScores
     strengths: list[str] = Field(min_length=1, max_length=5)
     improvements: list[str] = Field(min_length=1, max_length=5)
-    corrected_answer: str = Field(alias="correctedAnswer", min_length=1)
-    target_gap: str = Field(alias="targetGap", min_length=1)
-    sample_answer: str = Field(alias="sampleAnswer", min_length=1)
+    corrected_answer: str | None = Field(default=None, alias="correctedAnswer")
+    target_gap: str | None = Field(default=None, alias="targetGap")
+    sample_answer: str | None = Field(default=None, alias="sampleAnswer")
     audio_metrics: AudioMetrics = Field(alias="audioMetrics")
     disclaimer: str
     model_version: str = Field(alias="modelVersion")
     prompt_version: str = Field(alias="promptVersion")
+    result_status: str = Field(default="complete", alias="resultStatus")
+    rubrics: list[RubricAssessment] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    score_scale_version: str = Field(
+        default="rubric-band-v1", alias="scoreScaleVersion"
+    )
 
 
 class MockAnswerManifest(BaseModel):
@@ -286,13 +383,19 @@ class MockEvaluation(BaseModel):
     disclaimer: str
     model_version: str = Field(alias="modelVersion")
     prompt_version: str = Field(alias="promptVersion")
+    result_status: str = Field(default="complete", alias="resultStatus")
+    rubrics: list[RubricAssessment] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    score_scale_version: str = Field(
+        default="rubric-band-v1", alias="scoreScaleVersion"
+    )
 
     @field_validator("per_question")
     @classmethod
     def validate_feedback_count(
         cls, value: list[PerQuestionFeedback]
     ) -> list[PerQuestionFeedback]:
-        if [item.number for item in value] != list(range(1, 16)):
+        if value and [item.number for item in value] != list(range(1, 16)):
             raise ValueError("perQuestion must contain ordered numbers 1 through 15")
         return value
 
@@ -301,10 +404,26 @@ class UsageResponse(BaseModel):
     date: str
     free_remaining: int = Field(alias="freeRemaining", ge=0)
     bonus_remaining: int = Field(alias="bonusRemaining", ge=0)
+    server_date_key: str | None = Field(default=None, alias="serverDateKey")
+    resets_at: datetime | None = Field(default=None, alias="resetsAt")
+    daily_analysis_free_remaining: int | None = Field(
+        default=None, alias="dailyAnalysisFreeRemaining", ge=0
+    )
+    daily_analysis_reward_remaining: int | None = Field(
+        default=None, alias="dailyAnalysisRewardRemaining", ge=0
+    )
+    daily_refresh_remaining: int | None = Field(
+        default=None, alias="dailyRefreshRemaining", ge=0
+    )
+    mock_available: bool | None = Field(default=None, alias="mockAvailable")
+    mock_session_stage: str | None = Field(default=None, alias="mockSessionStage")
 
 
 class RewardPurpose(StrEnum):
     PRACTICE_CREDITS = "practice_credits"
+    PRACTICE_REFRESH = "practice_refresh"
+    MOCK_START = "mock_start"
+    MOCK_ADJUSTMENT = "mock_adjustment"
     MOCK_RESULT = "mock_result"
     TARGET_LEVEL_CHANGE = "target_level_change"
 
@@ -317,8 +436,12 @@ class RewardIntentRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_session_hash(self) -> "RewardIntentRequest":
-        if self.purpose is RewardPurpose.MOCK_RESULT and not self.session_hash:
-            raise ValueError("sessionHash is required for mock_result")
+        if self.purpose in {
+            RewardPurpose.MOCK_START,
+            RewardPurpose.MOCK_ADJUSTMENT,
+            RewardPurpose.MOCK_RESULT,
+        } and not self.session_hash:
+            raise ValueError("sessionHash is required for mock rewards")
         return self
 
 
@@ -336,3 +459,35 @@ class RewardIntentResponse(BaseModel):
 class APIError(BaseModel):
     code: str
     message: str
+
+
+class OperationResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    operation_id: str = Field(alias="operationId")
+    operation: str
+    status: str
+    result: dict[str, object] | None = None
+    retryable: bool = False
+    updated_at: datetime | None = Field(default=None, alias="updatedAt")
+
+
+class CapabilityQuotaPolicy(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    daily_analysis_free: int = Field(alias="dailyAnalysisFree", ge=0)
+    daily_refresh_rewards: int = Field(alias="dailyRefreshRewards", ge=0)
+    mock_sessions_per_day: int = Field(default=1, alias="mockSessionsPerDay", ge=0)
+    mock_reward_gates: int = Field(default=3, alias="mockRewardGates", ge=0)
+
+
+class CapabilitiesResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    minimum_supported_app_version: str = Field(alias="minimumSupportedAppVersion")
+    question_generation_v2: bool = Field(alias="questionGenerationV2")
+    mock_session_v2: bool = Field(alias="mockSessionV2")
+    evaluation_rubric_v2: bool = Field(alias="evaluationRubricV2")
+    practice_refresh: bool = Field(alias="practiceRefresh")
+    guide_schema_version: int = Field(alias="guideSchemaVersion", ge=1)
+    quota_policy: CapabilityQuotaPolicy = Field(alias="quotaPolicy")
