@@ -126,11 +126,43 @@ jobs:
 
       - name: Verify health endpoint
         run: |
-          SERVICE_URL="$(gcloud run services describe "${SERVICE}" \
-            --region "${REGION}" \
-            --project "${PROJECT_ID}" \
-            --format="value(status.traffic[?tag='candidate-${GITHUB_SHA::8}'].url)")"
-          curl -fsS "${SERVICE_URL}/health"
+          CANDIDATE_TAG="candidate-${GITHUB_SHA::8}"
+          SERVICE_URL=""
+
+          for attempt in {1..10}; do
+            SERVICE_URL="$(
+              gcloud run services describe "${SERVICE}" \
+                --region "${REGION}" \
+                --project "${PROJECT_ID}" \
+                --format=json \
+              | jq -r --arg tag "${CANDIDATE_TAG}" \
+                  '[.status.traffic[]? | select(.tag == $tag) | .url][0] // empty'
+            )"
+
+            if [[ "${SERVICE_URL}" == https://* ]]; then
+              break
+            fi
+
+            echo "Candidate URL is not available yet (attempt ${attempt}/10)."
+            sleep 3
+          done
+
+          if [[ "${SERVICE_URL}" != https://* ]]; then
+            echo "::error::Cloud Run candidate URL was not found for tag ${CANDIDATE_TAG}."
+            gcloud run services describe "${SERVICE}" \
+              --region "${REGION}" \
+              --project "${PROJECT_ID}" \
+              --format='table(status.traffic.tag,status.traffic.revisionName,status.traffic.url)'
+            exit 1
+          fi
+
+          curl --fail --show-error --silent \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "${SERVICE_URL}/health"
 
       - name: Promote verified revision
         run: >-
