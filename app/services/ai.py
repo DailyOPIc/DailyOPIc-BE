@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
+import random
 import re
 from dataclasses import dataclass
 from typing import Annotated, Any
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    create_model,
+    field_validator,
+)
 
 from app.models.api import (
     AudioMetrics,
@@ -23,6 +32,9 @@ from app.models.api import (
     PerQuestionFeedback,
     PracticeEvaluation,
     QuestionStyle,
+    RubricAssessment,
+    RubricBand,
+    RubricDimension,
 )
 from app.services.questions import (
     FallbackQuestionGenerator,
@@ -36,9 +48,18 @@ from app.services.questions import (
 from app.services.difficulty import adjusted_level, expected_target_level
 from app.services.difficulty import initial_level_from_target
 
-PROMPT_VERSION = "opic-rubric-2026-06-22-v1"
+PROMPT_VERSION = "opic-rubric-band-2026-07-21-v2"
+QUESTION_SCHEMA_VERSION = "question-content-slots-v2"
+SCORE_SCALE_VERSION = "rubric-band-v1"
 DISCLAIMER = "이 결과는 학습용 AI 예상치이며 실제 OPIc 공식 등급과 다를 수 있습니다."
 LEVELS = list(OPIcLevel)
+RUBRIC_SCORE_BY_BAND = {
+    RubricBand.FOUNDATION: 20,
+    RubricBand.DEVELOPING: 40,
+    RubricBand.FUNCTIONAL: 60,
+    RubricBand.STRONG: 80,
+    RubricBand.ADVANCED: 95,
+}
 logger = logging.getLogger(__name__)
 
 BriefKorean = Annotated[str, Field(min_length=1, max_length=140)]
@@ -54,7 +75,16 @@ class AIServiceConfigurationError(AIServiceError):
 
 
 class AIServiceUnavailable(AIServiceError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class AIQuestionGenerationError(AIServiceError):
@@ -64,6 +94,20 @@ class AIQuestionGenerationError(AIServiceError):
 class GeneratedQuestionsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[GeneratedQuestion]
+
+
+class GeneratedQuestionContent(BaseModel):
+    """Creative fields the model is allowed to author for a blueprint slot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=8, max_length=700)
+    follow_up_prompt: str | None = Field(
+        default=None,
+        alias="followUpPrompt",
+        max_length=500,
+    )
+    rubric_focus: list[str] = Field(alias="rubricFocus", min_length=1, max_length=6)
 
 
 @dataclass(slots=True)
@@ -89,38 +133,73 @@ class QuestionGenerationResult:
     provider: str
     openai_response_id: str | None = None
     usage: AIUsage | None = None
+    fallback_reason: str | None = None
+    fallback_question_numbers: tuple[int, ...] = ()
+    retry_count: int = 0
+    prompt_version: str = PROMPT_VERSION
+    schema_version: str = QUESTION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionValidationIssue:
+    question_number: int
+    field: str
+    expected: str | None
+    actual: str | None
+    category: str
+
+    def log_value(self) -> dict[str, object]:
+        return {
+            "questionNumber": self.question_number,
+            "field": self.field,
+            "expected": self.expected,
+            "actual": self.actual,
+            "category": self.category,
+        }
 
 
 class AIPracticeResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     predicted_level: OPIcLevel = Field(alias="predictedLevel")
     confidence: ConfidenceBand
-    scores: EvaluationScores
+    rubrics: list[RubricAssessment]
     strengths: list[BriefKorean] = Field(min_length=1, max_length=3)
     improvements: list[BriefKorean] = Field(min_length=1, max_length=3)
-    corrected_answer: str = Field(alias="correctedAnswer", min_length=1, max_length=900)
-    target_gap: ShortKorean = Field(alias="targetGap")
-    sample_answer: str = Field(alias="sampleAnswer", min_length=1, max_length=900)
+    corrected_answer: str | None = Field(
+        default=None, alias="correctedAnswer", max_length=900
+    )
+    target_gap: ShortKorean | None = Field(default=None, alias="targetGap")
+    sample_answer: str | None = Field(
+        default=None, alias="sampleAnswer", max_length=900
+    )
+
+    @field_validator("rubrics")
+    @classmethod
+    def validate_rubrics(
+        cls, value: list[RubricAssessment]
+    ) -> list[RubricAssessment]:
+        if [item.dimension for item in value] != list(RubricDimension):
+            raise ValueError("rubrics must contain all five dimensions in order")
+        return value
 
 
 class AIMockResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     predicted_level: OPIcLevel = Field(alias="predictedLevel")
     confidence: ConfidenceBand
-    scores: EvaluationScores
+    rubrics: list[RubricAssessment]
     strengths: list[BriefKorean] = Field(min_length=1, max_length=4)
     improvements: list[BriefKorean] = Field(min_length=1, max_length=4)
     target_gap: ShortKorean = Field(alias="targetGap")
     overall_feedback: str = Field(alias="overallFeedback", min_length=1, max_length=450)
-    per_question: list[PerQuestionFeedback] = Field(alias="perQuestion")
 
-    @field_validator("per_question")
+    @field_validator("rubrics")
     @classmethod
-    def validate_all_questions(
-        cls, value: list[PerQuestionFeedback]
-    ) -> list[PerQuestionFeedback]:
-        if [item.number for item in value] != list(range(1, 16)):
-            raise ValueError("perQuestion must contain ordered numbers 1 through 15")
+    def validate_rubrics(
+        cls, value: list[RubricAssessment]
+    ) -> list[RubricAssessment]:
+        if [item.dimension for item in value] != list(RubricDimension):
+            raise ValueError("rubrics must contain all five dimensions in order")
         return value
 
 
@@ -234,7 +313,10 @@ class AIService:
                 )
                 usage = self._log_usage(response, schema.__name__)
                 if not response.output_text:
-                    raise ValueError("OpenAI returned no structured output")
+                    refusal = self._response_refusal(response)
+                    if refusal:
+                        raise AIServiceUnavailable("AI service refused question generation")
+                    raise AIServiceUnavailable("OpenAI returned no structured output")
                 try:
                     return StructuredAIResult(
                         payload=schema.model_validate_json(response.output_text),
@@ -262,9 +344,33 @@ class AIService:
                 self.model,
                 schema.__name__,
             )
+            status_code = getattr(error, "status_code", None)
+            if status_code == 401:
+                raise AIServiceConfigurationError(
+                    "OpenAI authentication failed"
+                ) from error
+            retry_after: float | None = None
+            response = getattr(error, "response", None)
+            headers = getattr(response, "headers", None)
+            if headers:
+                try:
+                    retry_after = float(headers.get("retry-after"))
+                except (TypeError, ValueError):
+                    retry_after = None
             raise AIServiceUnavailable(
-                "AI service is temporarily unavailable"
+                "AI service is temporarily unavailable",
+                status_code=status_code,
+                retry_after=retry_after,
             ) from error
+
+    @staticmethod
+    def _response_refusal(response: Any) -> str | None:
+        for output in getattr(response, "output", ()) or ():
+            for content in getattr(output, "content", ()) or ():
+                refusal = getattr(content, "refusal", None)
+                if refusal:
+                    return str(refusal)
+        return None
 
     def _log_usage(self, response: Any, schema_name: str) -> AIUsage:
         usage = getattr(response, "usage", None)
@@ -470,6 +576,11 @@ class AIService:
             provider=result.provider,
             openai_response_id=result.openai_response_id,
             usage=result.usage,
+            fallback_reason=result.fallback_reason,
+            fallback_question_numbers=result.fallback_question_numbers,
+            retry_count=result.retry_count,
+            prompt_version=result.prompt_version,
+            schema_version=result.schema_version,
         )
 
     def _question_generation_payload(
@@ -589,36 +700,426 @@ class AIService:
         payload: dict[str, Any],
         history: dict[str, list[str]] | None,
     ) -> QuestionGenerationResult:
+        max_attempts = 3
+        by_number = {question.number: question for question in blueprint}
+        generated_by_number: dict[int, GeneratedQuestion] = {}
+        pending_numbers = set(by_number)
+        last_issues: list[QuestionValidationIssue] = []
         last_error: Exception | None = None
-        max_attempts = 3 if mode == "daily" else 2
-        validation_errors: list[str] = []
+        response_id: str | None = None
+        usage: AIUsage | None = None
+
         for attempt in range(1, max_attempts + 1):
+            requested_blueprint = [
+                question
+                for question in blueprint
+                if question.number in pending_numbers
+            ]
+            schema = self._question_content_schema(requested_blueprint)
+            attempt_payload = {
+                **payload,
+                "attempt": attempt,
+                "schemaVersion": QUESTION_SCHEMA_VERSION,
+                "blueprint": [
+                    self._blueprint_item(item) for item in requested_blueprint
+                ],
+                "fixedQuestions": [
+                    {
+                        "number": number,
+                        "promptHash": prompt_hash(question.prompt),
+                    }
+                    for number, question in sorted(generated_by_number.items())
+                    if number not in pending_numbers
+                ],
+            }
+            if last_issues:
+                attempt_payload["previousValidationErrors"] = [
+                    issue.log_value() for issue in last_issues
+                ]
+                attempt_payload["retryInstructions"] = [
+                    "Return only the requested failed slots.",
+                    "Keep fixed questions unchanged and avoid their prompt meanings.",
+                    "Correct every listed validation issue.",
+                ]
+
             try:
-                attempt_payload = {**payload, "attempt": attempt}
-                if validation_errors:
-                    attempt_payload["previousValidationErrors"] = validation_errors[-2:]
-                    attempt_payload["retryInstructions"] = [
-                        "Regenerate the full set with fresh prompt text.",
-                        "Do not reuse any topicId or prompt text that caused a previous validation error.",
-                        "Keep all blueprint metadata unchanged.",
-                    ]
                 result = await self._structured(
                     instructions=self._question_generation_instructions(mode, stage),
-                    input_text=json.dumps(
-                        attempt_payload,
-                        ensure_ascii=False,
-                    ),
-                    schema=GeneratedQuestionsPayload,
+                    input_text=json.dumps(attempt_payload, ensure_ascii=False),
+                    schema=schema,
                 )
-                generated = result.payload
-                assert isinstance(generated, GeneratedQuestionsPayload)
-                questions = generated.questions
-                if mode == "daily":
-                    questions = self._normalize_daily_metadata_to_blueprint(
-                        blueprint,
-                        questions,
+                response_id = result.response_id
+                usage = self._merge_usage(usage, result.usage)
+                generated_by_number.update(
+                    self._merge_question_content(
+                        requested_blueprint,
+                        result.payload,
                     )
-                    questions = self._normalize_daily_topic_ids(questions, history)
+                )
+                questions = [generated_by_number[item.number] for item in blueprint]
+                questions = self._normalize_server_topic_ids(questions, history)
+                generated_by_number = {item.number: item for item in questions}
+                last_issues = self._collect_question_validation_issues(
+                    mode=mode,
+                    stage=stage,
+                    simulation_level=simulation_level,
+                    blueprint=blueprint,
+                    questions=questions,
+                    history=history,
+                )
+                if not last_issues:
+                    self._validate_generated_questions(
+                        mode=mode,
+                        stage=stage,
+                        simulation_level=simulation_level,
+                        blueprint=blueprint,
+                        questions=questions,
+                        history=history,
+                    )
+                    return QuestionGenerationResult(
+                        questions=questions,
+                        fallback_used=False,
+                        provider="openai",
+                        openai_response_id=response_id,
+                        usage=usage,
+                        retry_count=attempt - 1,
+                    )
+                pending_numbers = {
+                    issue.question_number for issue in last_issues
+                }
+                logger.warning(
+                    "AI question content failed validation; retrying failed slots. "
+                    "mode=%s stage=%s model=%s attempt=%s issues=%s",
+                    mode,
+                    stage,
+                    self.model,
+                    attempt,
+                    [item.log_value() for item in last_issues],
+                )
+            except AIServiceConfigurationError:
+                raise
+            except Exception as error:
+                last_error = error
+                pending_numbers = set(by_number)
+                last_issues = [
+                    QuestionValidationIssue(
+                        question_number=item.number,
+                        field="provider",
+                        expected="valid structured content",
+                        actual=type(error).__name__,
+                        category="provider_error",
+                    )
+                    for item in blueprint
+                ]
+                logger.exception(
+                    "AI question generation attempt failed. "
+                    "mode=%s stage=%s model=%s attempt=%s",
+                    mode,
+                    stage,
+                    self.model,
+                    attempt,
+                )
+                if attempt < max_attempts:
+                    retry_after = getattr(error, "retry_after", None)
+                    delay = (
+                        min(8.0, max(0.0, float(retry_after)))
+                        if retry_after is not None
+                        else min(4.0, (2 ** (attempt - 1)) + random.uniform(0.0, 0.35))
+                    )
+                    await asyncio.sleep(delay)
+
+        fallback_numbers = tuple(sorted(pending_numbers or by_number.keys()))
+        for number in fallback_numbers:
+            generated_by_number[number] = by_number[number]
+        questions = [generated_by_number.get(item.number, item) for item in blueprint]
+        questions = self._normalize_server_topic_ids(questions, history)
+        try:
+            # Catalog content is trusted for structure and level. Recent-content history is
+            # intentionally excluded so a provider outage cannot turn fallback into a 503.
+            self._validate_generated_questions(
+                mode=mode,
+                stage=stage,
+                simulation_level=simulation_level,
+                blueprint=blueprint,
+                questions=questions,
+                history=None,
+            )
+        except Exception as error:
+            raise AIQuestionGenerationError(
+                f"validated catalog fallback failed for mode={mode} stage={stage}"
+            ) from error
+
+        fallback_reason = (
+            "provider_error"
+            if last_error is not None
+            else "validation_exhausted"
+        )
+        logger.error(
+            "AI question generation used validated catalog fallback. "
+            "mode=%s stage=%s model=%s reason=%s questions=%s retryCount=%s",
+            mode,
+            stage,
+            self.model,
+            fallback_reason,
+            fallback_numbers,
+            max_attempts - 1,
+        )
+        return QuestionGenerationResult(
+            questions=questions,
+            fallback_used=True,
+            provider=(
+                "mixed"
+                if generated_by_number and len(fallback_numbers) < len(blueprint)
+                else "catalog"
+            ),
+            openai_response_id=response_id,
+            usage=usage,
+            fallback_reason=fallback_reason,
+            fallback_question_numbers=fallback_numbers,
+            retry_count=max_attempts - 1,
+        )
+
+    @staticmethod
+    def _question_content_schema(
+        blueprint: list[GeneratedQuestion],
+    ) -> type[BaseModel]:
+        numbers = "_".join(str(item.number) for item in blueprint)
+        fields = {
+            f"q{item.number:02d}": (GeneratedQuestionContent, ...)
+            for item in blueprint
+        }
+        return create_model(
+            f"QuestionContents_{numbers}",
+            __config__=ConfigDict(extra="forbid"),
+            **fields,
+        )
+
+    @staticmethod
+    def _merge_question_content(
+        blueprint: list[GeneratedQuestion], payload: BaseModel
+    ) -> dict[int, GeneratedQuestion]:
+        merged: dict[int, GeneratedQuestion] = {}
+        for expected in blueprint:
+            content = getattr(payload, f"q{expected.number:02d}")
+            assert isinstance(content, GeneratedQuestionContent)
+            rubric_focus: list[str] = []
+            for raw_value in content.rubric_focus:
+                value = raw_value.strip()
+                if value and value not in rubric_focus:
+                    rubric_focus.append(value)
+            follow_up = (
+                content.follow_up_prompt.strip()
+                if content.follow_up_prompt and content.follow_up_prompt.strip()
+                else None
+            )
+            merged[expected.number] = expected.model_copy(
+                update={
+                    "prompt": content.prompt.strip(),
+                    "follow_up_prompt": follow_up,
+                    "rubric_focus": rubric_focus or expected.rubric_focus,
+                }
+            )
+        return merged
+
+    @staticmethod
+    def _merge_usage(current: AIUsage | None, new: AIUsage) -> AIUsage:
+        if current is None:
+            return new
+
+        def total(left: int | None, right: int | None) -> int | None:
+            if left is None and right is None:
+                return None
+            return (left or 0) + (right or 0)
+
+        return AIUsage(
+            input_tokens=total(current.input_tokens, new.input_tokens),
+            cached_input_tokens=total(
+                current.cached_input_tokens, new.cached_input_tokens
+            ),
+            output_tokens=total(current.output_tokens, new.output_tokens),
+            reasoning_tokens=total(
+                current.reasoning_tokens, new.reasoning_tokens
+            ),
+            total_tokens=total(current.total_tokens, new.total_tokens),
+        )
+
+    def _normalize_server_topic_ids(
+        self,
+        questions: list[GeneratedQuestion],
+        history: dict[str, list[str]] | None,
+    ) -> list[GeneratedQuestion]:
+        blocked = set((history or {}).get("topicIds", []))
+        used: set[str] = set()
+        group_ids: dict[str, str] = {}
+        normalized: list[GeneratedQuestion] = []
+
+        for question in questions:
+            group_key = question.combo_id or f"q{question.number}"
+            if group_key in group_ids:
+                topic_id = group_ids[group_key]
+            else:
+                base = self._snake_case_topic_id(
+                    question.topic_id or question.topic or "opic_topic"
+                )
+                topic_id = base
+                if topic_id in blocked or topic_id in used:
+                    suffix = f"_{prompt_hash(question.prompt)[:8]}"
+                    topic_id = f"{base[: max(1, 80 - len(suffix))]}{suffix}"
+                    counter = 2
+                    while topic_id in blocked or topic_id in used:
+                        counter_suffix = f"{suffix}_{counter}"
+                        topic_id = (
+                            f"{base[: max(1, 80 - len(counter_suffix))]}"
+                            f"{counter_suffix}"
+                        )
+                        counter += 1
+                group_ids[group_key] = topic_id
+                used.add(topic_id)
+            normalized.append(
+                question.model_copy(update={"topic_id": topic_id})
+                if question.topic_id != topic_id
+                else question
+            )
+        return normalized
+
+    def _collect_question_validation_issues(
+        self,
+        *,
+        mode: str,
+        stage: str,
+        simulation_level: int,
+        blueprint: list[GeneratedQuestion],
+        questions: list[GeneratedQuestion],
+        history: dict[str, list[str]] | None,
+    ) -> list[QuestionValidationIssue]:
+        issues: list[QuestionValidationIssue] = []
+        actual_by_number = {item.number: item for item in questions}
+        metadata_fields = (
+            "exam_section",
+            "combo_id",
+            "question_style",
+            "difficulty",
+            "estimated_level",
+            "category",
+        )
+
+        for expected in blueprint:
+            actual = actual_by_number.get(expected.number)
+            if actual is None:
+                issues.append(
+                    QuestionValidationIssue(
+                        expected.number,
+                        "slot",
+                        "present",
+                        "missing",
+                        "schema",
+                    )
+                )
+                continue
+            for field in metadata_fields:
+                expected_value = getattr(expected, field)
+                actual_value = getattr(actual, field)
+                if actual_value != expected_value:
+                    issues.append(
+                        QuestionValidationIssue(
+                            expected.number,
+                            field,
+                            str(expected_value),
+                            str(actual_value),
+                            "blueprint",
+                        )
+                    )
+            if not actual.topic_id:
+                issues.append(
+                    QuestionValidationIssue(
+                        expected.number,
+                        "topicId",
+                        "non-empty",
+                        None,
+                        "content",
+                    )
+                )
+            if len(actual.topic) > 80 or actual.topic.endswith("?") or len(actual.topic.split()) > 8:
+                issues.append(
+                    QuestionValidationIssue(
+                        expected.number,
+                        "topic",
+                        "short label",
+                        actual.topic[:100],
+                        "content",
+                    )
+                )
+            try:
+                self._validate_level_rules(simulation_level, [actual])
+            except ValueError as error:
+                issues.append(
+                    QuestionValidationIssue(
+                        expected.number,
+                        "prompt",
+                        f"level {simulation_level} rules",
+                        str(error),
+                        "difficulty",
+                    )
+                )
+
+        recent_topic_ids = set((history or {}).get("topicIds", []))
+        recent_prompt_hashes = set((history or {}).get("promptHashes", []))
+        seen_prompt_hashes: dict[str, int] = {}
+        for question in questions:
+            if question.topic_id in recent_topic_ids:
+                issues.append(
+                    QuestionValidationIssue(
+                        question.number,
+                        "topicId",
+                        "not recently used",
+                        question.topic_id,
+                        "uniqueness",
+                    )
+                )
+            current_prompt_hash = prompt_hash(question.prompt)
+            if current_prompt_hash in recent_prompt_hashes:
+                issues.append(
+                    QuestionValidationIssue(
+                        question.number,
+                        "prompt",
+                        "not recently used",
+                        current_prompt_hash,
+                        "uniqueness",
+                    )
+                )
+            previous_number = seen_prompt_hashes.get(current_prompt_hash)
+            if previous_number is not None:
+                for number in (previous_number, question.number):
+                    issues.append(
+                        QuestionValidationIssue(
+                            number,
+                            "prompt",
+                            "unique within set",
+                            current_prompt_hash,
+                            "uniqueness",
+                        )
+                    )
+            seen_prompt_hashes[current_prompt_hash] = question.number
+
+        serialized = [
+            item.model_dump(by_alias=True, mode="json") for item in questions
+        ]
+        if question_set_hash(serialized) in set((history or {}).get("setHashes", [])):
+            issues.extend(
+                QuestionValidationIssue(
+                    item.number,
+                    "setHash",
+                    "not recently used",
+                    question_set_hash(serialized),
+                    "uniqueness",
+                )
+                for item in questions
+            )
+
+        # Preserve the established whole-set structural validators. If an invariant
+        # is not attributable to one slot, repair every slot rather than guessing.
+        if not issues:
+            try:
                 self._validate_generated_questions(
                     mode=mode,
                     stage=stage,
@@ -627,25 +1128,22 @@ class AIService:
                     questions=questions,
                     history=history,
                 )
-                return QuestionGenerationResult(
-                    questions=questions,
-                    fallback_used=False,
-                    provider="openai",
-                    openai_response_id=result.response_id,
-                    usage=result.usage,
+            except ValueError as error:
+                issues.extend(
+                    QuestionValidationIssue(
+                        item.number,
+                        "questionSet",
+                        "valid",
+                        str(error),
+                        "set_validation",
+                    )
+                    for item in questions
                 )
-            except Exception as error:
-                last_error = error
-                validation_errors.append(str(error))
-                logger.exception(
-                    "AI question generation attempt failed. mode=%s model=%s attempt=%s",
-                    mode,
-                    self.model,
-                    attempt,
-                )
-        raise AIQuestionGenerationError(
-            f"AI question generation failed after {max_attempts} attempts for mode={mode}"
-        ) from last_error
+
+        unique: dict[tuple[int, str, str], QuestionValidationIssue] = {}
+        for issue in issues:
+            unique[(issue.question_number, issue.field, issue.category)] = issue
+        return list(unique.values())
 
     def _normalize_daily_topic_ids(
         self,
@@ -767,15 +1265,12 @@ class AIService:
         base = (
             "You create OPIc-style speaking test questions. "
             "Output must strictly match the provided JSON schema. "
-            "Follow the blueprint exactly for number, examSection, comboId, questionStyle, difficulty, estimatedLevel, and category. "
-            "Do not invent or change blueprint metadata. "
-            "Only make topic, topicId, prompt, followUpPrompt, and rubricFocus fresh and natural. "
-            "topic must be a short label under 40 characters, such as 'Self Introduction' or 'Coffee Shops'. "
-            "topic must never be a full question sentence. "
-            "topicId must be fresh lowercase snake_case and not in forbidden.topicIds. "
-            "Questions in the same combo must share the same topicId. "
+            "Each qNN property corresponds to the blueprint question with that number. "
+            "The server owns every blueprint metadata field, so never return number, examSection, comboId, topic, topicId, "
+            "questionStyle, difficulty, estimatedLevel, or category. "
+            "Only author prompt, followUpPrompt, and rubricFocus for each requested slot. "
             "Do not copy official OPIc wording or catalog examples. "
-            "Do not reuse forbidden prompts or topicIds. "
+            "Do not reuse forbidden prompt meanings or any fixedQuestions. "
             "\n\n"
             "Sentence count rules by effectiveLevel: "
             "Level 1: prompt must be exactly 1 sentence. "
@@ -866,29 +1361,56 @@ class AIService:
         blueprint: list[GeneratedQuestion], questions: list[GeneratedQuestion]
     ) -> None:
         if len(blueprint) != len(questions):
-            raise ValueError("generated question count does not match blueprint")
+            raise ValueError(
+                "generated question count does not match blueprint: "
+                f"expected={len(blueprint)} actual={len(questions)}"
+            )
 
         for expected, actual in zip(blueprint, questions):
             if actual.number != expected.number:
-                raise ValueError("generated question number does not match blueprint")
+                raise ValueError(
+                    "generated question number does not match blueprint: "
+                    f"question={expected.number} expected={expected.number} actual={actual.number}"
+                )
             if actual.exam_section != expected.exam_section:
-                raise ValueError("generated question examSection does not match blueprint")
+                raise ValueError(
+                    "generated question examSection does not match blueprint: "
+                    f"question={expected.number} expected={expected.exam_section.value} "
+                    f"actual={actual.exam_section.value}"
+                )
             if actual.combo_id != expected.combo_id:
-                raise ValueError("generated question comboId does not match blueprint")
+                raise ValueError(
+                    "generated question comboId does not match blueprint: "
+                    f"question={expected.number} expected={expected.combo_id} actual={actual.combo_id}"
+                )
             if actual.question_style != expected.question_style:
                 raise ValueError(
-                    "generated question questionStyle does not match blueprint"
+                    "generated question questionStyle does not match blueprint: "
+                    f"question={expected.number} expected={expected.question_style} "
+                    f"actual={actual.question_style}"
                 )
             if actual.difficulty != expected.difficulty:
                 raise ValueError(
-                    "generated question difficulty does not match blueprint"
+                    "generated question difficulty does not match blueprint: "
+                    f"question={expected.number} expected={expected.difficulty.value} "
+                    f"actual={actual.difficulty.value}"
                 )
             if actual.estimated_level != expected.estimated_level:
                 raise ValueError(
-                    "generated question estimatedLevel does not match blueprint"
+                    "generated question estimatedLevel does not match blueprint: "
+                    f"question={expected.number} expected={expected.estimated_level} "
+                    f"actual={actual.estimated_level}"
+                )
+            if actual.category != expected.category:
+                raise ValueError(
+                    "generated question category does not match blueprint: "
+                    f"question={expected.number} expected={expected.category} actual={actual.category}"
                 )
             if not actual.topic_id:
-                raise ValueError("generated question topicId is required")
+                raise ValueError(
+                    "generated question topicId is required: "
+                    f"question={expected.number}"
+                )
 
     @classmethod
     def _validate_level_rules(
@@ -919,6 +1441,9 @@ class AIService:
         for item in questions:
             if item.question_style in forbidden:
                 raise ValueError("generated question type is too difficult for level")
+
+            if item.exam_section is ExamSection.INTRODUCTION:
+                continue
 
             sentence_count = cls._sentence_count(item.prompt)
 
@@ -1010,6 +1535,52 @@ class AIService:
         )
         return level, scores
 
+    @staticmethod
+    def _scores_from_rubrics(
+        rubrics: list[RubricAssessment],
+    ) -> EvaluationScores:
+        values = {
+            item.dimension: RUBRIC_SCORE_BY_BAND[item.band] for item in rubrics
+        }
+        return EvaluationScores(
+            taskFulfillment=values[RubricDimension.TASK_FULFILLMENT],
+            grammar=values[RubricDimension.GRAMMAR],
+            vocabulary=values[RubricDimension.VOCABULARY],
+            discourse=values[RubricDimension.DISCOURSE],
+            fluency=values[RubricDimension.FLUENCY],
+        )
+
+    @staticmethod
+    def _rubrics_from_scores(scores: EvaluationScores) -> list[RubricAssessment]:
+        values = {
+            RubricDimension.TASK_FULFILLMENT: scores.task_fulfillment,
+            RubricDimension.GRAMMAR: scores.grammar,
+            RubricDimension.VOCABULARY: scores.vocabulary,
+            RubricDimension.DISCOURSE: scores.discourse,
+            RubricDimension.FLUENCY: scores.fluency,
+        }
+
+        def band(score: int) -> RubricBand:
+            if score >= 90:
+                return RubricBand.ADVANCED
+            if score >= 75:
+                return RubricBand.STRONG
+            if score >= 55:
+                return RubricBand.FUNCTIONAL
+            if score >= 35:
+                return RubricBand.DEVELOPING
+            return RubricBand.FOUNDATION
+
+        return [
+            RubricAssessment(
+                dimension=dimension,
+                band=band(score),
+                evidence="답변 길이와 전달 지표를 기준으로 한 개발용 평가입니다.",
+                nextAction="구체적인 이유와 예시를 연결해 답변을 확장하세요.",
+            )
+            for dimension, score in values.items()
+        ]
+
     async def evaluate_practice(
         self,
         *,
@@ -1023,7 +1594,7 @@ class AIService:
             result = AIPracticeResult(
                 predictedLevel=level,
                 confidence=ConfidenceBand.MEDIUM,
-                scores=scores,
+                rubrics=self._rubrics_from_scores(scores),
                 strengths=["질문에 맞춰 영어로 답변을 완성했습니다."],
                 improvements=["구체적인 이유와 예시를 한두 문장 더 연결해 보세요."],
                 correctedAnswer=transcript.strip()[:900],
@@ -1042,10 +1613,16 @@ class AIService:
             }
             structured = await self._structured(
                 instructions=(
-                    "Act as a conservative OPIc practice evaluator. Grade the answer independently of the target level. "
-                    "Use targetLevel only for targetGap and sampleAnswer. Do not claim phoneme-level pronunciation analysis. "
-                    "Give concise actionable feedback in Korean. Return at most three short strengths and improvements. "
-                    "correctedAnswer and sampleAnswer must be English and no longer than five sentences each."
+                    "Evaluate this OPIc-style practice answer using anchored, evidence-based bands. "
+                    "Grade independently of targetLevel; use targetLevel only for targetGap and sampleAnswer. "
+                    "Return rubrics exactly in this order: taskFulfillment, grammar, vocabulary, discourse, fluency. "
+                    "Use foundation when meaning is mostly unavailable or the task is not addressed; developing when short, "
+                    "frequent errors or fragments limit detail; functional when the main task is understandable with connected support; "
+                    "strong when detail, control, and organization are consistently effective; advanced only for sustained, precise, "
+                    "well-organized language. Cite transcript or delivery evidence briefly in Korean and give one next action per rubric. "
+                    "Use delivery metrics only for fluency, never claim phoneme-level pronunciation analysis. "
+                    "Return at most three concise strengths and improvements. correctedAnswer and sampleAnswer must be English "
+                    "and no longer than five sentences; use null only when a useful optional detail cannot be produced."
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIPracticeResult,
@@ -1053,12 +1630,25 @@ class AIService:
             )
             result = structured.payload
         assert isinstance(result, AIPracticeResult)
+        warnings = [
+            name
+            for name, value in {
+                "correctedAnswer": result.corrected_answer,
+                "targetGap": result.target_gap,
+                "sampleAnswer": result.sample_answer,
+            }.items()
+            if not value
+        ]
         return PracticeEvaluation(
             **result.model_dump(by_alias=True),
+            scores=self._scores_from_rubrics(result.rubrics),
             audioMetrics=metrics,
             disclaimer=DISCLAIMER,
             modelVersion=self.model,
             promptVersion=PROMPT_VERSION,
+            resultStatus="partial" if warnings else "complete",
+            warnings=warnings,
+            scoreScaleVersion=SCORE_SCALE_VERSION,
         )
 
     async def evaluate_mock(
@@ -1085,24 +1675,13 @@ class AIService:
             result = AIMockResult(
                 predictedLevel=level,
                 confidence=ConfidenceBand.MEDIUM,
-                scores=scores,
+                rubrics=self._rubrics_from_scores(scores),
                 strengths=["15개 문항을 끝까지 완주해 답변 표본을 확보했습니다."],
                 improvements=[
                     "답변마다 주장, 구체적 사례, 마무리의 세 단계 구조를 유지하세요."
                 ],
                 targetGap=f"목표 {target.value}에 도달하려면 답변 간 시제와 연결어의 일관성을 높이세요.",
                 overallFeedback="전체 답변에서 반복되는 강점과 개선점을 우선순위대로 연습하세요.",
-                perQuestion=[
-                    PerQuestionFeedback(
-                        number=index + 1,
-                        feedback="핵심 답변 뒤에 이유와 구체적인 예시를 보강하세요.",
-                        sampleAnswer=(
-                            f"Regarding {questions[index].topic}, I can explain my main point clearly, "
-                            "support it with a personal example, and describe the result in detail."
-                        ),
-                    )
-                    for index in range(15)
-                ],
             )
         else:
             payload = {
@@ -1122,13 +1701,14 @@ class AIService:
             }
             structured = await self._structured(
                 instructions=(
-                    "Evaluate this complete 15-answer OPIc-style mock exam conservatively and holistically. "
-                    "Determine predictedLevel before considering the target level. Use audio metrics only for delivery and fluency, "
-                    "not pronunciation. Return compact Korean feedback. Each perQuestion feedback must be one short sentence, "
-                    "and each English sampleAnswer must be one or two sentences. Return exactly 15 perQuestion items, "
-                    "ordered with number 1 through 15, matching the input answer order. Do not omit, duplicate, or reorder "
-                    "perQuestion entries. Keep overallFeedback within 450 characters, each perQuestion feedback within "
-                    "180 characters, and each perQuestion sampleAnswer within 350 characters."
+                    "Evaluate all 15 answers holistically with anchored, evidence-based bands. Determine predictedLevel before "
+                    "considering targetLevel and use targetLevel only for targetGap. Return rubrics exactly in this order: "
+                    "taskFulfillment, grammar, vocabulary, discourse, fluency. Use foundation when meaning is mostly unavailable "
+                    "or tasks are not addressed; developing when frequent limitations prevent detail; functional when most tasks are "
+                    "understandable with connected support; strong when detailed control and organization are consistent; advanced "
+                    "only for sustained, precise, flexible language. Use audio metrics only for fluency and delivery, not pronunciation. "
+                    "Return compact Korean strengths, improvements, targetGap, and overallFeedback. Do not return per-question "
+                    "feedback or sample answers."
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIMockResult,
@@ -1138,7 +1718,12 @@ class AIService:
         assert isinstance(result, AIMockResult)
         return MockEvaluation(
             **result.model_dump(by_alias=True),
+            scores=self._scores_from_rubrics(result.rubrics),
+            perQuestion=[],
             disclaimer=DISCLAIMER,
             modelVersion=self.model,
             promptVersion=PROMPT_VERSION,
+            resultStatus="complete",
+            warnings=[],
+            scoreScaleVersion=SCORE_SCALE_VERSION,
         )

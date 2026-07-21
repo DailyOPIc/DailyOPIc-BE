@@ -390,6 +390,10 @@ class FallbackQuestionGenerator:
                 return f"Describe a problem you experienced with {topic_label}. Explain how you handled it. Tell me what you learned from that experience."
             if question_type is QuestionStyle.COMPARISON:
                 return f"Compare two different experiences related to {topic_label}. Explain the main differences. Tell me which one was more meaningful and why."
+            if question_type is QuestionStyle.DESCRIPTION:
+                return f"Describe the key features of {topic_label}. Explain what makes them distinctive. Tell me why they matter to you."
+            if question_type is QuestionStyle.ROUTINE:
+                return f"Explain your usual routine involving {topic_label}. Describe how you organize it. Tell me why that routine works well for you."
             return f"Describe a detailed experience related to {topic_label}. Explain the background and the result. Tell me how that experience changed your thinking."
         if question_type is QuestionStyle.OPINION:
             return f"Discuss how {topic_label} influences people or society today. Explain both advantages and disadvantages. Predict one important change in the future."
@@ -397,7 +401,15 @@ class FallbackQuestionGenerator:
             return f"Analyze a complex problem connected to {topic_label}. Explain why the problem matters to different people. Propose a realistic solution and discuss its limits."
         if question_type is QuestionStyle.ROLEPLAY:
             return f"You are handling a complicated situation involving {topic_label}. Explain the background clearly. Negotiate a solution and confirm responsibilities."
-        return f"Discuss a complex experience related to {topic_label}. Explain how the situation developed. Analyze what it shows about people's choices or values."
+        if question_type is QuestionStyle.DESCRIPTION:
+            return f"Describe the most important features of {topic_label}. Explain how different people experience it. Analyze why those features matter in daily life."
+        if question_type is QuestionStyle.ROUTINE:
+            return f"Explain how people usually engage with {topic_label}. Describe how that routine has evolved. Analyze what could change it in the future."
+        if question_type is QuestionStyle.PAST_EXPERIENCE:
+            return f"Discuss a complex experience related to {topic_label}. Explain how the situation developed. Analyze what it shows about people's choices or values."
+        if question_type is QuestionStyle.COMPARISON:
+            return f"Compare two contrasting experiences involving {topic_label}. Explain the factors behind their differences. Evaluate which experience has a stronger impact and why."
+        return f"Explain an important issue related to {topic_label}. Support your view with a detailed example. Discuss why the issue deserves attention."
 
     @staticmethod
     def _intro_prompt(level: int) -> str:
