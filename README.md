@@ -144,11 +144,16 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
   --member "serviceAccount:${DEPLOYER_SA}" \
   --role roles/iam.serviceAccountUser \
   --project "$PROJECT_ID"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${RUNTIME_SA}" \
+  --role roles/firebaseauth.viewer
 ```
 
 Cloud Run runtime service account에는 운영 실행 권한이 별도로 필요합니다.
 
 - Firestore 접근: `roles/datastore.user`
+- Firebase ID 토큰 폐기 여부 확인: `roles/firebaseauth.viewer` (`firebaseauth.users.get`)
 - Secret Manager에서 `OPENAI_API_KEY`를 주입하는 경우 해당 secret에 `roles/secretmanager.secretAccessor`
 
 Workload Identity Federation으로 전환할 때는 아래 API도 활성화합니다.
@@ -237,6 +242,7 @@ OpenAPI 문서는 `/docs`에서 확인할 수 있습니다. 보호되는 endpoin
 
 - `X-DailyOPIc-User-ID: <Keychain UUID>`
 - `X-Firebase-AppCheck: <App Check token>`
+- `Authorization: Bearer <Firebase Authentication ID token>`
 - 평가 요청에는 `Idempotency-Key` 필요
 
 Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. 새 요청은 `initialLevel` 1~6을 보내며, 기존 `targetLevel`만 저장된 사용자는 서버가 자동으로 단계 값으로 매핑합니다. 최초 설정과 같은 단계 재확정은 무료이고, 기존 단계에서 다른 단계로 바꿀 때는 `target_level_change` reward intent를 만들고 SSV 검증이 끝난 뒤 `rewardNonce`를 함께 보내야 합니다.

@@ -74,13 +74,72 @@ class AuthService:
                     uid=firebase_uid,
                     legacy_install_id=legacy_install_id,
                 )
-            except Exception as error:
+            except auth.InsufficientPermissionError as error:
+                logger.exception(
+                    "Firebase Authentication verification unavailable: runtime service "
+                    "account requires firebaseauth.users.get"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "auth_verification_unavailable",
+                        "message": "Authentication verification is temporarily unavailable.",
+                    },
+                ) from error
+            except auth.CertificateFetchError as error:
+                logger.exception("Firebase Authentication verification unavailable: certificate fetch failed")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "auth_verification_unavailable",
+                        "message": "Authentication verification is temporarily unavailable.",
+                    },
+                ) from error
+            except auth.RevokedIdTokenError as error:
+                logger.warning("Firebase Authentication failed: revoked ID token")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={
+                        "code": "revoked_id_token",
+                        "message": "Firebase ID token has been revoked.",
+                    },
+                ) from error
+            except auth.UserDisabledError as error:
+                logger.warning("Firebase Authentication failed: disabled user")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={
+                        "code": "disabled_firebase_user",
+                        "message": "Firebase user is disabled.",
+                    },
+                ) from error
+            except auth.ExpiredIdTokenError as error:
+                logger.warning("Firebase Authentication failed: expired ID token")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail={
+                        "code": "expired_id_token",
+                        "message": "Firebase ID token is expired.",
+                    },
+                ) from error
+            except (auth.InvalidIdTokenError, ValueError) as error:
                 logger.warning("Firebase Authentication failed: invalid ID token")
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail={
                         "code": "invalid_id_token",
-                        "message": "Firebase ID token is invalid or expired.",
+                        "message": "Firebase ID token is invalid.",
+                    },
+                ) from error
+            except Exception as error:
+                logger.exception(
+                    "Firebase Authentication verification unavailable: unexpected Admin SDK error"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "auth_verification_unavailable",
+                        "message": "Authentication verification is temporarily unavailable.",
                     },
                 ) from error
 

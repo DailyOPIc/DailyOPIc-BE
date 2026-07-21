@@ -1,5 +1,6 @@
 import pytest
 from fastapi import HTTPException
+from firebase_admin import auth as firebase_auth
 
 from app.config import Settings
 from app.services.auth import AuthService
@@ -127,3 +128,49 @@ async def test_firebase_uid_is_source_of_truth(monkeypatch: pytest.MonkeyPatch) 
 
     assert user.uid == "firebase-user-123"
     assert user.legacy_install_id == USER_ID
+
+
+@pytest.mark.asyncio
+async def test_auth_permission_failure_returns_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = AuthService(
+        Settings(
+            firebase_project_id="dailyopic-test",
+            admob_rewarded_ad_unit_id="ca-app-pub-5460686409666356/7091483531",
+        )
+    )
+
+    def reject_token(token: str, check_revoked: bool) -> None:
+        raise firebase_auth.InsufficientPermissionError(
+            "missing firebaseauth.users.get",
+            cause=None,
+            http_response=None,
+        )
+
+    monkeypatch.setattr("app.services.auth.auth.verify_id_token", reject_token)
+
+    with pytest.raises(HTTPException) as error:
+        await service.authenticate(USER_ID, "app-check-token", "Bearer valid-token")
+
+    assert error.value.status_code == 503
+    assert error.value.detail["code"] == "auth_verification_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_expired_id_token_returns_refreshable_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = AuthService(
+        Settings(
+            firebase_project_id="dailyopic-test",
+            admob_rewarded_ad_unit_id="ca-app-pub-5460686409666356/7091483531",
+        )
+    )
+
+    def reject_token(token: str, check_revoked: bool) -> None:
+        raise firebase_auth.ExpiredIdTokenError("expired", cause=None)
+
+    monkeypatch.setattr("app.services.auth.auth.verify_id_token", reject_token)
+
+    with pytest.raises(HTTPException) as error:
+        await service.authenticate(USER_ID, "app-check-token", "Bearer expired-token")
+
+    assert error.value.status_code == 401
+    assert error.value.detail["code"] == "expired_id_token"
