@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 
 import firebase_admin
 from firebase_admin import firestore as admin_firestore
+from google.auth.credentials import AnonymousCredentials
 from google.cloud import firestore
 
 from app.models.api import DifficultyAdjustment, RewardPurpose
@@ -1003,8 +1005,26 @@ class InMemoryStateStore(StateStore):
 
 class FirestoreStateStore(StateStore):
     def __init__(self, project_id: str | None = None) -> None:
+        # The Firestore emulator is intentionally unauthenticated.  Firebase Admin's
+        # client still resolves Application Default Credentials before connecting,
+        # which breaks clean CI runners even when FIRESTORE_EMULATOR_HOST is set.
+        # Use an explicit anonymous Google Cloud client only for the emulator; the
+        # production path below continues to require Firebase Admin/ADC.
+        if os.getenv("FIRESTORE_EMULATOR_HOST"):
+            emulator_project = project_id or os.getenv("GCLOUD_PROJECT")
+            if not emulator_project:
+                raise ValueError(
+                    "project_id or GCLOUD_PROJECT is required for the Firestore emulator"
+                )
+            self._client = firestore.Client(
+                project=emulator_project,
+                credentials=AnonymousCredentials(),
+            )
+            return
         if not firebase_admin._apps:
-            firebase_admin.initialize_app(options={"projectId": project_id} if project_id else None)
+            firebase_admin.initialize_app(
+                options={"projectId": project_id} if project_id else None
+            )
         self._client = admin_firestore.client()
 
     @staticmethod
