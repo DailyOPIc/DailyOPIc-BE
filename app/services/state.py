@@ -25,7 +25,6 @@ from app.services.difficulty import (
 )
 from app.services.questions import prompt_hash
 
-
 _T = TypeVar("_T")
 _FIRESTORE_CONTENTION_ATTEMPTS = 5
 _FIRESTORE_CONTENTION_BASE_DELAY_SECONDS = 0.05
@@ -191,7 +190,9 @@ class StateStore(ABC):
     ) -> dict[str, Any] | None: ...
 
     @abstractmethod
-    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]: ...
+    async def get_question_history(
+        self, *, uid: str, mode: str
+    ) -> dict[str, list[str]]: ...
 
     @abstractmethod
     async def record_question_history(
@@ -271,7 +272,9 @@ class StateStore(ABC):
     ) -> dict[str, Any]: ...
 
     @abstractmethod
-    async def get_reward_intent(self, nonce: str, uid: str) -> dict[str, Any] | None: ...
+    async def get_reward_intent(
+        self, nonce: str, uid: str
+    ) -> dict[str, Any] | None: ...
 
     @abstractmethod
     async def verify_reward(
@@ -382,7 +385,9 @@ def _merge_question_history(
         "setHashes": _trim_recent([*history["setHashes"], set_hash]),
         "topicIds": _trim_recent([*history["topicIds"], *topic_ids]),
         "promptHashes": _trim_recent([*history["promptHashes"], *prompt_hashes]),
-        "promptTexts": _trim_recent([*history.get("promptTexts", []), *prompt_texts], 40),
+        "promptTexts": _trim_recent(
+            [*history.get("promptTexts", []), *prompt_texts], 40
+        ),
     }
 
 
@@ -413,7 +418,9 @@ def _profile_from_value(profile: dict[str, Any] | None) -> dict[str, Any] | None
         return None
     before_adjust = profile.get("beforeAdjust")
     if before_adjust is None:
-        before_adjust = profile.get("initialLevel")  # 레거시 문서: 사용자가 고른 원본 값
+        before_adjust = profile.get(
+            "initialLevel"
+        )  # 레거시 문서: 사용자가 고른 원본 값
     if before_adjust is None:
         before_adjust = initial_level_from_target(profile.get("targetLevel"))
     if before_adjust is None:
@@ -448,7 +455,8 @@ def _target_change_response(
         "previousBeforeAdjust": previous["beforeAdjust"] if previous else None,
         "latestAdjustment": profile["latestAdjustment"],
         "afterAdjust": profile["afterAdjust"],
-        "changed": previous is None or previous["beforeAdjust"] != profile["beforeAdjust"],
+        "changed": previous is None
+        or previous["beforeAdjust"] != profile["beforeAdjust"],
         "rewardConsumed": reward_consumed,
     }
 
@@ -567,7 +575,9 @@ class InMemoryStateStore(StateStore):
                 if existing.get("payloadHash") != payload_hash:
                     raise IdempotencyConflict("idempotency key payload does not match")
                 if existing.get("status") == "completed":
-                    return Reservation("cached", result=deepcopy(existing.get("result")))
+                    return Reservation(
+                        "cached", result=deepcopy(existing.get("result"))
+                    )
                 if existing.get("status") == "processing":
                     raise RequestAlreadyProcessing("operation is already processing")
             self._operations[key] = {
@@ -616,7 +626,9 @@ class InMemoryStateStore(StateStore):
             if record and record.get("status") == "processing":
                 record.update(
                     {
-                        "status": "recoverable_failed" if retryable else "terminal_failed",
+                        "status": (
+                            "recoverable_failed" if retryable else "terminal_failed"
+                        ),
                         "updatedAt": datetime.now(UTC),
                     }
                 )
@@ -692,7 +704,9 @@ class InMemoryStateStore(StateStore):
                 return None
             return _normalize_legacy_question_set(deepcopy(question_set))
 
-    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
+    async def get_question_history(
+        self, *, uid: str, mode: str
+    ) -> dict[str, list[str]]:
         async with self._lock:
             history_id = self._question_history_id(uid, mode)
             return deepcopy(
@@ -720,7 +734,9 @@ class InMemoryStateStore(StateStore):
 
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         async with self._lock:
-            return deepcopy(self._usage.get(self._usage_id(uid, date_key), _usage_defaults()))
+            return deepcopy(
+                self._usage.get(self._usage_id(uid, date_key), _usage_defaults())
+            )
 
     async def get_target_level(self, uid: str) -> str | None:
         async with self._lock:
@@ -750,12 +766,16 @@ class InMemoryStateStore(StateStore):
                     or reward.get("consumed", False)
                     or reward["expiresAt"] < now
                 ):
-                    raise RewardNotVerified("verified target level change reward is required")
+                    raise RewardNotVerified(
+                        "verified target level change reward is required"
+                    )
                 reward["consumed"] = True
                 reward["consumedAt"] = now
                 reward["consumedFor"] = "target_level_change"
                 reward_consumed = True
-            created_at = previous["createdAt"] if previous and previous.get("createdAt") else now
+            created_at = (
+                previous["createdAt"] if previous and previous.get("createdAt") else now
+            )
             profile = _profile_from_value(
                 {
                     "uid": uid,
@@ -818,7 +838,9 @@ class InMemoryStateStore(StateStore):
             if question_set.get("status") == "complete":
                 if question_set.get("adjustment") == adjustment:
                     return deepcopy(question_set)
-                raise AdjustmentAlreadyApplied("question set adjustment already applied")
+                raise AdjustmentAlreadyApplied(
+                    "question set adjustment already applied"
+                )
             question_set.update(
                 {
                     "targetLevel": target_level,
@@ -899,10 +921,7 @@ class InMemoryStateStore(StateStore):
                 not reward
                 or reward["uid"] != uid
                 or not _reward_purpose_matches(reward["purpose"], purpose)
-                or (
-                    session_hash is not None
-                    and reward["sessionHash"] != session_hash
-                )
+                or (session_hash is not None and reward["sessionHash"] != session_hash)
                 or reward["status"] != "verified"
                 or reward.get("consumed", False)
                 or reward["expiresAt"] < datetime.now(UTC)
@@ -962,7 +981,9 @@ class InMemoryStateStore(StateStore):
         max_daily_reward_count: int,
     ) -> dict[str, Any]:
         async with self._lock:
-            usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
+            usage = self._usage.setdefault(
+                self._usage_id(uid, date_key), _usage_defaults()
+            )
             usage["date"] = date_key
             count_key = _reward_count_key(purpose)
             if count_key and usage[count_key] >= max_daily_reward_count:
@@ -1128,7 +1149,9 @@ class FirestoreStateStore(StateStore):
     ) -> dict[str, Any] | None:
         def read() -> dict[str, Any] | None:
             if session_id:
-                snapshot = self._client.collection("mockSessions").document(session_id).get()
+                snapshot = (
+                    self._client.collection("mockSessions").document(session_id).get()
+                )
                 value = snapshot.to_dict() if snapshot.exists else None
                 return value if value and value.get("uid") == uid else None
             query = self._client.collection("mockSessions").where("uid", "==", uid)
@@ -1343,11 +1366,15 @@ class FirestoreStateStore(StateStore):
 
         return await asyncio.to_thread(read)
 
-    async def get_question_history(self, *, uid: str, mode: str) -> dict[str, list[str]]:
+    async def get_question_history(
+        self, *, uid: str, mode: str
+    ) -> dict[str, list[str]]:
         def read() -> dict[str, list[str]]:
-            snapshot = self._client.collection("questionHistories").document(
-                self._question_history_id(uid, mode)
-            ).get()
+            snapshot = (
+                self._client.collection("questionHistories")
+                .document(self._question_history_id(uid, mode))
+                .get()
+            )
             return {
                 **_question_history_defaults(),
                 **(snapshot.to_dict() or {}),
@@ -1373,15 +1400,19 @@ class FirestoreStateStore(StateStore):
                 set_hash=set_hash,
                 questions=questions,
             )
-            ref.set({**updated, "uid": uid, "mode": mode, "updatedAt": datetime.now(UTC)})
+            ref.set(
+                {**updated, "uid": uid, "mode": mode, "updatedAt": datetime.now(UTC)}
+            )
 
         await asyncio.to_thread(write)
 
     async def get_usage(self, uid: str, date_key: str) -> dict[str, int]:
         def read() -> dict[str, int]:
-            snapshot = self._client.collection("dailyUsage").document(
-                self._usage_id(uid, date_key)
-            ).get()
+            snapshot = (
+                self._client.collection("dailyUsage")
+                .document(self._usage_id(uid, date_key))
+                .get()
+            )
             return {**_usage_defaults(), **(snapshot.to_dict() or {})}
 
         return await asyncio.to_thread(read)
@@ -1390,7 +1421,11 @@ class FirestoreStateStore(StateStore):
         def read() -> str | None:
             snapshot = self._client.collection("userProfiles").document(uid).get()
             value = _profile_from_value(snapshot.to_dict() if snapshot.exists else None)
-            return str(value["targetLevel"]) if value and value.get("targetLevel") else None
+            return (
+                str(value["targetLevel"])
+                if value and value.get("targetLevel")
+                else None
+            )
 
         return await asyncio.to_thread(read)
 
@@ -1530,7 +1565,9 @@ class FirestoreStateStore(StateStore):
                 if question_set.get("status") == "complete":
                     if question_set.get("adjustment") == adjustment:
                         return question_set
-                    raise AdjustmentAlreadyApplied("question set adjustment already applied")
+                    raise AdjustmentAlreadyApplied(
+                        "question set adjustment already applied"
+                    )
                 updates = {
                     "targetLevel": target_level,
                     "adjustment": adjustment,
@@ -1542,7 +1579,10 @@ class FirestoreStateStore(StateStore):
                     **(generation_metadata or {}),
                     # 구 문서를 부분 업데이트할 때 제거된 저장 필드가 남지 않도록 명시 삭제
                     "dateKey": firestore.DELETE_FIELD,
-                    **{field: firestore.DELETE_FIELD for field in _LEGACY_QUESTION_SET_FIELDS},
+                    **{
+                        field: firestore.DELETE_FIELD
+                        for field in _LEGACY_QUESTION_SET_FIELDS
+                    },
                 }
                 transaction.update(set_ref, updates)
                 transaction.set(
@@ -1577,7 +1617,9 @@ class FirestoreStateStore(StateStore):
                 if existing.exists:
                     data = existing.to_dict() or {}
                     if data.get("uid") != uid:
-                        raise UsageLimitExceeded("idempotency key belongs to another user")
+                        raise UsageLimitExceeded(
+                            "idempotency key belongs to another user"
+                        )
                     if data.get("status") == "completed":
                         return Reservation("cached", result=data.get("result"))
                     if data.get("status") == "processing":
@@ -1630,7 +1672,9 @@ class FirestoreStateStore(StateStore):
     ) -> Reservation:
         def run() -> Reservation:
             transaction = self._client.transaction(max_attempts=20)
-            reward_ref = self._client.collection("adRewardIntents").document(reward_nonce)
+            reward_ref = self._client.collection("adRewardIntents").document(
+                reward_nonce
+            )
             request_ref = self._client.collection("aiRequests").document(request_id)
 
             @firestore.transactional
@@ -1639,7 +1683,9 @@ class FirestoreStateStore(StateStore):
                 if existing.exists:
                     data = existing.to_dict() or {}
                     if data.get("uid") != uid:
-                        raise RewardNotVerified("idempotency key belongs to another user")
+                        raise RewardNotVerified(
+                            "idempotency key belongs to another user"
+                        )
                     if data.get("status") == "completed":
                         return Reservation("cached", result=data.get("result"))
                     if data.get("status") == "processing":
@@ -1701,7 +1747,9 @@ class FirestoreStateStore(StateStore):
                     return
                 source = data.get("source")
                 if source in {"free", "bonus"}:
-                    usage_ref = self._client.collection("dailyUsage").document(data["usageId"])
+                    usage_ref = self._client.collection("dailyUsage").document(
+                        data["usageId"]
+                    )
                     usage_snapshot = usage_ref.get(transaction=transaction)
                     usage = {**_usage_defaults(), **(usage_snapshot.to_dict() or {})}
                     if source == "free":
@@ -1841,9 +1889,8 @@ class FirestoreStateStore(StateStore):
                     usage[count_key] += 1
                     usage["rewardCount"] += 1
                     updates["quotaCounted"] = True
-                if (
-                    purpose is RewardPurpose.PRACTICE_CREDITS
-                    and not reward.get("credited", False)
+                if purpose is RewardPurpose.PRACTICE_CREDITS and not reward.get(
+                    "credited", False
                 ):
                     usage["bonusRemaining"] += practice_credit_amount
 
