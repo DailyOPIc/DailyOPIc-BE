@@ -16,6 +16,32 @@ from app.services.state import (
 _QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
 
 
+def test_firestore_emulator_client_does_not_require_adc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    client = object()
+
+    def make_client(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setenv("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080")
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setattr(state_module.firestore, "Client", make_client)
+    monkeypatch.setattr(
+        state_module.admin_firestore,
+        "client",
+        lambda: pytest.fail("Firebase Admin client must not be used for the emulator"),
+    )
+
+    store = FirestoreStateStore("dailyopic-test")
+
+    assert store._client is client
+    assert captured["project"] == "dailyopic-test"
+    assert isinstance(captured["credentials"], state_module.AnonymousCredentials)
+
+
 @pytest.mark.asyncio
 async def test_firestore_contention_retry_starts_a_fresh_transaction(
     monkeypatch: pytest.MonkeyPatch,
