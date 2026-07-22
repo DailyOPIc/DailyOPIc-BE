@@ -153,6 +153,34 @@ def test_expiration_downgrades_to_free() -> None:
         assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
 
 
+def test_cancellation_keeps_access_until_expiry() -> None:
+    """자동갱신 해지(CANCELLATION)는 즉시 강등하지 않고 만료일까지 권한 유지."""
+    with TestClient(app) as client:
+        _post_webhook(client, _purchase_event("pro", event_id="pro-c1"))
+        cancel = {
+            "type": "CANCELLATION",
+            "id": "cancel-1",
+            "app_user_id": USER_ID,
+            "entitlement_ids": ["pro"],
+            "product_id": "opic_pro_monthly",
+            "expiration_at_ms": _future_ms(),  # 아직 미래 → 접근 유지
+        }
+        assert _post_webhook(client, cancel).status_code == 200
+        caps = client.get("/v1/capabilities", headers=_headers()).json()
+        assert caps["plan"] == "pro"
+
+        # 만료 이벤트가 오면 그때 free로 강등.
+        expire = {
+            "type": "EXPIRATION",
+            "id": "cancel-1-exp",
+            "app_user_id": USER_ID,
+            "entitlement_ids": ["pro"],
+            "product_id": "opic_pro_monthly",
+        }
+        assert _post_webhook(client, expire).status_code == 200
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
+
+
 def test_already_expired_timestamp_is_treated_as_free() -> None:
     with TestClient(app) as client:
         past_ms = int((datetime.now(UTC) - timedelta(days=1)).timestamp() * 1000)

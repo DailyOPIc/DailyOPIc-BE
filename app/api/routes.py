@@ -1679,12 +1679,13 @@ async def create_reward_intent(
     )
 
 
+# 즉시 권한을 회수하는 이벤트만 포함한다.
+# CANCELLATION(자동갱신 해지)·BILLING_ISSUE(유예 기간)·SUBSCRIPTION_PAUSED 는
+# 즉시 강등하지 않고, 저장된 expiresAt(실제 만료시각)까지 권한을 유지한다.
+# 만료 시점은 resolve_plan 이 서버 권위로 판정한다.
 _DEACTIVATING_EVENTS = {
-    "CANCELLATION",
     "EXPIRATION",
-    "SUBSCRIPTION_PAUSED",
     "REFUND",
-    "BILLING_ISSUE",
 }
 
 
