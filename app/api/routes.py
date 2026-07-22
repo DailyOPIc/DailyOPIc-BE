@@ -46,6 +46,7 @@ from app.models.api import (
     QuestionSetAdjustmentRequest,
     QuestionSetResponse,
     QuestionSetStatus,
+    RevenueCatWebhook,
     RewardIntentRequest,
     RewardIntentResponse,
     RewardPurpose,
@@ -68,6 +69,8 @@ from app.services.difficulty import (
     initial_level_from_target,
 )
 from app.services.questions import prompt_hash, question_set_hash
+from app.services import plans
+from app.services.plans import Plan
 from app.services.state import (
     AdjustmentAlreadyApplied,
     IdempotencyConflict,
@@ -75,6 +78,7 @@ from app.services.state import (
     RequestAlreadyProcessing,
     RewardNotVerified,
     UsageLimitExceeded,
+    resolve_plan,
 )
 
 
@@ -86,9 +90,39 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 MOCK_AUDIO_AGGREGATE_MAX_BYTES = 30 * 1024 * 1024
 
 
+async def _current_plan(request: Request, uid: str) -> Plan:
+    """엔타이틀먼트를 조회해 현재 유효 플랜을 반환(만료/미존재 → free)."""
+    entitlement = await request.app.state.state_store.get_entitlement(uid)
+    return Plan(resolve_plan(entitlement))
+
+
+def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
+    limits = plans.limits_for(plan)
+    return CapabilityQuotaPolicy(
+        dailyAnalysisFree=limits.practice_daily,
+        dailyRefreshRewards=plans.reward_max_for(plan, RewardPurpose.PRACTICE_REFRESH),
+        mockSessionsPerDay=limits.mock_daily,
+        mockRewardGates=3 if limits.mock_requires_ad else 0,
+        practiceDaily=limits.practice_daily,
+        practiceAdBonus=limits.practice_ad_bonus,
+        historyDays=limits.history_days,
+        analysisDepth=str(limits.analysis_depth),
+        gradeTrend=str(limits.grade_trend),
+        weaknessAnalysis=str(limits.weakness_analysis),
+        reviewSet=limits.review_set,
+        weeklyReport=limits.weekly_report,
+        mockComparison=str(limits.mock_comparison),
+        adsEnabled=limits.ads_enabled,
+    )
+
+
 @router.get("/v1/capabilities", response_model=CapabilitiesResponse)
-async def capabilities(request: Request) -> CapabilitiesResponse:
+async def capabilities(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> CapabilitiesResponse:
     settings = request.app.state.settings
+    plan = await _current_plan(request, user.uid)
     return CapabilitiesResponse(
         minimumSupportedAppVersion=settings.minimum_supported_app_version,
         questionGenerationV2=settings.question_generation_v2_enabled,
@@ -96,12 +130,8 @@ async def capabilities(request: Request) -> CapabilitiesResponse:
         evaluationRubricV2=settings.evaluation_rubric_v2_enabled,
         practiceRefresh=settings.practice_refresh_enabled,
         guideSchemaVersion=settings.guide_schema_version,
-        quotaPolicy=CapabilityQuotaPolicy(
-            dailyAnalysisFree=settings.free_practice_limit,
-            dailyRefreshRewards=settings.max_daily_reward_count,
-            mockSessionsPerDay=1,
-            mockRewardGates=3,
-        ),
+        plan=str(plan),
+        quotaPolicy=_quota_policy_for(plan),
     )
 
 
@@ -385,6 +415,7 @@ async def _create_daily_pool(
     source: str,
     date_key: str,
     set_id: str | None = None,
+    focus_dimension: str | None = None,
 ) -> QuestionSetResponse:
     initial_level = _request_initial_level(payload)
     effective_level = adjusted_level(initial_level, adjustment)
@@ -419,6 +450,7 @@ async def _create_daily_pool(
             payload.survey,
             adjustment=adjustment,
             history=history,
+            focus_dimension=focus_dimension,
         )
     except AIQuestionGenerationError as error:
         logger.exception(
@@ -752,6 +784,76 @@ async def create_practice_set(
             source="free",
             date_key=date_key,
             set_id=free_set_id,
+        )
+        await request.app.state.state_store.complete_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            result=response.model_dump(by_alias=True, mode="json"),
+            ttl_hours=request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except Exception:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=True,
+        )
+        raise
+
+
+@router.post("/v1/question-sets/review", response_model=QuestionSetResponse)
+async def create_review_set(
+    payload: PracticeSetRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> QuestionSetResponse:
+    """취약점 복습 세트(Pro 전용): 지정 루브릭 차원에 편향된 연습 세트를 즉시 생성.
+
+    기존 daily 생성 경로를 재사용(mode=daily)하므로 응답 문항은 일반 연습 평가
+    (/v2/evaluations/practice)로 그대로 채점된다. 결제 유도는 402로 반환.
+    """
+    plan = await _current_plan(request, user.uid)
+    if not plans.limits_for(plan).review_set:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "review_set_requires_pro",
+                "message": "취약점 복습 세트는 프로 플랜 전용입니다.",
+            },
+        )
+    if payload.focus_dimension is None:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "focus_dimension_required"},
+        )
+    operation_id = _request_id(idempotency_key)
+    operation = "review_set_generation"
+    date_key = _date_key()
+    reservation = await _reserve_operation(
+        request,
+        user,
+        operation=operation,
+        operation_id=operation_id,
+        payload=payload.model_dump(by_alias=True, mode="json"),
+    )
+    if reservation.status == "cached" and reservation.result:
+        return QuestionSetResponse.model_validate(reservation.result)
+    set_id = hashlib.sha256(
+        f"{user.uid}:review:{operation_id}".encode()
+    ).hexdigest()
+    try:
+        response = await _create_daily_pool(
+            request,
+            user,
+            payload,
+            adjustment=DifficultyAdjustment.SAME,
+            source="review",
+            date_key=date_key,
+            set_id=set_id,
+            focus_dimension=str(payload.focus_dimension),
         )
         await request.app.state.state_store.complete_operation(
             uid=user.uid,
@@ -1497,13 +1599,15 @@ async def usage(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> UsageResponse:
-    settings = request.app.state.settings
     date_key = _date_key()
+    plan = await _current_plan(request, user.uid)
+    limits = plans.limits_for(plan)
     value = await request.app.state.state_store.get_usage(user.uid, date_key)
     free_remaining = max(
-        0, settings.free_practice_limit - int(value.get("freeUsed", 0))
+        0, limits.practice_daily - int(value.get("freeUsed", 0))
     )
     bonus_remaining = max(0, int(value.get("bonusRemaining", 0)))
+    refresh_max = plans.reward_max_for(plan, RewardPurpose.PRACTICE_REFRESH)
     resets_at = _next_reset()
     mock_session = await request.app.state.state_store.get_mock_session(
         uid=user.uid,
@@ -1519,8 +1623,7 @@ async def usage(
         dailyAnalysisRewardRemaining=bonus_remaining,
         dailyRefreshRemaining=max(
             0,
-            settings.max_daily_reward_count
-            - int(value.get("practiceRefreshRewardCount", 0)),
+            refresh_max - int(value.get("practiceRefreshRewardCount", 0)),
         ),
         mockAvailable=mock_session is None,
         mockSessionStage=(str(mock_session["stage"]) if mock_session else None),
@@ -1534,6 +1637,19 @@ async def create_reward_intent(
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> RewardIntentResponse:
     settings = request.app.state.settings
+    plan = await _current_plan(request, user.uid)
+    # 유료 플랜은 모의고사 광고 게이트를 광고 없이 즉시 충족(auto-verify).
+    auto_verify = plans.reward_auto_verify(plan, payload.purpose)
+    max_daily_reward_count = plans.reward_max_for(plan, payload.purpose)
+    if max_daily_reward_count <= 0:
+        # 유료 플랜은 데일리/리프레시 광고 보너스를 사용하지 않음 → 결제 유도.
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "reward_not_available_for_plan",
+                "message": "This reward is not available on your current plan.",
+            },
+        )
     nonce = secrets.token_urlsafe(32)
     expires_at = datetime.now(UTC) + timedelta(minutes=30)
     try:
@@ -1544,9 +1660,9 @@ async def create_reward_intent(
             session_hash=payload.session_hash,
             date_key=_date_key(),
             expires_at=expires_at,
-            auto_verify=False,
+            auto_verify=auto_verify,
             practice_credit_amount=settings.reward_practice_credits,
-            max_daily_reward_count=settings.max_daily_reward_count,
+            max_daily_reward_count=max_daily_reward_count,
         )
     except UsageLimitExceeded as error:
         raise HTTPException(
@@ -1561,6 +1677,91 @@ async def create_reward_intent(
         customData=nonce,
         expiresAt=expires_at,
     )
+
+
+# 즉시 권한을 회수하는 이벤트만 포함한다.
+# CANCELLATION(자동갱신 해지)·BILLING_ISSUE(유예 기간)·SUBSCRIPTION_PAUSED 는
+# 즉시 강등하지 않고, 저장된 expiresAt(실제 만료시각)까지 권한을 유지한다.
+# 만료 시점은 resolve_plan 이 서버 권위로 판정한다.
+_DEACTIVATING_EVENTS = {
+    "EXPIRATION",
+    "REFUND",
+}
+
+
+@router.post("/v1/iap/revenuecat-webhook")
+async def revenuecat_webhook(
+    payload: RevenueCatWebhook,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    """RevenueCat 서버-서버 웹훅. App Check/Firebase Auth 대신 공유 시크릿으로 검증.
+
+    엔타이틀먼트를 Firestore userProfiles 에 반영(서버 권위). 이벤트는 멱등 처리.
+    """
+    settings = request.app.state.settings
+    expected = settings.revenuecat_webhook_auth
+    if not expected:
+        logger.error("RevenueCat webhook received but shared secret is not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "webhook_not_configured"},
+        )
+    if not authorization or not secrets.compare_digest(authorization, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "invalid_webhook_auth"},
+        )
+
+    event = payload.event
+    uid = (event.app_user_id or event.original_app_user_id or "").strip()
+    if not uid:
+        raise HTTPException(
+            status_code=422, detail={"code": "missing_app_user_id"}
+        )
+
+    event_id = event.id or _payload_hash(payload.model_dump(mode="json"))
+    is_new = await request.app.state.state_store.record_iap_event(event_id, uid)
+    if not is_new:
+        return {"status": "duplicate"}
+
+    event_type = event.type.upper()
+    if event_type in _DEACTIVATING_EVENTS:
+        plan = Plan.FREE
+        is_active = False
+    else:
+        entitlement_ids = event.entitlement_ids or (
+            [event.entitlement_id] if event.entitlement_id else None
+        )
+        plan = plans.plan_from_entitlement_ids(entitlement_ids)
+        if plan is Plan.FREE:
+            logger.warning(
+                "RevenueCat webhook: unmapped entitlements uid=%s ids=%s product=%s",
+                _uid_hash(uid),
+                entitlement_ids,
+                event.product_id,
+            )
+        is_active = plan is not Plan.FREE
+
+    entitlement = {
+        "plan": str(plan),
+        "isActive": is_active,
+        "source": "revenuecat",
+        "productId": event.product_id,
+        "periodType": event.period_type,
+        "expiresAt": event.expiration_at_ms,
+        "store": event.store,
+        "lastEventType": event_type,
+        "updatedAt": datetime.now(UTC),
+    }
+    await request.app.state.state_store.set_entitlement(uid, entitlement=entitlement)
+    logger.info(
+        "RevenueCat webhook processed uid=%s type=%s plan=%s",
+        _uid_hash(uid),
+        event_type,
+        plan,
+    )
+    return {"status": "ok", "plan": str(plan)}
 
 
 @router.get("/v1/ad-rewards/{nonce}", response_model=RewardIntentResponse)
@@ -1611,11 +1812,13 @@ async def admob_ssv(request: Request) -> PlainTextResponse:
                 verified.user_id,
             )
             raise RewardNotVerified("SSV user_id does not match the reward intent")
+        reward_plan = await _current_plan(request, verified.user_id)
+        reward_purpose = RewardPurpose(reward.get("purpose"))
         await request.app.state.state_store.verify_reward(
             nonce=verified.nonce,
             transaction_id=verified.transaction_id,
             practice_credit_amount=request.app.state.settings.reward_practice_credits,
-            max_daily_reward_count=request.app.state.settings.max_daily_reward_count,
+            max_daily_reward_count=plans.reward_max_for(reward_plan, reward_purpose),
         )
         logger.info("[SSV] reward verified nonce=%s", verified.nonce)
         logger.info("[SSV] reward completed nonce=%s", verified.nonce)
@@ -1676,10 +1879,11 @@ async def evaluate_practice(
     if question is None:
         raise HTTPException(status_code=422, detail={"code": "invalid_question_number"})
 
-    settings = request.app.state.settings
+    plan = await _current_plan(request, user.uid)
+    limits = plans.limits_for(plan)
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, _date_key(), request_id, settings.free_practice_limit
+            user.uid, _date_key(), request_id, limits.practice_daily
         )
     except UsageLimitExceeded as error:
         raise HTTPException(
@@ -1699,6 +1903,7 @@ async def evaluate_practice(
             transcript=transcript.strip(),
             target=target,
             metrics=metrics,
+            depth=limits.analysis_depth,
         )
         serialized_result = result.model_dump(by_alias=True, mode="json")
         await request.app.state.state_store.finalize_request(
@@ -1880,11 +2085,13 @@ async def evaluate_mock_session(
                 for answer in manifest.answers
             ]
         )
+        mock_plan = await _current_plan(request, user.uid)
         result = await request.app.state.ai_service.evaluate_mock(
             questions=questions,
             transcripts=[item.transcript for item in manifest.answers],
             target=target,
             metrics=list(metrics),
+            depth=plans.limits_for(mock_plan).analysis_depth,
         )
         serialized_result = result.model_dump(by_alias=True, mode="json")
         await request.app.state.state_store.finalize_request(
@@ -2038,11 +2245,13 @@ async def evaluate_mock(
                 for answer in manifest.answers
             ]
         )
+        mock_plan = await _current_plan(request, user.uid)
         result = await request.app.state.ai_service.evaluate_mock(
             questions=questions,
             transcripts=[item.transcript for item in manifest.answers],
             target=target,
             metrics=list(metrics),
+            depth=plans.limits_for(mock_plan).analysis_depth,
         )
         serialized_result = result.model_dump(by_alias=True, mode="json")
         await request.app.state.state_store.finalize_request(

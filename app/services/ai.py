@@ -474,6 +474,7 @@ class AIService:
         *,
         adjustment: DifficultyAdjustment | None = None,
         history: dict[str, list[str]] | None = None,
+        focus_dimension: str | None = None,
     ) -> QuestionGenerationResult:
         if isinstance(initial_level, OPIcLevel):
             initial_level = initial_level_from_target(initial_level) or 4
@@ -502,6 +503,9 @@ class AIService:
             history=history,
             survey=survey,
         )
+        if focus_dimension:
+            # 취약점 복습 세트(Pro): 지정 루브릭 차원을 rubricFocus/prompt에 집중하도록 힌트.
+            payload["focusDimension"] = focus_dimension
         return await self._generate_questions_with_openai(
             mode="daily",
             stage="pool",
@@ -1588,7 +1592,10 @@ class AIService:
         transcript: str,
         target: OPIcLevel,
         metrics: AudioMetrics,
+        depth: str = "detailed",
     ) -> PracticeEvaluation:
+        # 무료(summary)는 교정/모범답안을 생성·반환하지 않아 토큰·비용을 절감한다.
+        summary = str(depth) == "summary"
         if self._mock:
             level, scores = self._fallback_score(transcript, metrics)
             result = AIPracticeResult(
@@ -1597,11 +1604,15 @@ class AIService:
                 rubrics=self._rubrics_from_scores(scores),
                 strengths=["질문에 맞춰 영어로 답변을 완성했습니다."],
                 improvements=["구체적인 이유와 예시를 한두 문장 더 연결해 보세요."],
-                correctedAnswer=transcript.strip()[:900],
+                correctedAnswer=None if summary else transcript.strip()[:900],
                 targetGap=f"현재 예상 {level.value}에서 목표 {target.value}에 맞는 세부 묘사를 보강하세요.",
                 sampleAnswer=(
-                    f"For this {question.topic} question, I would begin with a clear answer, "
-                    "add a specific personal example, and finish by explaining why it matters to me."
+                    None
+                    if summary
+                    else (
+                        f"For this {question.topic} question, I would begin with a clear answer, "
+                        "add a specific personal example, and finish by explaining why it matters to me."
+                    )
                 ),
             )
         else:
@@ -1623,6 +1634,12 @@ class AIService:
                     "Use delivery metrics only for fluency, never claim phoneme-level pronunciation analysis. "
                     "Return at most three concise strengths and improvements. correctedAnswer and sampleAnswer must be English "
                     "and no longer than five sentences; use null only when a useful optional detail cannot be produced."
+                    + (
+                        " For this request set correctedAnswer and sampleAnswer to null "
+                        "(summary tier); still return all rubrics and one targetGap."
+                        if summary
+                        else ""
+                    )
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIPracticeResult,
@@ -1630,17 +1647,21 @@ class AIService:
             )
             result = structured.payload
         assert isinstance(result, AIPracticeResult)
-        warnings = [
-            name
-            for name, value in {
+        result_dump = result.model_dump(by_alias=True)
+        if summary:
+            # summary 티어는 교정/모범답안을 제공하지 않음(누락은 경고 대상 아님).
+            result_dump["correctedAnswer"] = None
+            result_dump["sampleAnswer"] = None
+            warning_source = {"targetGap": result.target_gap}
+        else:
+            warning_source = {
                 "correctedAnswer": result.corrected_answer,
                 "targetGap": result.target_gap,
                 "sampleAnswer": result.sample_answer,
-            }.items()
-            if not value
-        ]
+            }
+        warnings = [name for name, value in warning_source.items() if not value]
         return PracticeEvaluation(
-            **result.model_dump(by_alias=True),
+            **result_dump,
             scores=self._scores_from_rubrics(result.rubrics),
             audioMetrics=metrics,
             disclaimer=DISCLAIMER,
@@ -1658,7 +1679,11 @@ class AIService:
         transcripts: list[str],
         target: OPIcLevel,
         metrics: list[AudioMetrics],
+        depth: str = "detailed",
     ) -> MockEvaluation:
+        # depth는 클라이언트 표시 게이팅용으로 전달받는다. 모의고사는 무료도
+        # 광고 게이트(3회) + 1일 1회로 빈도가 낮아 서버 생성은 항상 전체로 유지한다.
+        del depth
         if self._mock:
             combined = " ".join(transcripts)
             aggregate = AudioMetrics(

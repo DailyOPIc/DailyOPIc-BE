@@ -114,7 +114,8 @@ def test_practice_quota_and_reward_flow() -> None:
             "transcript": "I read several news sources every morning because I want balanced information.",
             "targetLevel": "IH",
         }
-        for _ in range(3):
+        # 무료 플랜: 하루 데일리 학습 1회.
+        for _ in range(1):
             response = client.post(
                 "/v1/evaluations/practice",
                 headers=_headers(str(uuid.uuid4())),
@@ -174,7 +175,7 @@ def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota(
         assert all(item["examSection"] != "introduction" for item in first_set["questions"])
 
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 3
+        assert usage["freeRemaining"] == 1
 
         archived = client.post(
             "/v1/question-sets/practice",
@@ -206,8 +207,8 @@ def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota(
         assert [item["number"] for item in refreshed_set["questions"]] == list(range(2, 16))
 
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 3
-        assert usage["dailyRefreshRemaining"] == 2
+        assert usage["freeRemaining"] == 1
+        assert usage["dailyRefreshRemaining"] == 0
 
         response = client.post(
             "/v1/evaluations/practice",
@@ -554,7 +555,8 @@ def test_mock_session_v2_requires_three_verified_gates_and_resumes() -> None:
 
 def test_daily_reward_intent_quota_returns_402() -> None:
     with TestClient(app) as client:
-        for _ in range(3):
+        # 무료 플랜: 데일리 광고 보너스는 하루 1회.
+        for _ in range(1):
             response = client.post(
                 "/v1/ad-rewards/intents",
                 headers=_headers(),
@@ -575,7 +577,9 @@ def test_daily_reward_intent_quota_returns_402() -> None:
 
 def test_target_level_change_intent_is_not_blocked_by_practice_reward_quota() -> None:
     with TestClient(app) as client:
-        for _ in range(3):
+        # 무료 플랜의 데일리 광고 보너스 한도(1회)를 소진해도
+        # 목표 등급 변경 리워드는 별도 정책이라 막히지 않아야 한다.
+        for _ in range(1):
             response = client.post(
                 "/v1/ad-rewards/intents",
                 headers=_headers(),
