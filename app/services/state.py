@@ -317,6 +317,19 @@ class StateStore(ABC):
         max_daily_reward_count: int,
     ) -> dict[str, Any]: ...
 
+    @abstractmethod
+    async def get_entitlement(self, uid: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def set_entitlement(
+        self, uid: str, *, entitlement: dict[str, Any]
+    ) -> None: ...
+
+    @abstractmethod
+    async def record_iap_event(self, event_id: str, uid: str) -> bool:
+        """웹훅 이벤트 멱등 기록. 신규면 True, 이미 처리된 이벤트면 False."""
+        ...
+
 
 _DAILY_MODE_ALIASES = frozenset({"daily", "practice"})
 _LEGACY_QUESTION_SET_FIELDS = (
@@ -473,6 +486,37 @@ def _profile_from_value(profile: dict[str, Any] | None) -> dict[str, Any] | None
     }
 
 
+def _coerce_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)):
+        # RevenueCat는 밀리초 epoch. 초 단위도 방어적으로 지원.
+        seconds = value / 1000 if value > 1_000_000_000_000 else value
+        return datetime.fromtimestamp(seconds, tz=UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
+
+
+def resolve_plan(entitlement: dict[str, Any] | None) -> str:
+    """저장된 엔타이틀먼트에서 현재 유효 플랜 문자열을 계산.
+
+    비활성/만료/미존재는 모두 'free'로 강등한다. 서버 권위의 최종 판단 지점.
+    """
+    if not entitlement or not entitlement.get("isActive", False):
+        return "free"
+    expires_at = _coerce_datetime(entitlement.get("expiresAt"))
+    if expires_at is not None and expires_at < datetime.now(UTC):
+        return "free"
+    return str(entitlement.get("plan") or "free")
+
+
 def _target_change_response(
     *,
     profile: dict[str, Any],
@@ -504,6 +548,24 @@ class InMemoryStateStore(StateStore):
         self._profiles: dict[str, dict[str, Any]] = {}
         self._operations: dict[str, dict[str, Any]] = {}
         self._mock_sessions: dict[str, dict[str, Any]] = {}
+        self._entitlements: dict[str, dict[str, Any]] = {}
+        self._iap_events: dict[str, str] = {}
+
+    async def get_entitlement(self, uid: str) -> dict[str, Any] | None:
+        async with self._lock:
+            entitlement = self._entitlements.get(uid)
+            return deepcopy(entitlement) if entitlement else None
+
+    async def set_entitlement(self, uid: str, *, entitlement: dict[str, Any]) -> None:
+        async with self._lock:
+            self._entitlements[uid] = {**deepcopy(entitlement), "uid": uid}
+
+    async def record_iap_event(self, event_id: str, uid: str) -> bool:
+        async with self._lock:
+            if event_id in self._iap_events:
+                return False
+            self._iap_events[event_id] = uid
+            return True
 
     async def create_or_get_mock_session(
         self,
@@ -1498,6 +1560,48 @@ class FirestoreStateStore(StateStore):
             return _profile_from_value(snapshot.to_dict() if snapshot.exists else None)
 
         return await asyncio.to_thread(read)
+
+    async def get_entitlement(self, uid: str) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            data = snapshot.to_dict() if snapshot.exists else None
+            entitlement = (data or {}).get("entitlement")
+            return dict(entitlement) if entitlement else None
+
+        return await asyncio.to_thread(read)
+
+    async def set_entitlement(self, uid: str, *, entitlement: dict[str, Any]) -> None:
+        def write() -> None:
+            self._client.collection("userProfiles").document(uid).set(
+                {
+                    "uid": uid,
+                    "entitlement": entitlement,
+                    "updatedAt": datetime.now(UTC),
+                },
+                merge=True,
+            )
+
+        await asyncio.to_thread(write)
+
+    async def record_iap_event(self, event_id: str, uid: str) -> bool:
+        def run() -> bool:
+            transaction = self._client.transaction(max_attempts=5)
+            event_ref = self._client.collection("iapEvents").document(event_id)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> bool:
+                snapshot = event_ref.get(transaction=transaction)
+                if snapshot.exists:
+                    return False
+                transaction.set(
+                    event_ref,
+                    {"uid": uid, "createdAt": datetime.now(UTC)},
+                )
+                return True
+
+            return apply(transaction)
+
+        return await _run_with_firestore_contention_retry(run)
 
     async def set_initial_level(
         self, *, uid: str, initial_level: int, reward_nonce: str | None

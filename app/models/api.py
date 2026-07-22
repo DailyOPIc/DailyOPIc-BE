@@ -170,6 +170,10 @@ class PracticeSetRequest(BaseModel):
     recent_question_hashes: list[str] = Field(
         default_factory=list, alias="recentQuestionHashes", max_length=50
     )
+    # 취약점 복습 세트(Pro): 지정 루브릭 차원에 편향된 문제 생성 요청.
+    focus_dimension: RubricDimension | None = Field(
+        default=None, alias="focusDimension"
+    )
 
     @model_validator(mode="after")
     def validate_level(self) -> "PracticeSetRequest":
@@ -479,6 +483,17 @@ class CapabilityQuotaPolicy(BaseModel):
     daily_refresh_rewards: int = Field(alias="dailyRefreshRewards", ge=0)
     mock_sessions_per_day: int = Field(default=1, alias="mockSessionsPerDay", ge=0)
     mock_reward_gates: int = Field(default=3, alias="mockRewardGates", ge=0)
+    # 플랜별 기능 게이트(클라이언트 UI 게이팅용). 무료 기본값을 유지해 하위 호환.
+    practice_daily: int = Field(default=1, alias="practiceDaily", ge=0)
+    practice_ad_bonus: int = Field(default=1, alias="practiceAdBonus", ge=0)
+    history_days: int | None = Field(default=7, alias="historyDays", ge=0)
+    analysis_depth: str = Field(default="summary", alias="analysisDepth")
+    grade_trend: str = Field(default="limited", alias="gradeTrend")
+    weakness_analysis: str = Field(default="none", alias="weaknessAnalysis")
+    review_set: bool = Field(default=False, alias="reviewSet")
+    weekly_report: bool = Field(default=False, alias="weeklyReport")
+    mock_comparison: str = Field(default="none", alias="mockComparison")
+    ads_enabled: bool = Field(default=True, alias="adsEnabled")
 
 
 class CapabilitiesResponse(BaseModel):
@@ -490,4 +505,30 @@ class CapabilitiesResponse(BaseModel):
     evaluation_rubric_v2: bool = Field(alias="evaluationRubricV2")
     practice_refresh: bool = Field(alias="practiceRefresh")
     guide_schema_version: int = Field(alias="guideSchemaVersion", ge=1)
+    plan: str = "free"
     quota_policy: CapabilityQuotaPolicy = Field(alias="quotaPolicy")
+
+
+class RevenueCatEvent(BaseModel):
+    """RevenueCat 웹훅 이벤트(관심 필드만; 나머지 무시)."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    type: str
+    id: str | None = None
+    app_user_id: str | None = None
+    original_app_user_id: str | None = None
+    entitlement_ids: list[str] | None = None
+    entitlement_id: str | None = None
+    product_id: str | None = None
+    period_type: str | None = None
+    expiration_at_ms: int | None = None
+    purchased_at_ms: int | None = None
+    store: str | None = None
+
+
+class RevenueCatWebhook(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    event: RevenueCatEvent
+    api_version: str | None = None

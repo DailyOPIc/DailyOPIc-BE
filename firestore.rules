@@ -1,6 +1,10 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // 모든 데이터는 서버 권위(Firebase Admin SDK)로만 접근한다.
+    // 여기에는 dailyUsage, userProfiles(엔타이틀먼트 포함), iapEvents,
+    // adRewardIntents 등 결제/사용량 관련 컬렉션이 포함된다.
+    // 클라이언트 직접 접근은 전면 차단 → 엔타이틀먼트 위변조 불가.
     match /{document=**} {
       allow read, write: if false;
     }

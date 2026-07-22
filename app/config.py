@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     free_practice_limit: int = 3
     reward_practice_credits: int = 1
     max_daily_reward_count: int = 3
+    # RevenueCat 웹훅: 대시보드에 설정한 Authorization 헤더 공유 시크릿.
+    # 서버-서버 호출이라 App Check/Firebase Auth 대신 이 값으로 검증한다.
+    revenuecat_webhook_auth: str | None = None
     minimum_supported_app_version: str = "1.0.0"
     guide_schema_version: int = 2
     question_generation_v2_enabled: bool = True
@@ -34,6 +37,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_required_settings(self) -> "Settings":
         self.openai_api_key = self._clean(self.openai_api_key)
+        self.revenuecat_webhook_auth = self._clean(self.revenuecat_webhook_auth)
         self.firebase_project_id = self._clean_required(
             self.firebase_project_id, "FIREBASE_PROJECT_ID"
         )
