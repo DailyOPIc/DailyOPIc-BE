@@ -225,10 +225,21 @@ def _make_practice_form(client: TestClient) -> dict[str, str]:
     }
 
 
-def test_basic_plan_gets_three_daily_practices() -> None:
+def test_basic_plan_gets_three_daily_sets() -> None:
+    """토큰 모델: 토큰 = 하루 새 문제 세트 수. 베이직은 하루 3세트."""
+    refresh_payload = {
+        "targetLevel": "IH",
+        "background": {"interests": ["news"]},
+        "adjustment": "same",
+    }
     with TestClient(app) as client:
         _post_webhook(client, _purchase_event("basic", event_id="b-quota"))
+        # 초기 데일리 세트 = 토큰 1개.
         form = _make_practice_form(client)
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 2
+
+        # 세트 내 평가는 무제한(토큰 미소모).
         for _ in range(3):
             response = client.post(
                 "/v1/evaluations/practice",
@@ -236,12 +247,41 @@ def test_basic_plan_gets_three_daily_practices() -> None:
                 data=form,
             )
             assert response.status_code == 200, response.text
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 2  # 평가는 토큰을 쓰지 않음
+
+        # 리프레시 2회 = 토큰 2개(총 3세트 소진).
+        for index in range(2):
+            refreshed = client.post(
+                "/v1/question-sets/practice/refresh",
+                headers={**_headers(), "Idempotency-Key": f"basic-refresh-{index}"},
+                json=refresh_payload,
+            )
+            assert refreshed.status_code == 200, refreshed.text
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 0
+
+        # 4번째 세트는 토큰 소진으로 402.
         blocked = client.post(
-            "/v1/evaluations/practice",
-            headers=_headers(str(uuid.uuid4())),
-            data=form,
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "basic-refresh-blocked"},
+            json=refresh_payload,
         )
         assert blocked.status_code == 402
+        assert blocked.json()["detail"]["code"] == "practice_quota_exhausted"
+
+
+def test_mock_remaining_reflects_plan() -> None:
+    with TestClient(app) as client:
+        # 무료: 하루 1회.
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["mockRemaining"] == 1
+        assert usage["mockAvailable"] is True
+        # 플러스: 하루 3회.
+        _post_webhook(client, _purchase_event("plus", event_id="mock-rem"))
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["mockRemaining"] == 3
+        assert usage["mockAvailable"] is True
 
 
 def test_paid_plan_mock_reward_auto_verifies_without_ad() -> None:

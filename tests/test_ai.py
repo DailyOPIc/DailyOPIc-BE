@@ -565,3 +565,14 @@ async def test_real_ai_rejects_recent_set_hash() -> None:
     )
     assert result.fallback_used is True
     assert set(result.fallback_question_numbers) == set(range(1, 8))
+
+
+def test_predicted_level_never_below_il() -> None:
+    from app.services.ai import _clamp_min_level
+    from app.models.api import OPIcLevel
+
+    assert _clamp_min_level(OPIcLevel.NL) == OPIcLevel.IL
+    assert _clamp_min_level(OPIcLevel.NH) == OPIcLevel.IL
+    assert _clamp_min_level(OPIcLevel.IL) == OPIcLevel.IL
+    assert _clamp_min_level(OPIcLevel.IM2) == OPIcLevel.IM2
+    assert _clamp_min_level(OPIcLevel.AL) == OPIcLevel.AL

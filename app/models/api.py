@@ -210,7 +210,9 @@ class MockSessionAdjustmentRequest(MockSessionRewardRequest):
 
 class PracticeRefreshRequest(PracticeSetRequest):
     adjustment: DifficultyAdjustment = DifficultyAdjustment.SAME
-    reward_nonce: str = Field(alias="rewardNonce", min_length=16)
+    # 토큰 모델 전환으로 리프레시는 광고/리워드가 아닌 데일리 토큰을 소모한다.
+    # rewardNonce는 하위 호환을 위해 옵셔널로 남겨둔다(미사용).
+    reward_nonce: str | None = Field(default=None, alias="rewardNonce")
 
 
 class QuestionSetResponse(BaseModel):
@@ -420,6 +422,7 @@ class UsageResponse(BaseModel):
         default=None, alias="dailyRefreshRemaining", ge=0
     )
     mock_available: bool | None = Field(default=None, alias="mockAvailable")
+    mock_remaining: int | None = Field(default=None, alias="mockRemaining", ge=0)
     mock_session_stage: str | None = Field(default=None, alias="mockSessionStage")
 
 
