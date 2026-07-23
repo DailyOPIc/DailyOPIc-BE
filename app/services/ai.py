@@ -53,6 +53,15 @@ QUESTION_SCHEMA_VERSION = "question-content-slots-v2"
 SCORE_SCALE_VERSION = "rubric-band-v1"
 DISCLAIMER = "이 결과는 학습용 AI 예상치이며 실제 OPIc 공식 등급과 다를 수 있습니다."
 LEVELS = list(OPIcLevel)
+MIN_PREDICTED_LEVEL = OPIcLevel.IL
+
+
+def _clamp_min_level(level: OPIcLevel) -> OPIcLevel:
+    """예상 등급 하한을 IL로 고정(IL~AL 범위). NL/NM/NH로 내려가지 않도록."""
+    floor = LEVELS.index(MIN_PREDICTED_LEVEL)
+    return level if LEVELS.index(level) >= floor else MIN_PREDICTED_LEVEL
+
+
 RUBRIC_SCORE_BY_BAND = {
     RubricBand.FOUNDATION: 20,
     RubricBand.DEVELOPING: 40,
@@ -1517,18 +1526,19 @@ class AIService:
                 base + delivery - filler_count * 0.01 - max(0, repetition - 0.2) * 0.2,
             ),
         )
+        # 완화된 임계값 + IL 하한(IL~AL). 경계는 상위 등급 쪽으로 관대하게.
         thresholds = [
-            (0.78, OPIcLevel.AL),
-            (0.70, OPIcLevel.IH),
-            (0.64, OPIcLevel.IM3),
-            (0.57, OPIcLevel.IM2),
-            (0.49, OPIcLevel.IM1),
-            (0.40, OPIcLevel.IL),
-            (0.31, OPIcLevel.NH),
-            (0.22, OPIcLevel.NM),
+            (0.72, OPIcLevel.AL),
+            (0.62, OPIcLevel.IH),
+            (0.53, OPIcLevel.IM3),
+            (0.44, OPIcLevel.IM2),
+            (0.34, OPIcLevel.IM1),
         ]
-        level = next(
-            (level for minimum, level in thresholds if total >= minimum), OPIcLevel.NL
+        level = _clamp_min_level(
+            next(
+                (level for minimum, level in thresholds if total >= minimum),
+                OPIcLevel.IL,
+            )
         )
         scores = EvaluationScores(
             taskFulfillment=round(min(100, 25 + word_count * 0.5)),
@@ -1594,8 +1604,9 @@ class AIService:
         metrics: AudioMetrics,
         depth: str = "detailed",
     ) -> PracticeEvaluation:
-        # 무료(summary)는 교정/모범답안을 생성·반환하지 않아 토큰·비용을 절감한다.
-        summary = str(depth) == "summary"
+        # 하위 티어(summary=무료, basic=베이직)는 교정/모범답안/목표갭을 생성·반환하지
+        # 않아 토큰·비용을 절감한다. 상세(plus)·집중(pro)만 전체 생성.
+        strip_long = str(depth) in {"summary", "basic"}
         if self._mock:
             level, scores = self._fallback_score(transcript, metrics)
             result = AIPracticeResult(
@@ -1604,11 +1615,15 @@ class AIService:
                 rubrics=self._rubrics_from_scores(scores),
                 strengths=["질문에 맞춰 영어로 답변을 완성했습니다."],
                 improvements=["구체적인 이유와 예시를 한두 문장 더 연결해 보세요."],
-                correctedAnswer=None if summary else transcript.strip()[:900],
-                targetGap=f"현재 예상 {level.value}에서 목표 {target.value}에 맞는 세부 묘사를 보강하세요.",
+                correctedAnswer=None if strip_long else transcript.strip()[:900],
+                targetGap=(
+                    None
+                    if strip_long
+                    else f"현재 예상 {level.value}에서 목표 {target.value}에 맞는 세부 묘사를 보강하세요."
+                ),
                 sampleAnswer=(
                     None
-                    if summary
+                    if strip_long
                     else (
                         f"For this {question.topic} question, I would begin with a clear answer, "
                         "add a specific personal example, and finish by explaining why it matters to me."
@@ -1632,12 +1647,13 @@ class AIService:
                     "strong when detail, control, and organization are consistently effective; advanced only for sustained, precise, "
                     "well-organized language. Cite transcript or delivery evidence briefly in Korean and give one next action per rubric. "
                     "Use delivery metrics only for fluency, never claim phoneme-level pronunciation analysis. "
-                    "Return at most three concise strengths and improvements. correctedAnswer and sampleAnswer must be English "
+                    "Return at most three concise strengths and improvements. Do not grade below IL; "
+                    "if borderline between two bands, choose the higher one. correctedAnswer and sampleAnswer must be English "
                     "and no longer than five sentences; use null only when a useful optional detail cannot be produced."
                     + (
-                        " For this request set correctedAnswer and sampleAnswer to null "
-                        "(summary tier); still return all rubrics and one targetGap."
-                        if summary
+                        " For this request set correctedAnswer, sampleAnswer, and targetGap to null "
+                        "(limited tier); still return all rubrics, strengths, and improvements."
+                        if strip_long
                         else ""
                     )
                 ),
@@ -1648,11 +1664,14 @@ class AIService:
             result = structured.payload
         assert isinstance(result, AIPracticeResult)
         result_dump = result.model_dump(by_alias=True)
-        if summary:
-            # summary 티어는 교정/모범답안을 제공하지 않음(누락은 경고 대상 아님).
+        # 예상 등급 하한 IL 적용(IL~AL).
+        result_dump["predictedLevel"] = _clamp_min_level(result.predicted_level).value
+        if strip_long:
+            # 하위 티어는 교정/모범답안/목표갭을 제공하지 않음(누락은 경고 대상 아님).
             result_dump["correctedAnswer"] = None
             result_dump["sampleAnswer"] = None
-            warning_source = {"targetGap": result.target_gap}
+            result_dump["targetGap"] = None
+            warning_source = {}
         else:
             warning_source = {
                 "correctedAnswer": result.corrected_answer,
@@ -1733,7 +1752,7 @@ class AIService:
                     "understandable with connected support; strong when detailed control and organization are consistent; advanced "
                     "only for sustained, precise, flexible language. Use audio metrics only for fluency and delivery, not pronunciation. "
                     "Return compact Korean strengths, improvements, targetGap, and overallFeedback. Do not return per-question "
-                    "feedback or sample answers."
+                    "feedback or sample answers. Do not grade below IL; if borderline between two bands, choose the higher one."
                 ),
                 input_text=json.dumps(payload, ensure_ascii=False),
                 schema=AIMockResult,
@@ -1741,8 +1760,10 @@ class AIService:
             )
             result = structured.payload
         assert isinstance(result, AIMockResult)
+        mock_dump = result.model_dump(by_alias=True)
+        mock_dump["predictedLevel"] = _clamp_min_level(result.predicted_level).value
         return MockEvaluation(
-            **result.model_dump(by_alias=True),
+            **mock_dump,
             scores=self._scores_from_rubrics(result.rubrics),
             perQuestion=[],
             disclaimer=DISCLAIMER,

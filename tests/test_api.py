@@ -101,6 +101,7 @@ def test_practice_quota_and_reward_flow() -> None:
         assert health.status_code == 200
         assert health.json()["status"] == "ok"
 
+        # 토큰 모델: 초기 데일리 세트 생성 = 토큰 1개(무료는 하루 1세트).
         question_set = client.post(
             "/v1/question-sets/practice",
             headers=_headers(),
@@ -108,27 +109,38 @@ def test_practice_quota_and_reward_flow() -> None:
         ).json()
         assert "setToken" not in question_set
         assert [item["number"] for item in question_set["questions"]] == list(range(2, 16))
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 0  # 세트 1개 소진
+
         form = {
             "setId": question_set["setId"],
             "questionNumber": str(question_set["questions"][0]["number"]),
             "transcript": "I read several news sources every morning because I want balanced information.",
             "targetLevel": "IH",
         }
-        # 무료 플랜: 하루 데일리 학습 1회.
-        for _ in range(1):
+        # 세트 내 평가는 무제한 → 여러 번 200.
+        for _ in range(3):
             response = client.post(
                 "/v1/evaluations/practice",
                 headers=_headers(str(uuid.uuid4())),
                 data=form,
             )
             assert response.status_code == 200, response.text
+
+        refresh_payload = {
+            "targetLevel": "IH",
+            "background": {"interests": ["news"]},
+            "adjustment": "same",
+        }
+        # 새 세트(리프레시)는 토큰 필요 → 무료는 소진 상태라 402.
         blocked = client.post(
-            "/v1/evaluations/practice",
-            headers=_headers(str(uuid.uuid4())),
-            data=form,
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "free-refresh-blocked"},
+            json=refresh_payload,
         )
         assert blocked.status_code == 402
 
+        # 광고 보너스로 세트 토큰 1개 획득.
         reward = client.post(
             "/v1/ad-rewards/intents",
             headers=_headers(),
@@ -140,17 +152,17 @@ def test_practice_quota_and_reward_flow() -> None:
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["bonusRemaining"] == 1
 
-        response = client.post(
-            "/v1/evaluations/practice",
-            headers=_headers(str(uuid.uuid4())),
-            data=form,
+        refreshed = client.post(
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "free-refresh-ok"},
+            json=refresh_payload,
         )
-        assert response.status_code == 200, response.text
+        assert refreshed.status_code == 200, refreshed.text
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["bonusRemaining"] == 0
 
 
-def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota() -> None:
+def test_daily_pool_is_archived_and_refresh_consumes_a_token() -> None:
     with TestClient(app) as client:
         payload = {
             "initialLevel": 5,
@@ -174,9 +186,11 @@ def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota(
         assert [item["number"] for item in first_set["questions"]] == list(range(2, 16))
         assert all(item["examSection"] != "introduction" for item in first_set["questions"])
 
+        # 초기 세트가 토큰 1개 소진(무료 1세트).
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 1
+        assert usage["freeRemaining"] == 0
 
+        # 재요청은 같은 세트를 캐시 반환(토큰 미소모).
         archived = client.post(
             "/v1/question-sets/practice",
             headers=_headers(),
@@ -185,20 +199,25 @@ def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota(
         assert archived.status_code == 200, archived.text
         assert archived.json()["setId"] == first_set["setId"]
 
+        # 리프레시는 토큰 필요 → 무료 소진 상태라 402.
+        blocked = client.post(
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "daily-refresh-blocked"},
+            json={**payload, "adjustment": "harder"},
+        )
+        assert blocked.status_code == 402
+
+        # 광고 보너스 토큰 획득 후 리프레시 성공.
         refresh_reward = client.post(
             "/v1/ad-rewards/intents",
             headers=_headers(),
-            json={"purpose": "practice_refresh"},
+            json={"purpose": "practice_credits"},
         ).json()
         _verify_reward(client, refresh_reward["nonce"])
         refreshed = client.post(
             "/v1/question-sets/practice/refresh",
             headers={**_headers(), "Idempotency-Key": "daily-refresh-test-1"},
-            json={
-                **payload,
-                "adjustment": "harder",
-                "rewardNonce": refresh_reward["nonce"],
-            },
+            json={**payload, "adjustment": "harder"},
         )
         assert refreshed.status_code == 200, refreshed.text
         refreshed_set = refreshed.json()
@@ -207,8 +226,8 @@ def test_daily_pool_is_archived_and_refresh_uses_verified_ad_not_analysis_quota(
         assert [item["number"] for item in refreshed_set["questions"]] == list(range(2, 16))
 
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 1
-        assert usage["dailyRefreshRemaining"] == 0
+        assert usage["freeRemaining"] == 0
+        assert usage["bonusRemaining"] == 0
 
         response = client.post(
             "/v1/evaluations/practice",
@@ -546,11 +565,12 @@ def test_mock_session_v2_requires_three_verified_gates_and_resumes() -> None:
         )
         assert evaluated.status_code == 200, evaluated.text
         assert evaluated.json()["perQuestion"] == []
-        completed = client.get("/v1/mock-exams/current", headers=_headers()).json()
-        assert completed["stage"] == "completed"
+        # 완료 후에는 진행 중 세션이 없어 current는 404, 무료(1회)는 소진.
+        current_after = client.get("/v1/mock-exams/current", headers=_headers())
+        assert current_after.status_code == 404
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["mockAvailable"] is False
-        assert usage["mockSessionStage"] == "completed"
+        assert usage["mockRemaining"] == 0
 
 
 def test_daily_reward_intent_quota_returns_402() -> None:

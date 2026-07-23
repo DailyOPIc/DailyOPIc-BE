@@ -144,6 +144,20 @@ class StateStore(ABC):
     ) -> dict[str, Any] | None: ...
 
     @abstractmethod
+    async def get_active_mock_session(
+        self, *, uid: str, date_key: str
+    ) -> dict[str, Any] | None:
+        """오늘 진행 중(미완료) 모의고사 세션(없으면 None)."""
+        ...
+
+    @abstractmethod
+    async def count_completed_mock_sessions(
+        self, *, uid: str, date_key: str
+    ) -> int:
+        """오늘 완료된 모의고사 세션 수."""
+        ...
+
+    @abstractmethod
     async def transition_mock_session(
         self,
         *,
@@ -268,6 +282,11 @@ class StateStore(ABC):
     async def reserve_practice(
         self, uid: str, date_key: str, request_id: str, free_limit: int
     ) -> Reservation: ...
+
+    @abstractmethod
+    async def reserve_request(self, uid: str, request_id: str) -> Reservation:
+        """쿼터 미차감 요청 멱등 예약(토큰 모델에서 평가는 쿼터를 쓰지 않음)."""
+        ...
 
     @abstractmethod
     async def reserve_mock(
@@ -618,6 +637,31 @@ class InMemoryStateStore(StateStore):
                 and (date_key is None or value.get("date") == date_key)
             ]
             return deepcopy(matches[0]) if matches else None
+
+    async def get_active_mock_session(
+        self, *, uid: str, date_key: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            for value in self._mock_sessions.values():
+                if (
+                    value.get("uid") == uid
+                    and value.get("date") == date_key
+                    and value.get("stage") != "completed"
+                ):
+                    return deepcopy(value)
+            return None
+
+    async def count_completed_mock_sessions(
+        self, *, uid: str, date_key: str
+    ) -> int:
+        async with self._lock:
+            return sum(
+                1
+                for value in self._mock_sessions.values()
+                if value.get("uid") == uid
+                and value.get("date") == date_key
+                and value.get("stage") == "completed"
+            )
 
     async def transition_mock_session(
         self,
@@ -991,6 +1035,24 @@ class InMemoryStateStore(StateStore):
             }
             return Reservation("new", source=source)
 
+    async def reserve_request(self, uid: str, request_id: str) -> Reservation:
+        async with self._lock:
+            existing = self._requests.get(request_id)
+            if existing:
+                if existing["uid"] != uid:
+                    raise UsageLimitExceeded("idempotency key belongs to another user")
+                if existing["status"] == "completed":
+                    return Reservation("cached", result=deepcopy(existing["result"]))
+                if existing["status"] == "processing":
+                    raise RequestAlreadyProcessing("request is already processing")
+            self._requests[request_id] = {
+                "uid": uid,
+                "status": "processing",
+                "source": "none",
+                "createdAt": datetime.now(UTC),
+            }
+            return Reservation("new", source="none")
+
     async def reserve_mock(
         self,
         uid: str,
@@ -1253,6 +1315,40 @@ class FirestoreStateStore(StateStore):
                 query = query.where("date", "==", date_key)
             snapshot = next(iter(query.limit(1).stream()), None)
             return snapshot.to_dict() if snapshot else None
+
+        return await asyncio.to_thread(read)
+
+    async def get_active_mock_session(
+        self, *, uid: str, date_key: str
+    ) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            query = (
+                self._client.collection("mockSessions")
+                .where("uid", "==", uid)
+                .where("date", "==", date_key)
+            )
+            for snapshot in query.stream():
+                value = snapshot.to_dict() or {}
+                if value.get("stage") != "completed":
+                    return value
+            return None
+
+        return await asyncio.to_thread(read)
+
+    async def count_completed_mock_sessions(
+        self, *, uid: str, date_key: str
+    ) -> int:
+        def read() -> int:
+            query = (
+                self._client.collection("mockSessions")
+                .where("uid", "==", uid)
+                .where("date", "==", date_key)
+            )
+            return sum(
+                1
+                for snapshot in query.stream()
+                if (snapshot.to_dict() or {}).get("stage") == "completed"
+            )
 
         return await asyncio.to_thread(read)
 
@@ -1831,6 +1927,39 @@ class FirestoreStateStore(StateStore):
 
         async with self._transaction_locks.hold(f"practice:{usage_id}"):
             return await _run_with_firestore_contention_retry(run)
+
+    async def reserve_request(self, uid: str, request_id: str) -> Reservation:
+        def run() -> Reservation:
+            transaction = self._client.transaction(max_attempts=5)
+            request_ref = self._client.collection("aiRequests").document(request_id)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> Reservation:
+                existing = request_ref.get(transaction=transaction)
+                if existing.exists:
+                    data = existing.to_dict() or {}
+                    if data.get("uid") != uid:
+                        raise UsageLimitExceeded(
+                            "idempotency key belongs to another user"
+                        )
+                    if data.get("status") == "completed":
+                        return Reservation("cached", result=data.get("result"))
+                    if data.get("status") == "processing":
+                        raise RequestAlreadyProcessing("request is already processing")
+                transaction.set(
+                    request_ref,
+                    {
+                        "uid": uid,
+                        "status": "processing",
+                        "source": "none",
+                        "createdAt": datetime.now(UTC),
+                    },
+                )
+                return Reservation("new", source="none")
+
+            return apply(transaction)
+
+        return await _run_with_firestore_contention_retry(run)
 
     async def reserve_mock(
         self,

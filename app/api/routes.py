@@ -775,6 +775,33 @@ async def create_practice_set(
     )
     if reservation.status == "cached" and reservation.result:
         return QuestionSetResponse.model_validate(reservation.result)
+    # 토큰 모델: 하루 첫 데일리 세트 생성 시 토큰 1개 소모(세트당 소모).
+    plan = await _current_plan(request, user.uid)
+    limits = plans.limits_for(plan)
+    token_request_id = hashlib.sha256(
+        f"{user.uid}:daily_token:{date_key}".encode()
+    ).hexdigest()
+    try:
+        await request.app.state.state_store.reserve_practice(
+            user.uid, date_key, token_request_id, limits.practice_daily
+        )
+    except UsageLimitExceeded as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
+        ) from error
+    except RequestAlreadyProcessing as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "request_processing", "operationId": operation_id},
+            headers={"Retry-After": "2"},
+        ) from error
     try:
         response = await _create_daily_pool(
             request,
@@ -785,6 +812,11 @@ async def create_practice_set(
             date_key=date_key,
             set_id=free_set_id,
         )
+        await request.app.state.state_store.finalize_request(
+            token_request_id,
+            {"setId": response.set_id, "setHash": response.set_hash},
+            request.app.state.request_result_ttl_hours,
+        )
         await request.app.state.state_store.complete_operation(
             uid=user.uid,
             operation=operation,
@@ -794,6 +826,7 @@ async def create_practice_set(
         )
         return response
     except Exception:
+        await request.app.state.state_store.fail_request(token_request_id)
         await request.app.state.state_store.fail_operation(
             uid=user.uid,
             operation=operation,
@@ -895,15 +928,14 @@ async def refresh_practice_set(
     request_id = hashlib.sha256(
         f"{user.uid}:{operation}:{operation_id}".encode()
     ).hexdigest()
+    # 토큰 모델: 새 문제 세트(리프레시)를 받을 때 토큰 1개 소모(광고/리워드 아님).
+    plan = await _current_plan(request, user.uid)
+    limits = plans.limits_for(plan)
     try:
-        await request.app.state.state_store.reserve_mock(
-            user.uid,
-            request_id,
-            payload.reward_nonce,
-            None,
-            RewardPurpose.PRACTICE_REFRESH,
+        await request.app.state.state_store.reserve_practice(
+            user.uid, date_key, request_id, limits.practice_daily
         )
-    except RewardNotVerified as error:
+    except UsageLimitExceeded as error:
         await request.app.state.state_store.fail_operation(
             uid=user.uid,
             operation=operation,
@@ -912,7 +944,7 @@ async def refresh_practice_set(
         )
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"code": "practice_refresh_reward_required", "message": str(error)},
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
         ) from error
     except RequestAlreadyProcessing as error:
         raise HTTPException(
@@ -1030,18 +1062,46 @@ async def create_mock_session(
     )
     if reservation.status == "cached" and reservation.result:
         return MockSessionResponse.model_validate(reservation.result)
-    session_id = hashlib.sha256(f"{user.uid}:mock-session:{date_key}".encode()).hexdigest()
-    session_hash = hashlib.sha256(f"{session_id}:reward-gates".encode()).hexdigest()
-    record = await request.app.state.state_store.create_or_get_mock_session(
-        uid=user.uid,
-        session_id=session_id,
-        session_hash=session_hash,
-        date_key=date_key,
-        initial_level=initial_level,
-        background=payload.background.model_dump(mode="json"),
-        survey=payload.survey.model_dump(mode="json") if payload.survey else None,
-        resets_at=_next_reset(),
+    # 플랜별 하루 N회: 진행 중 세션이 있으면 이어서, 없으면 완료 수 < 한도일 때만 새 회차 생성.
+    mock_daily = plans.limits_for(await _current_plan(request, user.uid)).mock_daily
+    active = await request.app.state.state_store.get_active_mock_session(
+        uid=user.uid, date_key=date_key
     )
+    if active is not None:
+        record = active
+    else:
+        completed = await request.app.state.state_store.count_completed_mock_sessions(
+            uid=user.uid, date_key=date_key
+        )
+        if completed >= mock_daily:
+            await request.app.state.state_store.fail_operation(
+                uid=user.uid,
+                operation="mock_session_create",
+                operation_id=operation_id,
+                retryable=False,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "mock_limit_reached",
+                    "message": "오늘 사용할 수 있는 모의고사를 모두 사용했어요.",
+                },
+            )
+        attempt = completed
+        session_id = hashlib.sha256(
+            f"{user.uid}:mock-session:{date_key}:{attempt}".encode()
+        ).hexdigest()
+        session_hash = hashlib.sha256(f"{session_id}:reward-gates".encode()).hexdigest()
+        record = await request.app.state.state_store.create_or_get_mock_session(
+            uid=user.uid,
+            session_id=session_id,
+            session_hash=session_hash,
+            date_key=date_key,
+            initial_level=initial_level,
+            background=payload.background.model_dump(mode="json"),
+            survey=payload.survey.model_dump(mode="json") if payload.survey else None,
+            resets_at=_next_reset(),
+        )
     response = await _mock_session_response(request, user, record)
     await request.app.state.state_store.complete_operation(
         uid=user.uid,
@@ -1058,7 +1118,7 @@ async def current_mock_session(
     request: Request,
     user: Annotated[CurrentUser, Depends(current_user)],
 ) -> MockSessionResponse:
-    record = await request.app.state.state_store.get_mock_session(
+    record = await request.app.state.state_store.get_active_mock_session(
         uid=user.uid,
         date_key=_date_key(),
     )
@@ -1609,10 +1669,15 @@ async def usage(
     bonus_remaining = max(0, int(value.get("bonusRemaining", 0)))
     refresh_max = plans.reward_max_for(plan, RewardPurpose.PRACTICE_REFRESH)
     resets_at = _next_reset()
-    mock_session = await request.app.state.state_store.get_mock_session(
-        uid=user.uid,
-        date_key=date_key,
+    active_mock = await request.app.state.state_store.get_active_mock_session(
+        uid=user.uid, date_key=date_key
     )
+    completed_mock = await request.app.state.state_store.count_completed_mock_sessions(
+        uid=user.uid, date_key=date_key
+    )
+    mock_remaining = max(0, limits.mock_daily - completed_mock)
+    # 진행 중 세션이 있거나, 완료 수가 한도 미만이면 응시 가능.
+    mock_available = active_mock is not None or mock_remaining > 0
     return UsageResponse(
         date=date_key,
         freeRemaining=free_remaining,
@@ -1625,8 +1690,9 @@ async def usage(
             0,
             refresh_max - int(value.get("practiceRefreshRewardCount", 0)),
         ),
-        mockAvailable=mock_session is None,
-        mockSessionStage=(str(mock_session["stage"]) if mock_session else None),
+        mockAvailable=mock_available,
+        mockRemaining=mock_remaining,
+        mockSessionStage=(str(active_mock["stage"]) if active_mock else None),
     )
 
 
@@ -1881,15 +1947,12 @@ async def evaluate_practice(
 
     plan = await _current_plan(request, user.uid)
     limits = plans.limits_for(plan)
+    # 토큰 모델: 토큰은 "새 문제 세트"를 받을 때 소모되고, 세트 내 평가는 무제한이다.
+    # 따라서 평가는 쿼터를 차감하지 않고 요청 멱등성만 확보한다.
     try:
-        reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, _date_key(), request_id, limits.practice_daily
+        reservation = await request.app.state.state_store.reserve_request(
+            user.uid, request_id
         )
-    except UsageLimitExceeded as error:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"code": "practice_quota_exhausted", "message": str(error)},
-        ) from error
     except RequestAlreadyProcessing as error:
         raise HTTPException(status_code=409, detail={"code": "request_processing"}) from error
 
