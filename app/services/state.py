@@ -152,9 +152,9 @@ class StateStore(ABC):
 
     @abstractmethod
     async def count_completed_mock_sessions(
-        self, *, uid: str, date_key: str
+        self, *, uid: str, date_key: str | None = None
     ) -> int:
-        """오늘 완료된 모의고사 세션 수."""
+        """완료된 모의고사 세션 수. date_key=None이면 전체 기간(무료 평생 체험 판정용)."""
         ...
 
     @abstractmethod
@@ -404,6 +404,7 @@ def _usage_defaults() -> dict[str, int]:
         "practiceCreditRewardCount": 0,
         "practiceRefreshRewardCount": 0,
         "mockRewardCount": 0,
+        "targetLevelChangeRewardCount": 0,
     }
 
 
@@ -473,6 +474,8 @@ def _reward_count_key(purpose: RewardPurpose) -> str | None:
         RewardPurpose.MOCK_RESULT,
     }:
         return "mockRewardCount"
+    if purpose is RewardPurpose.TARGET_LEVEL_CHANGE:
+        return "targetLevelChangeRewardCount"
     return None
 
 
@@ -652,14 +655,14 @@ class InMemoryStateStore(StateStore):
             return None
 
     async def count_completed_mock_sessions(
-        self, *, uid: str, date_key: str
+        self, *, uid: str, date_key: str | None = None
     ) -> int:
         async with self._lock:
             return sum(
                 1
                 for value in self._mock_sessions.values()
                 if value.get("uid") == uid
-                and value.get("date") == date_key
+                and (date_key is None or value.get("date") == date_key)
                 and value.get("stage") == "completed"
             )
 
@@ -1336,14 +1339,12 @@ class FirestoreStateStore(StateStore):
         return await asyncio.to_thread(read)
 
     async def count_completed_mock_sessions(
-        self, *, uid: str, date_key: str
+        self, *, uid: str, date_key: str | None = None
     ) -> int:
         def read() -> int:
-            query = (
-                self._client.collection("mockSessions")
-                .where("uid", "==", uid)
-                .where("date", "==", date_key)
-            )
+            query = self._client.collection("mockSessions").where("uid", "==", uid)
+            if date_key is not None:
+                query = query.where("date", "==", date_key)
             return sum(
                 1
                 for snapshot in query.stream()

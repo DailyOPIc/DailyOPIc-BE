@@ -271,6 +271,45 @@ def test_basic_plan_gets_three_daily_sets() -> None:
         assert blocked.json()["detail"]["code"] == "practice_quota_exhausted"
 
 
+def test_target_level_change_limited_to_once_per_day() -> None:
+    with TestClient(app) as client:
+        # 최초 설정은 리워드 불필요.
+        first = client.put(
+            "/v1/users/me/target-level", headers=_headers(), json={"targetLevel": "IH"}
+        )
+        assert first.status_code == 200, first.text
+
+        # 변경은 리워드 필요.
+        blocked = client.put(
+            "/v1/users/me/target-level", headers=_headers(), json={"targetLevel": "AL"}
+        )
+        assert blocked.status_code == 402
+
+        # 1회차: 리워드 발급·검증 후 변경 성공.
+        reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "target_level_change"},
+        )
+        assert reward.status_code == 200, reward.text
+        _verify_reward(client, reward.json()["nonce"])
+        changed = client.put(
+            "/v1/users/me/target-level",
+            headers=_headers(),
+            json={"targetLevel": "AL", "rewardNonce": reward.json()["nonce"]},
+        )
+        assert changed.status_code == 200, changed.text
+
+        # 같은 날 2회차: 난이도 변경 리워드는 하루 1회 → 402.
+        second = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "target_level_change"},
+        )
+        assert second.status_code == 402
+        assert second.json()["detail"]["code"] == "reward_quota_exhausted"
+
+
 def test_mock_remaining_reflects_plan() -> None:
     with TestClient(app) as client:
         # 무료: 하루 1회.
