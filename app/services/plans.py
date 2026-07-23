@@ -51,6 +51,7 @@ class PlanLimits:
     refresh_ad_bonus: int  # 광고로 얻는 문제 리프레시 횟수
     mock_daily: int  # 하루 모의고사 횟수
     mock_requires_ad: bool  # 모의고사 광고 게이트 필요 여부(무료만 True)
+    mock_is_trial: bool  # True면 mock_daily가 '평생 1회 체험'을 의미(무료)
     history_days: int | None  # 학습 기록 열람 범위(None = 전체)
     analysis_depth: AnalysisDepth
     grade_trend: FeatureTier  # 예상 등급 추이
@@ -71,6 +72,7 @@ PLAN_LIMITS: dict[Plan, PlanLimits] = {
         refresh_ad_bonus=1,
         mock_daily=1,
         mock_requires_ad=True,
+        mock_is_trial=True,
         history_days=7,
         analysis_depth=AnalysisDepth.SUMMARY,
         grade_trend=FeatureTier.LIMITED,
@@ -85,8 +87,9 @@ PLAN_LIMITS: dict[Plan, PlanLimits] = {
         practice_daily=3,
         practice_ad_bonus=0,
         refresh_ad_bonus=10,
-        mock_daily=2,
+        mock_daily=1,
         mock_requires_ad=False,
+        mock_is_trial=False,
         history_days=30,
         analysis_depth=AnalysisDepth.BASIC,
         grade_trend=FeatureTier.BASIC,
@@ -103,6 +106,7 @@ PLAN_LIMITS: dict[Plan, PlanLimits] = {
         refresh_ad_bonus=20,
         mock_daily=3,
         mock_requires_ad=False,
+        mock_is_trial=False,
         history_days=30,
         analysis_depth=AnalysisDepth.DETAILED,
         grade_trend=FeatureTier.BASIC,
@@ -119,6 +123,7 @@ PLAN_LIMITS: dict[Plan, PlanLimits] = {
         refresh_ad_bonus=30,
         mock_daily=5,
         mock_requires_ad=False,
+        mock_is_trial=False,
         history_days=None,
         analysis_depth=AnalysisDepth.FOCUS,
         grade_trend=FeatureTier.DETAILED,
@@ -168,12 +173,14 @@ def reward_auto_verify(plan: Plan | str | None, purpose: RewardPurpose) -> bool:
     resolved = Plan(plan) if plan is not None else Plan.FREE
     if resolved is Plan.FREE:
         return False
-    # 유료 플랜: 모의고사 게이트 + 문제 리프레시를 광고 없이 즉시 통과.
+    # 유료 플랜: 모의고사 게이트 + 문제 리프레시 + 난이도(목표 등급) 변경을
+    # 광고 없이 즉시 통과.
     return purpose in {
         RewardPurpose.MOCK_START,
         RewardPurpose.MOCK_ADJUSTMENT,
         RewardPurpose.MOCK_RESULT,
         RewardPurpose.PRACTICE_REFRESH,
+        RewardPurpose.TARGET_LEVEL_CHANGE,
     }
 
 
@@ -182,7 +189,7 @@ def reward_max_for(plan: Plan | str | None, purpose: RewardPurpose) -> int:
 
     - 모의고사 게이트: 하루 1회 모의고사에 필요한 3게이트(무료는 광고, 유료는 auto-verify).
     - 데일리 광고 보너스/리프레시: 무료만 허용, 유료는 0(광고 없음).
-    - 목표 등급 변경: 카운트 대상 아님(무제한 취급, 상한만 넉넉히).
+    - 목표 등급(난이도) 변경: 전 플랜 하루 1회(무료 광고, 유료 auto-verify).
     """
     resolved = Plan(plan) if plan is not None else Plan.FREE
     limits = PLAN_LIMITS[resolved]
@@ -197,5 +204,5 @@ def reward_max_for(plan: Plan | str | None, purpose: RewardPurpose) -> int:
     if purpose is RewardPurpose.PRACTICE_REFRESH:
         return limits.refresh_ad_bonus
     if purpose is RewardPurpose.TARGET_LEVEL_CHANGE:
-        return 99
+        return 1
     return 0

@@ -1062,18 +1062,26 @@ async def create_mock_session(
     )
     if reservation.status == "cached" and reservation.result:
         return MockSessionResponse.model_validate(reservation.result)
-    # 플랜별 하루 N회: 진행 중 세션이 있으면 이어서, 없으면 완료 수 < 한도일 때만 새 회차 생성.
-    mock_daily = plans.limits_for(await _current_plan(request, user.uid)).mock_daily
+    # 진행 중 세션이 있으면 이어서, 없으면 한도 미만일 때만 새 회차 생성.
+    # 무료는 평생 1회 체험(전체 기간), 유료는 하루 N회.
+    limits = plans.limits_for(await _current_plan(request, user.uid))
     active = await request.app.state.state_store.get_active_mock_session(
         uid=user.uid, date_key=date_key
     )
     if active is not None:
         record = active
     else:
-        completed = await request.app.state.state_store.count_completed_mock_sessions(
-            uid=user.uid, date_key=date_key
-        )
-        if completed >= mock_daily:
+        if limits.mock_is_trial:
+            completed = await request.app.state.state_store.count_completed_mock_sessions(
+                uid=user.uid
+            )
+            limit = 1
+        else:
+            completed = await request.app.state.state_store.count_completed_mock_sessions(
+                uid=user.uid, date_key=date_key
+            )
+            limit = limits.mock_daily
+        if completed >= limit:
             await request.app.state.state_store.fail_operation(
                 uid=user.uid,
                 operation="mock_session_create",
@@ -1084,10 +1092,15 @@ async def create_mock_session(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail={
                     "code": "mock_limit_reached",
-                    "message": "오늘 사용할 수 있는 모의고사를 모두 사용했어요.",
+                    "message": (
+                        "무료 체험 모의고사를 이미 사용했어요. 업그레이드하면 매일 응시할 수 있어요."
+                        if limits.mock_is_trial
+                        else "오늘 사용할 수 있는 모의고사를 모두 사용했어요."
+                    ),
                 },
             )
-        attempt = completed
+        # 무료 체험은 회차 인덱스가 항상 0(평생 1회), 유료는 오늘 완료 수를 인덱스로.
+        attempt = 0 if limits.mock_is_trial else completed
         session_id = hashlib.sha256(
             f"{user.uid}:mock-session:{date_key}:{attempt}".encode()
         ).hexdigest()
@@ -1672,11 +1685,22 @@ async def usage(
     active_mock = await request.app.state.state_store.get_active_mock_session(
         uid=user.uid, date_key=date_key
     )
-    completed_mock = await request.app.state.state_store.count_completed_mock_sessions(
-        uid=user.uid, date_key=date_key
-    )
-    mock_remaining = max(0, limits.mock_daily - completed_mock)
-    # 진행 중 세션이 있거나, 완료 수가 한도 미만이면 응시 가능.
+    if limits.mock_is_trial:
+        # 무료: 평생 최초 1회 체험(전체 기간 완료 수 기준).
+        completed_all_time = (
+            await request.app.state.state_store.count_completed_mock_sessions(
+                uid=user.uid
+            )
+        )
+        mock_remaining = max(0, 1 - completed_all_time)
+    else:
+        completed_today = (
+            await request.app.state.state_store.count_completed_mock_sessions(
+                uid=user.uid, date_key=date_key
+            )
+        )
+        mock_remaining = max(0, limits.mock_daily - completed_today)
+    # 진행 중 세션이 있거나, 남은 횟수가 있으면 응시 가능.
     mock_available = active_mock is not None or mock_remaining > 0
     return UsageResponse(
         date=date_key,
