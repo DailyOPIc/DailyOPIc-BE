@@ -6,6 +6,17 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+def _normalize_enum_input(value: str) -> str:
+    """Enum alias 입력값 정규화: strip → lowercase → 특수문자 정리
+
+    예:
+      "past-experience" → "past_experience"
+      "Problem Solving" → "problem_solving"
+      "  descriptive  " → "descriptive"
+    """
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
 class OPIcLevel(StrEnum):
     NL = "NL"
     NM = "NM"
@@ -35,9 +46,12 @@ class DifficultyAdjustment(StrEnum):
 
     @classmethod
     def _missing_(cls, value: object) -> "DifficultyAdjustment | None":
-        if isinstance(value, str) and value.strip().lower() == "similar":
-            return cls.SAME
-        return None
+        if not isinstance(value, str):
+            return None
+        # alias 매핑: "similar" → SAME
+        aliases = {"similar": cls.SAME}
+        normalized = _normalize_enum_input(value)
+        return aliases.get(normalized)
 
 
 class QuestionSetStatus(StrEnum):
@@ -58,7 +72,9 @@ class QuestionStyle(StrEnum):
     def _missing_(cls, value: object) -> "QuestionStyle | None":
         if not isinstance(value, str):
             return None
-        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        # 정규화: strip → lowercase → 특수문자 정리
+        normalized = _normalize_enum_input(value)
+        # alias 매핑: underscore 제거 후 검색
         aliases = {
             "descriptive": cls.DESCRIPTION,
             "pastexperience": cls.PAST_EXPERIENCE,
