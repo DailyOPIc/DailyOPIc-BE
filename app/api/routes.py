@@ -164,8 +164,11 @@ def _uid_hash(uid: str) -> str:
     return hashlib.sha256(uid.encode()).hexdigest()[:12]
 
 
-def _daily_free_set_id(uid: str, date_key: str) -> str:
-    return hashlib.sha256(f"{uid}:practice:{date_key}:free".encode()).hexdigest()
+def _daily_free_set_id(uid: str, date_key: str, level: int) -> str:
+    # 난이도(level)를 키에 포함해, 목표 등급을 바꾸면 새 레벨의 세트가 생성되도록 한다.
+    return hashlib.sha256(
+        f"{uid}:practice:{date_key}:free:{level}".encode()
+    ).hexdigest()
 
 
 def _stable_json(value: dict[str, object] | None) -> str:
@@ -751,7 +754,8 @@ async def create_practice_set(
 ) -> QuestionSetResponse:
     date_key = _date_key()
     initial_level = _request_initial_level(payload)
-    free_set_id = _daily_free_set_id(user.uid, date_key)
+    # 난이도별 세트 id/operation → 목표 등급 변경 시 이전 문제 대신 새 레벨 문제 생성.
+    free_set_id = _daily_free_set_id(user.uid, date_key, initial_level)
     existing = await request.app.state.state_store.get_question_set(
         uid=user.uid,
         set_id=free_set_id,
@@ -765,7 +769,7 @@ async def create_practice_set(
             model_version=request.app.state.ai_service.model,
         )
     operation = "daily_free_generation"
-    operation_id = f"daily-{date_key}"
+    operation_id = f"daily-{date_key}-{initial_level}"
     reservation = await _reserve_operation(
         request,
         user,
