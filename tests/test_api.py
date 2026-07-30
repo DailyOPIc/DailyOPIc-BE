@@ -837,3 +837,57 @@ def test_idempotent_cache_reuse_is_safe() -> None:
         assert second.json() == first.json()
         assert "type" not in second.json()
         assert "questionType" not in second.json()
+
+
+def test_capabilities_endpoint_returns_plan_and_quota_policy() -> None:
+    """capabilities 엔드포인트가 plans.py의 한도값을 정확하게 반환."""
+    with TestClient(app) as client:
+        response = client.get("/v1/capabilities", headers=_headers())
+
+    assert response.status_code == 200
+    data = response.json()
+
+    # 플랜이 반환됨
+    assert "plan" in data
+    assert data["plan"] in ["free", "basic", "plus", "pro"]
+
+    # quotaPolicy가 반환됨 (plans.limits_for() + plans.reward_max_for() 호출)
+    assert "quotaPolicy" in data
+    policy = data["quotaPolicy"]
+
+    # FREE 플랜 기본값 (기본값은 entitlement 없으면 FREE)
+    assert policy["practiceDaily"] == 1
+    assert policy["mockSessionsPerDay"] == 1
+    assert policy["practiceAdBonus"] == 1
+    assert policy["dailyRefreshRewards"] == 1
+    assert policy["analysisDepth"] == "summary"
+    assert policy["adsEnabled"] is True
+
+
+def test_capabilities_endpoint_plan_quota_fields_present() -> None:
+    """quotaPolicy에 모든 필드가 포함됨."""
+    with TestClient(app) as client:
+        response = client.get("/v1/capabilities", headers=_headers())
+
+    assert response.status_code == 200
+    policy = response.json()["quotaPolicy"]
+
+    # plans.limits_for() 에서 매핑되는 모든 필드 확인
+    required_fields = [
+        "practiceDaily",
+        "practiceAdBonus",
+        "dailyAnalysisFree",
+        "dailyRefreshRewards",
+        "mockSessionsPerDay",
+        "mockRewardGates",
+        "historyDays",
+        "analysisDepth",
+        "gradeTrend",
+        "weaknessAnalysis",
+        "reviewSet",
+        "weeklyReport",
+        "mockComparison",
+        "adsEnabled",
+    ]
+    for field in required_fields:
+        assert field in policy, f"Missing field in quotaPolicy: {field}"
