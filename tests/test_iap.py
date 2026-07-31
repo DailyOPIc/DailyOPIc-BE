@@ -153,6 +153,34 @@ def test_expiration_downgrades_to_free() -> None:
         assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
 
 
+def test_promotional_grant_activates_pro_until_expiration() -> None:
+    with TestClient(app) as client:
+        grant = _purchase_event(
+            "pro",
+            event_id="promo-pro-1",
+            event_type="NON_RENEWING_PURCHASE",
+        )
+        grant["store"] = "PROMOTIONAL"
+        grant["period_type"] = "PROMOTIONAL"
+
+        response = _post_webhook(client, grant)
+        assert response.status_code == 200
+        assert response.json()["plan"] == "pro"
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+
+        expiration = {
+            "type": "EXPIRATION",
+            "id": "promo-pro-1-expiration",
+            "app_user_id": USER_ID,
+            "entitlement_ids": ["pro"],
+            "product_id": "rc_promo_pro",
+            "store": "PROMOTIONAL",
+            "period_type": "PROMOTIONAL",
+        }
+        assert _post_webhook(client, expiration).status_code == 200
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
+
+
 def test_cancellation_keeps_access_until_expiry() -> None:
     """자동갱신 해지(CANCELLATION)는 즉시 강등하지 않고 만료일까지 권한 유지."""
     with TestClient(app) as client:
