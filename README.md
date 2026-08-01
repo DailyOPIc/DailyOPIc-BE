@@ -34,6 +34,7 @@ pytest
 MOCK_AI=true
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.4-mini-2026-03-17
+REVENUECAT_SECRET_API_KEY=
 
 FIREBASE_PROJECT_ID=opicmobile-45cd5
 ADMOB_REWARDED_AD_UNIT_ID=ca-app-pub-5460686409666356/7091483531
@@ -50,7 +51,9 @@ MAX_DAILY_REWARD_COUNT=3
 
 ## 운영 설정
 
-운영도 같은 환경변수 구조를 사용합니다. Secret Manager로 주입해야 하는 값은 `OPENAI_API_KEY`뿐입니다.
+운영도 같은 환경변수 구조를 사용합니다. `OPENAI_API_KEY`와
+`REVENUECAT_SECRET_API_KEY`는 반드시 Secret Manager로 주입하고 소스, 이미지,
+GitHub Actions 평문 환경변수에 저장하지 않습니다.
 
 ```env
 MOCK_AI=false
@@ -61,6 +64,33 @@ FREE_PRACTICE_LIMIT=3
 REWARD_PRACTICE_CREDITS=1
 MAX_DAILY_REWARD_COUNT=3
 ```
+
+RevenueCat Secret API Key를 Cloud Run에 연결할 때는 키를 명령행 인자로
+넘기지 않고 Secret Manager의 표준 입력으로 새 버전을 추가합니다.
+
+```bash
+gcloud secrets create revenuecat-secret-api-key \
+  --replication-policy=automatic \
+  --project "$PROJECT_ID"
+
+gcloud secrets versions add revenuecat-secret-api-key \
+  --data-file=- \
+  --project "$PROJECT_ID"
+
+gcloud secrets add-iam-policy-binding revenuecat-secret-api-key \
+  --member "serviceAccount:${RUNTIME_SA}" \
+  --role roles/secretmanager.secretAccessor \
+  --project "$PROJECT_ID"
+
+gcloud run services update "$SERVICE" \
+  --region "$REGION" \
+  --project "$PROJECT_ID" \
+  --update-secrets=REVENUECAT_SECRET_API_KEY=revenuecat-secret-api-key:latest
+```
+
+이미 secret이 있는 경우 `gcloud secrets create` 단계는 생략합니다. 서버에
+키가 없거나 RevenueCat API 조회가 실패하면 웹훅은 2xx를 반환하지
+않으며, 기존 사용자 플랜은 보존됩니다.
 
 iOS 번들 ID `com.mark.opicmobile`에 대해 Firebase App Check/App Attest를 활성화해야 합니다. Cloud Run 서비스 계정에는 Firestore 접근 권한이 필요합니다. 서비스 계정 JSON 파일은 레포지토리에 저장하지 않습니다.
 
@@ -154,7 +184,8 @@ Cloud Run runtime service account에는 운영 실행 권한이 별도로 필요
 
 - Firestore 접근: `roles/datastore.user`
 - Firebase ID 토큰 폐기 여부 확인: `roles/firebaseauth.viewer` (`firebaseauth.users.get`)
-- Secret Manager에서 `OPENAI_API_KEY`를 주입하는 경우 해당 secret에 `roles/secretmanager.secretAccessor`
+- Secret Manager에서 `OPENAI_API_KEY` 또는 `REVENUECAT_SECRET_API_KEY`를 주입하는
+  경우 각 secret에 `roles/secretmanager.secretAccessor`
 
 Workload Identity Federation으로 전환할 때는 아래 API도 활성화합니다.
 
@@ -304,6 +335,7 @@ firebase emulators:exec --only firestore \
 - 개발/시뮬레이터용 App Check debug token을 Firebase Console에 등록
 - Cloud Run 서비스 계정에 Firestore 접근 권한이 있는지 확인
 - `OPENAI_API_KEY`를 Secret Manager로 연결
+- `REVENUECAT_SECRET_API_KEY`를 Secret Manager로 연결
 - 서버에는 `ADMOB_REWARDED_AD_UNIT_ID=ca-app-pub-5460686409666356/7091483531`만 설정
 - AdMob SSV callback URL은 public HTTPS `https://<cloud-run-host>/v1/admob/ssv` 또는 개발용 HTTPS 터널로 설정
 - Firestore TTL을 `questionSets`, `aiRequests`, `adRewardIntents`의 `expiresAt`에 설정

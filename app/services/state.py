@@ -345,8 +345,20 @@ class StateStore(ABC):
     ) -> None: ...
 
     @abstractmethod
-    async def record_iap_event(self, event_id: str, uid: str) -> bool:
-        """웹훅 이벤트 멱등 기록. 신규면 True, 이미 처리된 이벤트면 False."""
+    async def is_iap_event_completed(self, event_id: str) -> bool: ...
+
+    @abstractmethod
+    async def complete_iap_sync(
+        self,
+        *,
+        event_id: str,
+        uid: str,
+        entitlement: dict[str, Any],
+    ) -> bool:
+        """사용자 상태와 이벤트 completed 마커를 함께 저장한다.
+
+        신규 완료면 True, 이미 완료된 이벤트면 False.
+        """
         ...
 
 
@@ -571,7 +583,7 @@ class InMemoryStateStore(StateStore):
         self._operations: dict[str, dict[str, Any]] = {}
         self._mock_sessions: dict[str, dict[str, Any]] = {}
         self._entitlements: dict[str, dict[str, Any]] = {}
-        self._iap_events: dict[str, str] = {}
+        self._iap_events: dict[str, dict[str, Any]] = {}
 
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None:
         async with self._lock:
@@ -582,11 +594,38 @@ class InMemoryStateStore(StateStore):
         async with self._lock:
             self._entitlements[uid] = {**deepcopy(entitlement), "uid": uid}
 
-    async def record_iap_event(self, event_id: str, uid: str) -> bool:
+    async def is_iap_event_completed(self, event_id: str) -> bool:
+        async with self._lock:
+            return event_id in self._iap_events
+
+    async def complete_iap_sync(
+        self,
+        *,
+        event_id: str,
+        uid: str,
+        entitlement: dict[str, Any],
+    ) -> bool:
         async with self._lock:
             if event_id in self._iap_events:
                 return False
-            self._iap_events[event_id] = uid
+
+            incoming_sync_at = _coerce_datetime(
+                entitlement.get("revenueCatRequestDate")
+            )
+            if incoming_sync_at is None:
+                raise ValueError("revenueCatRequestDate is required")
+            existing = self._entitlements.get(uid)
+            existing_sync_at = _coerce_datetime(
+                (existing or {}).get("revenueCatRequestDate")
+            )
+            if existing_sync_at is None or incoming_sync_at >= existing_sync_at:
+                self._entitlements[uid] = {**deepcopy(entitlement), "uid": uid}
+
+            self._iap_events[event_id] = {
+                "uid": uid,
+                "status": "completed",
+                "completedAt": datetime.now(UTC),
+            }
             return True
 
     async def create_or_get_mock_session(
@@ -1680,19 +1719,65 @@ class FirestoreStateStore(StateStore):
 
         await asyncio.to_thread(write)
 
-    async def record_iap_event(self, event_id: str, uid: str) -> bool:
+    async def is_iap_event_completed(self, event_id: str) -> bool:
+        def read() -> bool:
+            return (
+                self._client.collection("iapEvents")
+                .document(event_id)
+                .get()
+                .exists
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def complete_iap_sync(
+        self,
+        *,
+        event_id: str,
+        uid: str,
+        entitlement: dict[str, Any],
+    ) -> bool:
         def run() -> bool:
             transaction = self._client.transaction(max_attempts=5)
             event_ref = self._client.collection("iapEvents").document(event_id)
+            profile_ref = self._client.collection("userProfiles").document(uid)
 
             @firestore.transactional
             def apply(transaction: firestore.Transaction) -> bool:
-                snapshot = event_ref.get(transaction=transaction)
-                if snapshot.exists:
+                event_snapshot = event_ref.get(transaction=transaction)
+                if event_snapshot.exists:
                     return False
+
+                incoming_sync_at = _coerce_datetime(
+                    entitlement.get("revenueCatRequestDate")
+                )
+                if incoming_sync_at is None:
+                    raise ValueError("revenueCatRequestDate is required")
+                profile_snapshot = profile_ref.get(transaction=transaction)
+                profile = profile_snapshot.to_dict() if profile_snapshot.exists else {}
+                existing = (profile or {}).get("entitlement") or {}
+                existing_sync_at = _coerce_datetime(
+                    existing.get("revenueCatRequestDate")
+                )
+
+                now = datetime.now(UTC)
+                if existing_sync_at is None or incoming_sync_at >= existing_sync_at:
+                    transaction.set(
+                        profile_ref,
+                        {
+                            "uid": uid,
+                            "entitlement": entitlement,
+                            "updatedAt": now,
+                        },
+                        merge=True,
+                    )
                 transaction.set(
                     event_ref,
-                    {"uid": uid, "createdAt": datetime.now(UTC)},
+                    {
+                        "uid": uid,
+                        "status": "completed",
+                        "completedAt": now,
+                    },
                 )
                 return True
 

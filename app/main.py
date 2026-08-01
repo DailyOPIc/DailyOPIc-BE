@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI
 from pydantic import TypeAdapter
 
@@ -15,6 +16,7 @@ from app.services.ai import AIService
 from app.services.audio import AudioMetricsService
 from app.services.auth import AuthService
 from app.services.questions import QuestionPatternRepository
+from app.services.revenuecat import RevenueCatClient
 from app.services.state import FirestoreStateStore
 from app.services.telemetry import RequestTimer, emit, stable_hash
 from app.services.rate_limit import (
@@ -60,7 +62,12 @@ async def lifespan(app: FastAPI):
     )
     app.state.level_adapter = TypeAdapter(OPIcLevel)
     app.state.rate_limiter = SlidingWindowRateLimiter()
-    yield
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as http_client:
+        app.state.revenuecat = RevenueCatClient(
+            secret_api_key=settings.revenuecat_secret_api_key,
+            http_client=http_client,
+        )
+        yield
 
 
 app = FastAPI(
