@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from app.main import app
 from app.services.admob import VerifiedReward
+from app.services.revenuecat import (
+    RevenueCatAPIError,
+    RevenueCatClient,
+    RevenueCatCustomerInfo,
+)
 
 
 USER_ID = "22222222-2222-4222-8222-222222222222"
@@ -48,7 +57,67 @@ def _purchase_event(
     }
 
 
-def _post_webhook(client: TestClient, event: dict, *, secret: str = WEBHOOK_SECRET):
+class _FakeRevenueCatClient:
+    def __init__(
+        self,
+        customer_info: RevenueCatCustomerInfo | None = None,
+        error: RevenueCatAPIError | None = None,
+    ) -> None:
+        self.customer_info = customer_info
+        self.error = error
+        self.calls: list[str] = []
+
+    async def get_customer_info(self, app_user_id: str) -> RevenueCatCustomerInfo:
+        self.calls.append(app_user_id)
+        if self.error is not None:
+            raise self.error
+        assert self.customer_info is not None
+        return self.customer_info
+
+
+def _customer_info(
+    entitlement_ids: list[str],
+    *,
+    request_date: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> RevenueCatCustomerInfo:
+    requested_at = request_date or datetime.now(UTC)
+    expiration = expires_at or requested_at + timedelta(days=30)
+    return RevenueCatCustomerInfo(
+        request_date=requested_at,
+        active_entitlements={identifier: expiration for identifier in entitlement_ids},
+    )
+
+
+def _default_customer_info(event: dict[str, Any]) -> RevenueCatCustomerInfo:
+    now = datetime.now(UTC)
+    if str(event.get("type") or "").upper() in {"EXPIRATION", "REFUND"}:
+        return _customer_info([], request_date=now)
+    expiration_ms = event.get("expiration_at_ms")
+    if expiration_ms is not None:
+        expiration = datetime.fromtimestamp(expiration_ms / 1000, tz=UTC)
+        if expiration <= now:
+            return _customer_info([], request_date=now)
+    else:
+        expiration = now + timedelta(days=30)
+    return _customer_info(
+        list(event.get("entitlement_ids") or []),
+        request_date=now,
+        expires_at=expiration,
+    )
+
+
+def _post_webhook(
+    client: TestClient,
+    event: dict,
+    *,
+    secret: str = WEBHOOK_SECRET,
+    customer_info: RevenueCatCustomerInfo | None = None,
+    revenuecat: _FakeRevenueCatClient | None = None,
+):
+    client.app.state.revenuecat = revenuecat or _FakeRevenueCatClient(
+        customer_info or _default_customer_info(event)
+    )
     return client.post(
         "/v1/iap/revenuecat-webhook",
         headers={"Authorization": secret},
@@ -137,6 +206,101 @@ def test_pro_purchase_unlocks_pro_features() -> None:
         assert caps["quotaPolicy"]["historyDays"] is None
 
 
+@pytest.mark.parametrize(
+    ("active_ids", "expected_plan"),
+    [
+        (["basic", "pro"], "pro"),
+        (["basic", "plus"], "plus"),
+        (["basic"], "basic"),
+        (["pro"], "pro"),
+        ([], "free"),
+    ],
+)
+def test_webhook_uses_highest_active_customer_info_entitlement(
+    active_ids: list[str], expected_plan: str
+) -> None:
+    with TestClient(app) as client:
+        event = _purchase_event("basic", event_id=f"highest-{expected_plan}")
+        response = _post_webhook(
+            client,
+            event,
+            customer_info=_customer_info(active_ids),
+        )
+        assert response.status_code == 200
+        assert response.json()["plan"] == expected_plan
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == expected_plan
+
+
+def test_basic_renewal_does_not_overwrite_active_pro() -> None:
+    with TestClient(app) as client:
+        grant = _purchase_event(
+            "pro", event_id="grant-with-basic", event_type="NON_RENEWING_PURCHASE"
+        )
+        _post_webhook(
+            client,
+            grant,
+            customer_info=_customer_info(["basic", "pro"]),
+        )
+
+        renewal = _purchase_event(
+            "basic", event_id="basic-renewal", event_type="RENEWAL"
+        )
+        response = _post_webhook(
+            client,
+            renewal,
+            customer_info=_customer_info(["basic", "pro"]),
+        )
+
+        assert response.json()["plan"] == "pro"
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+
+
+def test_pro_expiration_falls_back_to_active_basic() -> None:
+    with TestClient(app) as client:
+        _post_webhook(
+            client,
+            _purchase_event("pro", event_id="pro-before-expiration"),
+            customer_info=_customer_info(["basic", "pro"]),
+        )
+        expiration = {
+            "type": "EXPIRATION",
+            "id": "pro-expiration-with-basic",
+            "app_user_id": USER_ID,
+            "entitlement_ids": ["pro"],
+        }
+        response = _post_webhook(
+            client,
+            expiration,
+            customer_info=_customer_info(["basic"]),
+        )
+
+        assert response.json()["plan"] == "basic"
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "basic"
+
+
+def test_basic_expiration_keeps_active_pro() -> None:
+    with TestClient(app) as client:
+        _post_webhook(
+            client,
+            _purchase_event("pro", event_id="pro-with-basic"),
+            customer_info=_customer_info(["basic", "pro"]),
+        )
+        expiration = {
+            "type": "EXPIRATION",
+            "id": "basic-expiration-with-pro",
+            "app_user_id": USER_ID,
+            "entitlement_ids": ["basic"],
+        }
+        response = _post_webhook(
+            client,
+            expiration,
+            customer_info=_customer_info(["pro"]),
+        )
+
+        assert response.json()["plan"] == "pro"
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+
+
 def test_expiration_downgrades_to_free() -> None:
     with TestClient(app) as client:
         _post_webhook(client, _purchase_event("pro", event_id="pro-2"))
@@ -150,6 +314,34 @@ def test_expiration_downgrades_to_free() -> None:
             "product_id": "opic_pro_monthly",
         }
         assert _post_webhook(client, expire).status_code == 200
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
+
+
+def test_promotional_grant_activates_pro_until_expiration() -> None:
+    with TestClient(app) as client:
+        grant = _purchase_event(
+            "pro",
+            event_id="promo-pro-1",
+            event_type="NON_RENEWING_PURCHASE",
+        )
+        grant["store"] = "PROMOTIONAL"
+        grant["period_type"] = "PROMOTIONAL"
+
+        response = _post_webhook(client, grant)
+        assert response.status_code == 200
+        assert response.json()["plan"] == "pro"
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+
+        expiration = {
+            "type": "EXPIRATION",
+            "id": "promo-pro-1-expiration",
+            "app_user_id": USER_ID,
+            "entitlement_ids": ["pro"],
+            "product_id": "rc_promo_pro",
+            "store": "PROMOTIONAL",
+            "period_type": "PROMOTIONAL",
+        }
+        assert _post_webhook(client, expiration).status_code == 200
         assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
 
 
@@ -194,7 +386,12 @@ def test_already_expired_timestamp_is_treated_as_free() -> None:
 
 def test_webhook_is_idempotent() -> None:
     with TestClient(app) as client:
-        first = _post_webhook(client, _purchase_event("basic", event_id="dup-1"))
+        revenuecat = _FakeRevenueCatClient(_customer_info(["basic"]))
+        first = _post_webhook(
+            client,
+            _purchase_event("basic", event_id="dup-1"),
+            revenuecat=revenuecat,
+        )
         assert first.status_code == 200
         assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "basic"
 
@@ -202,10 +399,252 @@ def test_webhook_is_idempotent() -> None:
         dup = _post_webhook(
             client,
             _purchase_event("plus", event_id="dup-1"),
+            revenuecat=revenuecat,
         )
         assert dup.status_code == 200
         assert dup.json()["status"] == "duplicate"
+        assert revenuecat.calls == [USER_ID]
         assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "basic"
+
+
+@pytest.mark.parametrize(
+    ("code", "gateway_status", "upstream_status"),
+    [
+        ("timeout", 503, None),
+        ("upstream_auth_error", 502, 401),
+        ("upstream_auth_error", 502, 403),
+        ("subscriber_not_found", 502, 404),
+        ("upstream_unavailable", 503, 429),
+        ("upstream_unavailable", 503, 500),
+        ("invalid_response", 502, None),
+    ],
+)
+def test_revenuecat_api_failure_preserves_existing_plan_and_remains_retryable(
+    code: str, gateway_status: int, upstream_status: int | None
+) -> None:
+    with TestClient(app) as client:
+        _post_webhook(
+            client,
+            _purchase_event("pro", event_id=f"existing-{code}-{upstream_status}"),
+        )
+        event_id = f"failed-{code}-{upstream_status}"
+        failure = _FakeRevenueCatClient(
+            error=RevenueCatAPIError(
+                code,
+                gateway_status=gateway_status,
+                upstream_status=upstream_status,
+            )
+        )
+
+        response = _post_webhook(
+            client,
+            _purchase_event("basic", event_id=event_id),
+            revenuecat=failure,
+        )
+
+        assert response.status_code == gateway_status
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+        assert client.app.state.state_store._iap_events.get(event_id) is None
+
+
+def test_missing_revenuecat_api_key_preserves_existing_plan() -> None:
+    with TestClient(app) as client:
+        unconfigured_revenuecat = client.app.state.revenuecat
+        _post_webhook(
+            client,
+            _purchase_event("pro", event_id="existing-before-missing-key"),
+        )
+        client.app.state.revenuecat = unconfigured_revenuecat
+        event = _purchase_event("basic", event_id="missing-api-key")
+
+        response = client.post(
+            "/v1/iap/revenuecat-webhook",
+            headers={"Authorization": WEBHOOK_SECRET},
+            json={"event": event, "api_version": "1.0"},
+        )
+
+        assert response.status_code == 503
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+        assert client.app.state.state_store._iap_events.get("missing-api-key") is None
+
+
+def test_state_save_failure_allows_same_webhook_to_retry() -> None:
+    with TestClient(app, raise_server_exceptions=False) as client:
+        store = client.app.state.state_store
+        original = store.complete_iap_sync
+        attempts = 0
+
+        async def fail_once(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("simulated state failure")
+            return await original(**kwargs)
+
+        store.complete_iap_sync = fail_once
+        revenuecat = _FakeRevenueCatClient(_customer_info(["basic"]))
+        event = _purchase_event("basic", event_id="retry-after-state-failure")
+
+        first = _post_webhook(client, event, revenuecat=revenuecat)
+        assert first.status_code == 500
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "free"
+
+        second = _post_webhook(client, event, revenuecat=revenuecat)
+        assert second.status_code == 200
+        assert second.json()["plan"] == "basic"
+        assert revenuecat.calls == [USER_ID, USER_ID]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "active_ids", "expected_plan"),
+    [
+        ("CANCELLATION", ["basic", "pro"], "pro"),
+        ("REFUND", ["basic"], "basic"),
+        ("EXPIRATION", ["pro"], "pro"),
+    ],
+)
+def test_lifecycle_event_always_uses_full_customer_info(
+    event_type: str, active_ids: list[str], expected_plan: str
+) -> None:
+    with TestClient(app) as client:
+        event = {
+            "type": event_type,
+            "id": f"lifecycle-{event_type.lower()}",
+            "app_user_id": USER_ID,
+            "entitlement_ids": [],
+        }
+        response = _post_webhook(
+            client,
+            event,
+            customer_info=_customer_info(active_ids),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["plan"] == expected_plan
+
+
+def test_older_customer_info_cannot_overwrite_newer_plan() -> None:
+    with TestClient(app) as client:
+        now = datetime.now(UTC)
+        _post_webhook(
+            client,
+            _purchase_event("pro", event_id="newer-snapshot"),
+            customer_info=_customer_info(["pro"], request_date=now),
+        )
+        stale = _post_webhook(
+            client,
+            _purchase_event("basic", event_id="older-snapshot"),
+            customer_info=_customer_info(
+                ["basic"], request_date=now - timedelta(minutes=1)
+            ),
+        )
+
+        assert stale.status_code == 200
+        assert client.get("/v1/capabilities", headers=_headers()).json()["plan"] == "pro"
+
+
+@pytest.mark.asyncio
+async def test_revenuecat_client_url_encodes_user_id_and_parses_active_entitlements() -> None:
+    seen_path: bytes | None = None
+    request_date = datetime(2026, 8, 1, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_path
+        seen_path = request.url.raw_path
+        return httpx.Response(
+            200,
+            json={
+                "request_date": request_date.isoformat(),
+                "subscriber": {
+                    "entitlements": {
+                        "basic": {
+                            "expires_date": (request_date - timedelta(days=1)).isoformat(),
+                            "grace_period_expires_date": (
+                                request_date + timedelta(days=1)
+                            ).isoformat(),
+                        },
+                        "pro": {
+                            "expires_date": (request_date + timedelta(days=2)).isoformat(),
+                            "grace_period_expires_date": None,
+                        },
+                        "expired": {
+                            "expires_date": (request_date - timedelta(days=2)).isoformat(),
+                            "grace_period_expires_date": None,
+                        },
+                    }
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        revenuecat = RevenueCatClient(
+            secret_api_key=SecretStr("placeholder"),
+            http_client=http_client,
+        )
+        info = await revenuecat.get_customer_info("user/+?# %")
+
+    assert seen_path == b"/v1/subscribers/user%2F%2B%3F%23%20%25"
+    assert info.active_entitlement_ids == ["basic", "pro"]
+    assert info.active_entitlements["basic"] == request_date + timedelta(days=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected_gateway"),
+    [(401, 502), (403, 502), (404, 502), (429, 503), (500, 503)],
+)
+async def test_revenuecat_client_maps_http_errors(
+    status_code: int, expected_gateway: int
+) -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status_code, json={"error": "omitted"})
+    )
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        revenuecat = RevenueCatClient(
+            secret_api_key=SecretStr("placeholder"),
+            http_client=http_client,
+        )
+        with pytest.raises(RevenueCatAPIError) as captured:
+            await revenuecat.get_customer_info(USER_ID)
+
+    assert captured.value.gateway_status == expected_gateway
+    assert captured.value.upstream_status == status_code
+
+
+@pytest.mark.asyncio
+async def test_revenuecat_client_rejects_invalid_json() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"{not-json")
+    )
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        revenuecat = RevenueCatClient(
+            secret_api_key=SecretStr("placeholder"),
+            http_client=http_client,
+        )
+        with pytest.raises(RevenueCatAPIError) as captured:
+            await revenuecat.get_customer_info(USER_ID)
+
+    assert captured.value.code == "invalid_response"
+    assert captured.value.gateway_status == 502
+
+
+@pytest.mark.asyncio
+async def test_revenuecat_client_maps_timeout() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated timeout", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http_client:
+        revenuecat = RevenueCatClient(
+            secret_api_key=SecretStr("placeholder"),
+            http_client=http_client,
+        )
+        with pytest.raises(RevenueCatAPIError) as captured:
+            await revenuecat.get_customer_info(USER_ID)
+
+    assert captured.value.code == "timeout"
+    assert captured.value.gateway_status == 503
 
 
 # --- 플랜 인지 사용량 ------------------------------------------------------

@@ -22,6 +22,56 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
+async def test_firestore_iap_sync_is_atomic_idempotent_and_rejects_stale_state() -> None:
+    uid = f"iap-user-{uuid.uuid4()}"
+    event_id = f"iap-event-{uuid.uuid4()}"
+    stale_event_id = f"iap-stale-{uuid.uuid4()}"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    request_date = datetime.now(UTC)
+    pro_entitlement = {
+        "plan": "pro",
+        "isActive": True,
+        "source": "revenuecat",
+        "activeEntitlementIds": ["basic", "pro"],
+        "expiresAt": request_date + timedelta(days=7),
+        "revenueCatRequestDate": request_date,
+        "lastEventType": "NON_RENEWING_PURCHASE",
+        "updatedAt": request_date,
+    }
+
+    assert await store.complete_iap_sync(
+        event_id=event_id,
+        uid=uid,
+        entitlement=pro_entitlement,
+    )
+    assert await store.is_iap_event_completed(event_id)
+    assert not await store.complete_iap_sync(
+        event_id=event_id,
+        uid=uid,
+        entitlement={**pro_entitlement, "plan": "basic"},
+    )
+
+    stale_basic = {
+        **pro_entitlement,
+        "plan": "basic",
+        "activeEntitlementIds": ["basic"],
+        "revenueCatRequestDate": request_date - timedelta(minutes=1),
+    }
+    assert await store.complete_iap_sync(
+        event_id=stale_event_id,
+        uid=uid,
+        entitlement=stale_basic,
+    )
+    assert (await store.get_entitlement(uid) or {})["plan"] == "pro"
+
+    event_document = (
+        store._client.collection("iapEvents").document(event_id).get().to_dict()
+    )
+    assert event_document is not None
+    assert event_document["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_firestore_question_set_is_bound_to_user_and_mode() -> None:
     uid = f"question-set-{uuid.uuid4()}"
     store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))

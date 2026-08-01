@@ -71,6 +71,7 @@ from app.services.difficulty import (
 from app.services.questions import prompt_hash, question_set_hash
 from app.services import plans
 from app.services.plans import Plan
+from app.services.revenuecat import RevenueCatAPIError
 from app.services.state import (
     AdjustmentAlreadyApplied,
     IdempotencyConflict,
@@ -1773,16 +1774,6 @@ async def create_reward_intent(
     )
 
 
-# 즉시 권한을 회수하는 이벤트만 포함한다.
-# CANCELLATION(자동갱신 해지)·BILLING_ISSUE(유예 기간)·SUBSCRIPTION_PAUSED 는
-# 즉시 강등하지 않고, 저장된 expiresAt(실제 만료시각)까지 권한을 유지한다.
-# 만료 시점은 resolve_plan 이 서버 권위로 판정한다.
-_DEACTIVATING_EVENTS = {
-    "EXPIRATION",
-    "REFUND",
-}
-
-
 @router.post("/v1/iap/revenuecat-webhook")
 async def revenuecat_webhook(
     payload: RevenueCatWebhook,
@@ -1815,43 +1806,60 @@ async def revenuecat_webhook(
         )
 
     event_id = event.id or _payload_hash(payload.model_dump(mode="json"))
-    is_new = await request.app.state.state_store.record_iap_event(event_id, uid)
-    if not is_new:
+    if await request.app.state.state_store.is_iap_event_completed(event_id):
         return {"status": "duplicate"}
 
     event_type = event.type.upper()
-    if event_type in _DEACTIVATING_EVENTS:
-        plan = Plan.FREE
-        is_active = False
-    else:
-        entitlement_ids = event.entitlement_ids or (
-            [event.entitlement_id] if event.entitlement_id else None
+    try:
+        customer_info = await request.app.state.revenuecat.get_customer_info(uid)
+    except RevenueCatAPIError as error:
+        logger.error(
+            "RevenueCat customer sync failed uidHash=%s eventIdHash=%s "
+            "code=%s upstreamStatus=%s",
+            _uid_hash(uid),
+            _uid_hash(event_id),
+            error.code,
+            error.upstream_status,
         )
-        plan = plans.plan_from_entitlement_ids(entitlement_ids)
-        if plan is Plan.FREE:
-            logger.warning(
-                "RevenueCat webhook: unmapped entitlements uid=%s ids=%s product=%s",
-                _uid_hash(uid),
-                entitlement_ids,
-                event.product_id,
-            )
-        is_active = plan is not Plan.FREE
+        raise HTTPException(
+            status_code=error.gateway_status,
+            detail={"code": "revenuecat_sync_failed"},
+        ) from error
+
+    active_entitlement_ids = customer_info.active_entitlement_ids
+    plan = plans.plan_from_entitlement_ids(active_entitlement_ids)
+    selected_entitlement_ids = (
+        [
+            identifier
+            for identifier in active_entitlement_ids
+            if plans.plan_from_entitlement_ids([identifier]) is plan
+        ]
+        if plan is not Plan.FREE
+        else []
+    )
+    expires_at = customer_info.effective_expiration_for(selected_entitlement_ids)
 
     entitlement = {
         "plan": str(plan),
-        "isActive": is_active,
+        "isActive": plan is not Plan.FREE,
         "source": "revenuecat",
-        "productId": event.product_id,
-        "periodType": event.period_type,
-        "expiresAt": event.expiration_at_ms,
-        "store": event.store,
+        "activeEntitlementIds": active_entitlement_ids,
+        "expiresAt": expires_at,
+        "revenueCatRequestDate": customer_info.request_date,
         "lastEventType": event_type,
         "updatedAt": datetime.now(UTC),
     }
-    await request.app.state.state_store.set_entitlement(uid, entitlement=entitlement)
+    completed = await request.app.state.state_store.complete_iap_sync(
+        event_id=event_id,
+        uid=uid,
+        entitlement=entitlement,
+    )
+    if not completed:
+        return {"status": "duplicate"}
     logger.info(
-        "RevenueCat webhook processed uid=%s type=%s plan=%s",
+        "RevenueCat webhook processed uidHash=%s eventIdHash=%s type=%s plan=%s",
         _uid_hash(uid),
+        _uid_hash(event_id),
         event_type,
         plan,
     )

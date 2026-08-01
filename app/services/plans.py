@@ -10,7 +10,7 @@ IAP BM의 단일 진실 소스. 서버는 이 매핑을 근거로 사용량을 �
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from app.models.api import RewardPurpose
@@ -64,76 +64,75 @@ class PlanLimits:
 
 _MOCK_REWARD_GATES = 3  # start / adjustment / result
 
-PLAN_LIMITS: dict[Plan, PlanLimits] = {
-    Plan.FREE: PlanLimits(
-        plan=Plan.FREE,
-        practice_daily=1,
-        practice_ad_bonus=1,
-        refresh_ad_bonus=1,
-        mock_daily=1,
-        mock_requires_ad=True,
-        mock_is_trial=True,
-        history_days=7,
-        analysis_depth=AnalysisDepth.SUMMARY,
-        grade_trend=FeatureTier.LIMITED,
-        weakness_analysis=FeatureTier.NONE,
-        review_set=False,
-        weekly_report=False,
-        mock_comparison=FeatureTier.NONE,
-        ads_enabled=True,
-    ),
-    Plan.BASIC: PlanLimits(
-        plan=Plan.BASIC,
-        practice_daily=3,
-        practice_ad_bonus=0,
-        refresh_ad_bonus=10,
-        mock_daily=1,
-        mock_requires_ad=False,
-        mock_is_trial=False,
-        history_days=30,
-        analysis_depth=AnalysisDepth.BASIC,
-        grade_trend=FeatureTier.BASIC,
-        weakness_analysis=FeatureTier.NONE,
-        review_set=False,
-        weekly_report=False,
-        mock_comparison=FeatureTier.NONE,
-        ads_enabled=False,
-    ),
-    Plan.PLUS: PlanLimits(
-        plan=Plan.PLUS,
-        practice_daily=10,
-        practice_ad_bonus=0,
-        refresh_ad_bonus=20,
-        mock_daily=3,
-        mock_requires_ad=False,
-        mock_is_trial=False,
-        history_days=30,
-        analysis_depth=AnalysisDepth.DETAILED,
-        grade_trend=FeatureTier.BASIC,
-        weakness_analysis=FeatureTier.BASIC,
-        review_set=False,
-        weekly_report=False,
-        mock_comparison=FeatureTier.NONE,
-        ads_enabled=False,
-    ),
-    Plan.PRO: PlanLimits(
-        plan=Plan.PRO,
-        practice_daily=20,
-        practice_ad_bonus=0,
-        refresh_ad_bonus=30,
-        mock_daily=5,
-        mock_requires_ad=False,
-        mock_is_trial=False,
-        history_days=None,
-        analysis_depth=AnalysisDepth.FOCUS,
-        grade_trend=FeatureTier.DETAILED,
-        weakness_analysis=FeatureTier.ADVANCED,
-        review_set=True,
-        weekly_report=True,
-        mock_comparison=FeatureTier.DETAILED,
-        ads_enabled=False,
-    ),
+# 공통 디폴트값 (FREE 플랜 기준)
+_DEFAULT_LIMITS = PlanLimits(
+    plan=Plan.FREE,
+    practice_daily=1,
+    practice_ad_bonus=1,
+    refresh_ad_bonus=1,
+    mock_daily=1,
+    mock_requires_ad=True,
+    mock_is_trial=True,
+    history_days=7,
+    analysis_depth=AnalysisDepth.SUMMARY,
+    grade_trend=FeatureTier.LIMITED,
+    weakness_analysis=FeatureTier.NONE,
+    review_set=False,
+    weekly_report=False,
+    mock_comparison=FeatureTier.NONE,
+    ads_enabled=True,
+)
+
+# 플랜별 변경점만 정의
+_PLAN_OVERRIDES: dict[Plan, dict] = {
+    Plan.FREE: {},  # 디폴트 사용
+    Plan.BASIC: {
+        "practice_daily": 3,
+        "practice_ad_bonus": 0,
+        "refresh_ad_bonus": 10,
+        "mock_requires_ad": False,
+        "mock_is_trial": False,
+        "history_days": 30,
+        "analysis_depth": AnalysisDepth.BASIC,
+        "grade_trend": FeatureTier.BASIC,
+        "ads_enabled": False,
+    },
+    Plan.PLUS: {
+        "practice_daily": 10,
+        "practice_ad_bonus": 0,
+        "refresh_ad_bonus": 20,
+        "mock_daily": 3,
+        "mock_requires_ad": False,
+        "mock_is_trial": False,
+        "history_days": 30,
+        "analysis_depth": AnalysisDepth.DETAILED,
+        "grade_trend": FeatureTier.BASIC,
+        "weakness_analysis": FeatureTier.BASIC,
+        "ads_enabled": False,
+    },
+    Plan.PRO: {
+        "practice_daily": 20,
+        "practice_ad_bonus": 0,
+        "refresh_ad_bonus": 30,
+        "mock_daily": 5,
+        "mock_requires_ad": False,
+        "mock_is_trial": False,
+        "history_days": None,
+        "analysis_depth": AnalysisDepth.FOCUS,
+        "grade_trend": FeatureTier.DETAILED,
+        "weakness_analysis": FeatureTier.ADVANCED,
+        "review_set": True,
+        "weekly_report": True,
+        "mock_comparison": FeatureTier.DETAILED,
+        "ads_enabled": False,
+    },
 }
+
+# 플랜별 한도 생성
+PLAN_LIMITS: dict[Plan, PlanLimits] = {}
+for plan in Plan:
+    overrides = _PLAN_OVERRIDES.get(plan, {})
+    PLAN_LIMITS[plan] = replace(_DEFAULT_LIMITS, plan=plan, **overrides)
 
 
 def limits_for(plan: Plan | str | None) -> PlanLimits:
