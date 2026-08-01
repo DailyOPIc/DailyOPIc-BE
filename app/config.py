@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     # RevenueCat 웹훅: 대시보드에 설정한 Authorization 헤더 공유 시크릿.
     # 서버-서버 호출이라 App Check/Firebase Auth 대신 이 값으로 검증한다.
     revenuecat_webhook_auth: str | None = None
+    # RevenueCat REST API 조회용 Secret API Key. 서버 환경변수로만 주입한다.
+    revenuecat_secret_api_key: SecretStr | None = None
     minimum_supported_app_version: str = "1.0.0"
     guide_schema_version: int = 2
     question_generation_v2_enabled: bool = True
@@ -38,6 +40,9 @@ class Settings(BaseSettings):
     def validate_required_settings(self) -> "Settings":
         self.openai_api_key = self._clean(self.openai_api_key)
         self.revenuecat_webhook_auth = self._clean(self.revenuecat_webhook_auth)
+        if self.revenuecat_secret_api_key is not None:
+            secret = self.revenuecat_secret_api_key.get_secret_value().strip()
+            self.revenuecat_secret_api_key = SecretStr(secret) if secret else None
         self.firebase_project_id = self._clean_required(
             self.firebase_project_id, "FIREBASE_PROJECT_ID"
         )
