@@ -885,11 +885,7 @@ def test_capabilities_endpoint_plan_quota_fields_present() -> None:
         "mockRewardGates",
         "historyDays",
         "analysisDepth",
-        "gradeTrend",
-        "weaknessAnalysis",
         "reviewSet",
-        "weeklyReport",
-        "mockComparison",
         "adsEnabled",
     ]
     for field in required_fields:

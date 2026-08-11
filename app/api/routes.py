@@ -108,11 +108,7 @@ def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
         practiceAdBonus=limits.practice_ad_bonus,
         historyDays=limits.history_days,
         analysisDepth=str(limits.analysis_depth),
-        gradeTrend=str(limits.grade_trend),
-        weaknessAnalysis=str(limits.weakness_analysis),
         reviewSet=limits.review_set,
-        weeklyReport=limits.weekly_report,
-        mockComparison=str(limits.mock_comparison),
         adsEnabled=limits.ads_enabled,
     )
 

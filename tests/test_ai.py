@@ -571,8 +571,44 @@ def test_predicted_level_never_below_il() -> None:
     from app.services.ai import _clamp_min_level
     from app.models.api import OPIcLevel
 
-    assert _clamp_min_level(OPIcLevel.NL) == OPIcLevel.IL
-    assert _clamp_min_level(OPIcLevel.NH) == OPIcLevel.IL
-    assert _clamp_min_level(OPIcLevel.IL) == OPIcLevel.IL
-    assert _clamp_min_level(OPIcLevel.IM2) == OPIcLevel.IM2
-    assert _clamp_min_level(OPIcLevel.AL) == OPIcLevel.AL
+    # (등급, 하한으로 끌어올렸는지)
+    assert _clamp_min_level(OPIcLevel.NL) == (OPIcLevel.IL, True)
+    assert _clamp_min_level(OPIcLevel.NH) == (OPIcLevel.IL, True)
+    assert _clamp_min_level(OPIcLevel.IL) == (OPIcLevel.IL, False)
+    assert _clamp_min_level(OPIcLevel.IM2) == (OPIcLevel.IM2, False)
+    assert _clamp_min_level(OPIcLevel.AL) == (OPIcLevel.AL, False)
+
+
+@pytest.mark.asyncio
+async def test_analysis_depth_boundary_is_free_vs_paid() -> None:
+    """무료(summary)만 교정/모범답안/목표갭이 빠지고, 유료 플랜은 모두 동일하다."""
+    from app.services.plans import PLAN_LIMITS, Plan
+
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key=None, model="test-model", mock=True, repository=repository)
+    question = (await service.generate_practice(OPIcLevel.IM2, BackgroundProfile())).questions[0]
+    metrics = AudioMetrics(
+        durationSeconds=35, speakingSeconds=31, silenceRatio=0.11, wordsPerMinute=105
+    )
+
+    async def evaluate(plan: Plan):
+        return await service.evaluate_practice(
+            question=question,
+            transcript="I read the news every morning and discuss it with my coworkers.",
+            target=OPIcLevel.IH,
+            metrics=metrics,
+            depth=PLAN_LIMITS[plan].analysis_depth,
+        )
+
+    free = await evaluate(Plan.FREE)
+    assert free.corrected_answer is None
+    assert free.sample_answer is None
+    assert free.target_gap is None
+    # 무료도 등급·강점·개선점·5영역 피드백은 그대로 받는다.
+    assert free.rubrics and free.strengths and free.improvements
+
+    for plan in (Plan.BASIC, Plan.PLUS, Plan.PRO):
+        paid = await evaluate(plan)
+        assert paid.corrected_answer is not None
+        assert paid.sample_answer is not None
+        assert paid.target_gap is not None

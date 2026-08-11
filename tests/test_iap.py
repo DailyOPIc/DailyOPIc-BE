@@ -187,7 +187,7 @@ def test_purchase_sets_plan_and_capabilities_reflect_it() -> None:
         assert caps["plan"] == "plus"
         assert caps["quotaPolicy"]["practiceDaily"] == 10
         assert caps["quotaPolicy"]["adsEnabled"] is False
-        assert caps["quotaPolicy"]["analysisDepth"] == "detailed"
+        assert caps["quotaPolicy"]["analysisDepth"] == "full"
 
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["freeRemaining"] == 10
@@ -202,7 +202,6 @@ def test_pro_purchase_unlocks_pro_features() -> None:
         assert caps["plan"] == "pro"
         assert caps["quotaPolicy"]["practiceDaily"] == 20
         assert caps["quotaPolicy"]["reviewSet"] is True
-        assert caps["quotaPolicy"]["weeklyReport"] is True
         assert caps["quotaPolicy"]["historyDays"] is None
 
 

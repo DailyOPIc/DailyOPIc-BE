@@ -33,6 +33,7 @@ class AudioMetricsService:
                 speakingSeconds=estimated,
                 silenceRatio=0,
                 wordsPerMinute=words / estimated * 60,
+                isEstimated=True,
             )
 
         suffix = Path(upload.filename or "answer.m4a").suffix or ".m4a"
@@ -66,8 +67,11 @@ class AudioMetricsService:
                 timeout=15,
             )
             duration = float(probe.stdout.strip())
+            estimated = False
         except (OSError, ValueError, subprocess.SubprocessError):
+            # 길이를 재지 못하면 전사 길이로 추정한다. 추정이라는 사실을 남긴다.
             duration = max(1.0, words / 130 * 60)
+            estimated = True
 
         if duration > self._max_seconds:
             raise AudioValidationError(f"audio must be {self._max_seconds} seconds or shorter")
@@ -104,6 +108,7 @@ class AudioMetricsService:
                 silence_seconds += max(0.0, duration - open_start)
         except (OSError, subprocess.SubprocessError):
             silence_seconds = 0.0
+            estimated = True
 
         speaking = max(0.5, duration - min(duration, silence_seconds))
         return AudioMetrics(
@@ -111,4 +116,5 @@ class AudioMetricsService:
             speakingSeconds=round(speaking, 2),
             silenceRatio=round(min(1.0, silence_seconds / max(duration, 0.5)), 3),
             wordsPerMinute=round(words / speaking * 60, 1),
+            isEstimated=estimated,
         )
