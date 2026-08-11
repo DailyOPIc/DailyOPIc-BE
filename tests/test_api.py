@@ -34,6 +34,9 @@ class FailingQuestionAIService:
     async def generate_daily_pool(self, *args: object, **kwargs: object) -> object:
         raise AIQuestionGenerationError("forced failure")
 
+    async def generate_mock(self, *args: object, **kwargs: object) -> object:
+        raise AIQuestionGenerationError("forced failure")
+
 
 class FailingMockEvaluationAIService:
     model = "test-model"
@@ -891,3 +894,165 @@ def test_capabilities_endpoint_plan_quota_fields_present() -> None:
     ]
     for field in required_fields:
         assert field in policy, f"Missing field in quotaPolicy: {field}"
+
+
+def _mock_session_payload() -> dict[str, object]:
+    return {
+        "initialLevel": 4,
+        "background": {"travel": ["domestic"]},
+        "survey": {
+            "status": "student",
+            "residence": "family",
+            "leisure": ["movies", "music", "cafes"],
+            "hobbies": [],
+            "sports": [],
+            "travel": ["domestic_travel"],
+        },
+    }
+
+
+def test_abandon_mock_session_closes_the_active_slot() -> None:
+    with TestClient(app) as client:
+        session = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-abandon-create"),
+            json=_mock_session_payload(),
+        ).json()
+        assert client.get("/v1/mock-exams/current", headers=_headers()).status_code == 200
+
+        abandoned = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/abandon",
+            headers=_headers(),
+        )
+        assert abandoned.status_code == 200, abandoned.text
+        assert abandoned.json()["stage"] == "completed"
+
+        # 포기한 회차는 더 이상 진행 중이 아니다 → 앱이 다시 살려내지 않는다.
+        assert client.get("/v1/mock-exams/current", headers=_headers()).status_code == 404
+        # 반복 호출도 안전해야 한다(재시도/중복 탭).
+        again = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/abandon",
+            headers=_headers(),
+        )
+        assert again.status_code == 200, again.text
+        assert again.json()["stage"] == "completed"
+
+
+def test_abandoned_mock_session_does_not_consume_the_daily_quota() -> None:
+    """포기는 응시 한도를 쓰지 않는다. 단, 이미 본 광고를 돌려주지도 않는다."""
+    with TestClient(app) as client:
+        session = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-quota-create-1"),
+            json=_mock_session_payload(),
+        ).json()
+        reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "mock_start", "sessionHash": session["sessionHash"]},
+        ).json()
+        _verify_reward(client, reward["nonce"])
+        started = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/start",
+            headers=_headers("mock-session-quota-start"),
+            json={"rewardNonce": reward["nonce"]},
+        )
+        assert started.status_code == 200, started.text
+
+        client.post(
+            f"/v1/mock-exams/{session['sessionId']}/abandon",
+            headers=_headers(),
+        )
+
+        # 무료(평생 1회)인데도 포기한 회차는 한도를 소진하지 않는다.
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["mockRemaining"] == 1
+        assert usage["mockAvailable"] is True
+        assert usage["mockSessionStage"] is None
+
+        # 같은 날 새 회차를 만들 수 있고, 포기한 회차와 같은 문서면 안 된다.
+        restarted = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-quota-create-2"),
+            json=_mock_session_payload(),
+        )
+        assert restarted.status_code == 200, restarted.text
+        assert restarted.json()["sessionId"] != session["sessionId"]
+        assert restarted.json()["stage"] == "awaiting_start_ad"
+
+        # 재시작해도 이미 쓴 리워드는 그대로 소비된 상태여야 한다.
+        assert client.app.state.state_store._rewards[reward["nonce"]]["consumed"] is True
+        reused = client.post(
+            f"/v1/mock-exams/{restarted.json()['sessionId']}/start",
+            headers=_headers("mock-session-quota-start-2"),
+            json={"rewardNonce": reward["nonce"]},
+        )
+        assert reused.status_code == 402, reused.text
+
+
+def test_completed_mock_session_still_consumes_the_quota() -> None:
+    """채점까지 끝난 회차는 예전처럼 한도를 소진한다(포기와 구분되는지)."""
+    with TestClient(app) as client:
+        session = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-graded-create"),
+            json=_mock_session_payload(),
+        ).json()
+        store = client.app.state.state_store
+        # 15문항 응시·채점 전체는 test_mock_exam_full_flow가 이미 검증한다.
+        # 여기서는 "abandonedAt 없는 completed"만 한도에 잡히는지를 본다.
+        store._mock_sessions[session["sessionId"]]["stage"] = "completed"
+
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["mockRemaining"] == 0
+        assert usage["mockAvailable"] is False
+        blocked = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-graded-create-2"),
+            json=_mock_session_payload(),
+        )
+        assert blocked.status_code == 402, blocked.text
+        assert blocked.json()["detail"]["code"] == "mock_limit_reached"
+
+
+def test_failed_mock_start_keeps_reward_nonce_reusable() -> None:
+    """실패한 시작 요청의 리워드 논스는 그대로 재사용할 수 있어야 한다.
+
+    이게 성립해야 iOS가 네트워크/생성 실패 뒤에 광고를 한 번 더 보여주지 않는다.
+    """
+    with TestClient(app) as client:
+        session = client.post(
+            "/v1/mock-exams/sessions",
+            headers=_headers("mock-session-reuse-create"),
+            json=_mock_session_payload(),
+        ).json()
+        reward = client.post(
+            "/v1/ad-rewards/intents",
+            headers=_headers(),
+            json={"purpose": "mock_start", "sessionHash": session["sessionHash"]},
+        ).json()
+        _verify_reward(client, reward["nonce"])
+
+        working_ai_service = client.app.state.ai_service
+        client.app.state.ai_service = FailingQuestionAIService()
+        try:
+            failed = client.post(
+                f"/v1/mock-exams/{session['sessionId']}/start",
+                headers=_headers("mock-session-reuse-start-1"),
+                json={"rewardNonce": reward["nonce"]},
+            )
+        finally:
+            client.app.state.ai_service = working_ai_service
+        assert failed.status_code >= 500
+        assert (
+            client.get("/v1/mock-exams/current", headers=_headers()).json()["stage"]
+            == "awaiting_start_ad"
+        )
+
+        retry = client.post(
+            f"/v1/mock-exams/{session['sessionId']}/start",
+            headers=_headers("mock-session-reuse-start-2"),
+            json={"rewardNonce": reward["nonce"]},
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["stage"] == "answering_front"

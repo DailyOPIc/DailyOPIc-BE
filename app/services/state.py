@@ -152,9 +152,14 @@ class StateStore(ABC):
 
     @abstractmethod
     async def count_completed_mock_sessions(
-        self, *, uid: str, date_key: str | None = None
+        self, *, uid: str, date_key: str | None = None, include_abandoned: bool = False
     ) -> int:
-        """완료된 모의고사 세션 수. date_key=None이면 전체 기간(무료 평생 체험 판정용)."""
+        """완료된 모의고사 세션 수. date_key=None이면 전체 기간(무료 평생 체험 판정용).
+
+        포기한 회차(abandonedAt 존재)는 응시 한도를 소진하지 않으므로 기본적으로 세지
+        않는다. include_abandoned=True는 회차 번호(sessionId) 계산처럼 "오늘 닫힌 문서"
+        전부가 필요할 때만 쓴다.
+        """
         ...
 
     @abstractmethod
@@ -694,7 +699,7 @@ class InMemoryStateStore(StateStore):
             return None
 
     async def count_completed_mock_sessions(
-        self, *, uid: str, date_key: str | None = None
+        self, *, uid: str, date_key: str | None = None, include_abandoned: bool = False
     ) -> int:
         async with self._lock:
             return sum(
@@ -703,6 +708,7 @@ class InMemoryStateStore(StateStore):
                 if value.get("uid") == uid
                 and (date_key is None or value.get("date") == date_key)
                 and value.get("stage") == "completed"
+                and (include_abandoned or not value.get("abandonedAt"))
             )
 
     async def transition_mock_session(
@@ -1378,16 +1384,18 @@ class FirestoreStateStore(StateStore):
         return await asyncio.to_thread(read)
 
     async def count_completed_mock_sessions(
-        self, *, uid: str, date_key: str | None = None
+        self, *, uid: str, date_key: str | None = None, include_abandoned: bool = False
     ) -> int:
         def read() -> int:
             query = self._client.collection("mockSessions").where("uid", "==", uid)
             if date_key is not None:
                 query = query.where("date", "==", date_key)
+            # stage 필터가 이미 파이썬 쪽이라 abandonedAt도 같이 걸러도 색인이 늘지 않는다.
             return sum(
                 1
                 for snapshot in query.stream()
-                if (snapshot.to_dict() or {}).get("stage") == "completed"
+                if (value := snapshot.to_dict() or {}).get("stage") == "completed"
+                and (include_abandoned or not value.get("abandonedAt"))
             )
 
         return await asyncio.to_thread(read)

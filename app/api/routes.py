@@ -1104,8 +1104,13 @@ async def create_mock_session(
                     ),
                 },
             )
-        # 무료 체험은 회차 인덱스가 항상 0(평생 1회), 유료는 오늘 완료 수를 인덱스로.
-        attempt = 0 if limits.mock_is_trial else completed
+        # 회차 인덱스는 "오늘 닫힌 문서 수"(채점 완료 + 포기)로 잡는다. 포기한 회차는
+        # 한도를 소진하지 않지만 문서는 남아 있으므로, 인덱스에서 빼면 새 회차가
+        # 포기한 회차와 같은 sessionId로 충돌해 create_or_get이 그 회차를 그대로
+        # 돌려준다(= 포기한 회차 부활). 포기 이력이 없으면 예전 값과 동일하다.
+        attempt = await request.app.state.state_store.count_completed_mock_sessions(
+            uid=user.uid, date_key=date_key, include_abandoned=True
+        )
         session_id = hashlib.sha256(
             f"{user.uid}:mock-session:{date_key}:{attempt}".encode()
         ).hexdigest()
@@ -1142,6 +1147,49 @@ async def current_mock_session(
     )
     if not record:
         raise HTTPException(status_code=404, detail={"code": "mock_session_not_found"})
+    return await _mock_session_response(request, user, record)
+
+
+@router.post("/v1/mock-exams/{session_id}/abandon", response_model=MockSessionResponse)
+async def abandon_mock_session(
+    session_id: str,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> MockSessionResponse:
+    # 사용자가 회차를 포기했을 때 서버 쪽 소유권을 닫는다. 새 stage를 만들지 않고
+    # completed로 마감하는 이유는 get_active_mock_session 규칙과 구버전 클라이언트의
+    # stage 디코딩을 그대로 두기 위해서다. 대신 abandonedAt을 남겨
+    # count_completed_mock_sessions가 이 회차를 한도에서 제외한다(= 같은 날 다시 응시
+    # 가능). 이미 소비한 리워드는 되돌리지 않는다.
+    record = await request.app.state.state_store.get_mock_session(
+        uid=user.uid,
+        session_id=session_id,
+    )
+    if not record:
+        raise HTTPException(status_code=404, detail={"code": "mock_session_not_found"})
+    if record.get("stage") != MockSessionStage.COMPLETED.value:
+        try:
+            record = await request.app.state.state_store.transition_mock_session(
+                uid=user.uid,
+                session_id=session_id,
+                expected_stages={
+                    stage.value
+                    for stage in MockSessionStage
+                    if stage is not MockSessionStage.COMPLETED
+                },
+                stage=MockSessionStage.COMPLETED.value,
+                updates={"abandonedAt": datetime.now(UTC)},
+            )
+        except InvalidSessionTransition:
+            # 그 사이 다른 요청이 마감했으면 그것이 최종 상태다.
+            record = await request.app.state.state_store.get_mock_session(
+                uid=user.uid,
+                session_id=session_id,
+            )
+            if not record:
+                raise HTTPException(
+                    status_code=404, detail={"code": "mock_session_not_found"}
+                ) from None
     return await _mock_session_response(request, user, record)
 
 
