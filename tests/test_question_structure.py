@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from pydantic import ValidationError
 
 from app.models.api import (
@@ -14,6 +15,14 @@ from app.services.questions import (
     QuestionPatternRepository,
     validate_mock_blueprint,
 )
+
+CATALOG = Path("app/data/question_patterns.json")
+BACKGROUND = BackgroundProfile(interests=["movies", "music"])
+
+
+@pytest.fixture
+def generator() -> FallbackQuestionGenerator:
+    return FallbackQuestionGenerator(QuestionPatternRepository(CATALOG))
 
 
 def test_mock_exam_matches_exact_blueprint() -> None:
@@ -87,6 +96,74 @@ def test_background_survey_requires_three_multi_select_topics() -> None:
         assert "at least 3 survey topics" in str(error)
     else:
         raise AssertionError("survey validation should reject too few topics")
+
+
+def _fallback_sets(
+    generator: FallbackQuestionGenerator, level: int
+) -> dict[str, list]:
+    """OpenAI 실패 시 서버가 대신 내려보내는 세 경로."""
+    return {
+        "mock": generator.mock_front(level, BACKGROUND)
+        + generator.mock_tail(effective_level=level, background=BACKGROUND),
+        "practice": generator.practice_front(level, BACKGROUND)
+        + generator.practice_tail(effective_level=level, background=BACKGROUND),
+        "daily": generator.daily_pool(level, BACKGROUND),
+    }
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4, 5, 6])
+def test_fallback_prompts_are_unique_for_every_level(
+    generator: FallbackQuestionGenerator, level: int
+) -> None:
+    """폴백 문항에 중복 프롬프트가 있으면 AIService 의 유일성 검증에 걸려
+    503 ai_unavailable 이 된다. 즉 사용자가 문항을 아예 받지 못한다."""
+    for name, questions in _fallback_sets(generator, level).items():
+        prompts = [item.prompt for item in questions]
+        duplicated = sorted({item for item in prompts if prompts.count(item) > 1})
+        assert not duplicated, f"{name} level={level} 중복 프롬프트={duplicated}"
+
+
+# 수정 대상이 아닌 레벨의 문구를 고정한다. 레벨 3·4 의 DESCRIPTION 분기를 추가하면서
+# 다른 레벨 문구가 함께 바뀌면 이 테스트가 먼저 실패해야 한다.
+UNTOUCHED_PRACTICE_FRONT_PROMPTS = {
+    2: [
+        "Introduce yourself.",
+        "Tell me about movies. Why do you like it.",
+        "What do you usually do when you spend time with movies. Give one simple reason.",
+        "Tell me about a simple experience related to movies. Why do you remember it.",
+        "Tell me about music. Why do you like it.",
+        "What do you usually do when you spend time with music. Give one simple reason.",
+        "Tell me about a simple experience related to music. Why do you remember it.",
+    ],
+    5: [
+        "Introduce yourself.",
+        "Describe the key features of movies. Explain what makes them distinctive. Tell me why they matter to you.",
+        "Explain your usual routine involving movies. Describe how you organize it. Tell me why that routine works well for you.",
+        "Describe a detailed experience related to movies. Explain the background and the result. Tell me how that experience changed your thinking.",
+        "Describe the key features of music. Explain what makes them distinctive. Tell me why they matter to you.",
+        "Explain your usual routine involving music. Describe how you organize it. Tell me why that routine works well for you.",
+        "Describe a detailed experience related to music. Explain the background and the result. Tell me how that experience changed your thinking.",
+    ],
+    6: [
+        "Introduce yourself.",
+        "Describe the most important features of movies. Explain how different people experience it. Analyze why those features matter in daily life.",
+        "Explain how people usually engage with movies. Describe how that routine has evolved. Analyze what could change it in the future.",
+        "Discuss a complex experience related to movies. Explain how the situation developed. Analyze what it shows about people's choices or values.",
+        "Describe the most important features of music. Explain how different people experience it. Analyze why those features matter in daily life.",
+        "Explain how people usually engage with music. Describe how that routine has evolved. Analyze what could change it in the future.",
+        "Discuss a complex experience related to music. Explain how the situation developed. Analyze what it shows about people's choices or values.",
+    ],
+}
+
+
+@pytest.mark.parametrize("level", sorted(UNTOUCHED_PRACTICE_FRONT_PROMPTS))
+def test_untouched_levels_keep_existing_prompts(
+    generator: FallbackQuestionGenerator, level: int
+) -> None:
+    questions = generator.practice_front(level, BACKGROUND)
+    assert [
+        item.prompt for item in questions
+    ] == UNTOUCHED_PRACTICE_FRONT_PROMPTS[level]
 
 
 def test_catalog_has_required_mock_schema() -> None:

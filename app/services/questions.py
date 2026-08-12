@@ -324,9 +324,13 @@ class FallbackQuestionGenerator:
     def _level_question_type(
         level: int, requested: QuestionStyle
     ) -> QuestionStyle:
+        # PAST_EXPERIENCE 를 강등하면 콤보(묘사/루틴/과거경험)의 1번과 3번이 같은
+        # 프롬프트가 되어 유일성 검증에 걸린다. _validate_level_rules 도 레벨 1 에서
+        # PAST_EXPERIENCE 를 금지하지 않으므로 그대로 유지한다.
         if level <= 1 and requested not in {
             QuestionStyle.DESCRIPTION,
             QuestionStyle.ROUTINE,
+            QuestionStyle.PAST_EXPERIENCE,
         }:
             return QuestionStyle.DESCRIPTION
         if level <= 2 and requested in {
@@ -368,6 +372,8 @@ class FallbackQuestionGenerator:
         if level <= 1:
             if question_type is QuestionStyle.ROUTINE:
                 return f"What do you usually do when you enjoy {topic_label}."
+            if question_type is QuestionStyle.PAST_EXPERIENCE:
+                return f"Tell me about the last time you enjoyed {topic_label}."
             return f"Describe {topic_label} in your daily life."
         if level == 2:
             if question_type is QuestionStyle.PAST_EXPERIENCE:
@@ -378,10 +384,16 @@ class FallbackQuestionGenerator:
         if level == 3:
             if question_type is QuestionStyle.ROUTINE:
                 return f"Explain your usual routine for {topic_label}. Give one reason why it fits your life."
+            if question_type is QuestionStyle.DESCRIPTION:
+                return f"Tell me about {topic_label} in your daily life. Explain one reason you enjoy it."
             return f"Tell me about a memorable experience with {topic_label}. Explain why it was memorable."
         if level == 4:
             if question_type is QuestionStyle.COMPARISON:
                 return f"Compare your experience with {topic_label} now and in the past. Explain what has changed."
+            if question_type is QuestionStyle.DESCRIPTION:
+                return f"Describe {topic_label} in detail. Explain what makes it different from other things you enjoy."
+            if question_type is QuestionStyle.ROUTINE:
+                return f"Explain your usual routine for {topic_label}. Tell me why that routine works for you."
             return f"Tell me about a specific experience with {topic_label}. Explain the situation and why it mattered to you."
         if level == 5:
             if question_type is QuestionStyle.ROLEPLAY:

@@ -19,6 +19,7 @@ from app.models.api import (
     RubricDimension,
 )
 from app.services.ai import (
+    AIQuestionGenerationError,
     AIService,
     AIServiceConfigurationError,
     GeneratedQuestionContent,
@@ -612,3 +613,44 @@ async def test_analysis_depth_boundary_is_free_vs_paid() -> None:
         assert paid.corrected_answer is not None
         assert paid.sample_answer is not None
         assert paid.target_gap is not None
+
+
+class _BrokenResponses:
+    """OpenAI 장애를 재현한다. 호출하면 항상 예외를 던진다."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def create(self, **kwargs: object) -> object:
+        self.calls += 1
+        raise RuntimeError("provider down")
+
+
+class BrokenOpenAIClient:
+    def __init__(self) -> None:
+        self.responses = _BrokenResponses()
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4, 5, 6])
+async def test_practice_fallback_survives_provider_outage_at_every_level(
+    level: int,
+) -> None:
+    """OpenAI 가 죽어도 폴백 문항으로 응답할 수 있어야 한다.
+
+    폴백이 실패하면 routes 에서 503 ai_unavailable 로 나가 사용자가 문항을
+    아예 받지 못한다.
+    """
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    service._client = BrokenOpenAIClient()  # type: ignore[assignment]
+
+    try:
+        result = await service.generate_practice(
+            level, BackgroundProfile(interests=["movies", "music"])
+        )
+    except AIQuestionGenerationError as error:  # pragma: no cover - 수정 전 경로
+        raise AssertionError(f"level={level} 폴백 실패: {error}") from error
+
+    assert result.fallback_used is True
+    assert result.provider == "catalog"
+    assert [item.number for item in result.questions] == list(range(1, 8))
