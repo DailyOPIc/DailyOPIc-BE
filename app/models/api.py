@@ -90,6 +90,18 @@ class ConfidenceBand(StrEnum):
     HIGH = "high"
 
 
+class AnswerQuality(StrEnum):
+    """등급을 얼마나 믿을 수 있는지에 대한 서버 판정(DESIGN_DECISIONS T4의 A/B/C).
+
+    판정 규칙은 app/services/answer_quality.py 한 곳에만 둔다. 클라이언트는
+    이 값을 렌더링만 하고 자체 임계값을 만들지 않는다.
+    """
+
+    GRADABLE = "gradable"  # A
+    LOW_EVIDENCE = "low_evidence"  # B
+    INSUFFICIENT = "insufficient"  # C
+
+
 class RubricBand(StrEnum):
     FOUNDATION = "foundation"
     DEVELOPING = "developing"
@@ -336,6 +348,9 @@ class AudioMetrics(BaseModel):
     speaking_seconds: float = Field(alias="speakingSeconds", ge=0)
     silence_ratio: float = Field(alias="silenceRatio", ge=0, le=1)
     words_per_minute: float = Field(alias="wordsPerMinute", ge=0)
+    # ffprobe/ffmpeg 실패 또는 오디오 미첨부 시 전사 길이로 추정한 값이면 True.
+    # 측정값과 추정값을 구분하지 않으면 추정치를 근거로 신뢰도를 말하게 된다.
+    is_estimated: bool = Field(default=False, alias="isEstimated")
 
 
 class PracticeEvaluation(BaseModel):
@@ -358,6 +373,10 @@ class PracticeEvaluation(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     score_scale_version: str = Field(
         default="rubric-band-v1", alias="scoreScaleVersion"
+    )
+    # 근거 충분도. 판정 규칙은 app/services/answer_quality.py 한 곳에만 있다.
+    answer_quality: AnswerQuality = Field(
+        default=AnswerQuality.GRADABLE, alias="answerQuality"
     )
 
 
@@ -410,6 +429,9 @@ class MockEvaluation(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     score_scale_version: str = Field(
         default="rubric-band-v1", alias="scoreScaleVersion"
+    )
+    answer_quality: AnswerQuality = Field(
+        default=AnswerQuality.GRADABLE, alias="answerQuality"
     )
 
     @field_validator("per_question")
@@ -507,12 +529,11 @@ class CapabilityQuotaPolicy(BaseModel):
     practice_ad_bonus: int = Field(default=1, alias="practiceAdBonus", ge=0)
     history_days: int | None = Field(default=7, alias="historyDays", ge=0)
     analysis_depth: str = Field(default="summary", alias="analysisDepth")
-    grade_trend: str = Field(default="limited", alias="gradeTrend")
-    weakness_analysis: str = Field(default="none", alias="weaknessAnalysis")
     review_set: bool = Field(default=False, alias="reviewSet")
-    weekly_report: bool = Field(default=False, alias="weeklyReport")
-    mock_comparison: str = Field(default="none", alias="mockComparison")
     ads_enabled: bool = Field(default=True, alias="adsEnabled")
+    # 제거: gradeTrend / weaknessAnalysis / weeklyReport / mockComparison.
+    # 앞의 셋은 앱이 로컬 기록으로 계산하는 전 플랜 무료 기능이고, 마지막은
+    # 구현이 없는 값이었다. 강제하지 않는 게이트는 내려보내지 않는다.
 
 
 class CapabilitiesResponse(BaseModel):
