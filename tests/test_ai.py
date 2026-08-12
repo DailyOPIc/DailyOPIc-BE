@@ -323,14 +323,17 @@ async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() 
         effective_level=2,
     )
 
+    # ROLEPLAY 는 초급에서도 유지한다(실제 시험에 반드시 나오는 유형).
+    # 난이도는 프롬프트 문장 길이로 낮추고, 인지 부하가 큰 세 유형만 제외한다.
     forbidden = {
         QuestionStyle.COMPARISON,
         QuestionStyle.PROBLEM_SOLVING,
         QuestionStyle.OPINION,
-        QuestionStyle.ROLEPLAY,
     }
+    styles = {item.question_style for item in result.questions}
     assert [item.number for item in result.questions] == list(range(8, 16))
-    assert {item.question_style for item in result.questions}.isdisjoint(forbidden)
+    assert styles.isdisjoint(forbidden)
+    assert QuestionStyle.ROLEPLAY in styles
     request = service._client.responses.requests[0]  # type: ignore[union-attr]
     input_text = json.loads(str(request["input"]))
     assert input_text["effectiveLevel"] == 2

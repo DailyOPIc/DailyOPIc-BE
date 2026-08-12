@@ -1439,19 +1439,13 @@ class AIService:
     ) -> None:
         forbidden: set[QuestionStyle] = set()
 
-        if simulation_level <= 1:
+        # ROLEPLAY 는 초급에서도 허용한다. 실제 시험에 반드시 나오므로 유형을
+        # 빼지 않고 프롬프트 문장 길이로만 난이도를 낮춘다.
+        if simulation_level <= 2:
             forbidden = {
                 QuestionStyle.COMPARISON,
                 QuestionStyle.PROBLEM_SOLVING,
                 QuestionStyle.OPINION,
-                QuestionStyle.ROLEPLAY,
-            }
-        elif simulation_level == 2:
-            forbidden = {
-                QuestionStyle.COMPARISON,
-                QuestionStyle.PROBLEM_SOLVING,
-                QuestionStyle.OPINION,
-                QuestionStyle.ROLEPLAY,
             }
         elif simulation_level == 3:
             forbidden = {

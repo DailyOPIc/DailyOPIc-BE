@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -181,3 +182,60 @@ def test_catalog_has_required_mock_schema() -> None:
         "tags",
     }
     assert all(required.issubset(item.keys()) for item in repository.patterns)
+
+
+def _sentence_count(prompt: str) -> int:
+    """AIService._sentence_count 와 동일한 정의."""
+    return len([item for item in re.split(r"[.!?]+", prompt) if item.strip()])
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4, 5, 6])
+def test_mock_exam_keeps_roleplay_section_at_low_levels(
+    generator: FallbackQuestionGenerator, level: int
+) -> None:
+    """실제 OPIc 은 자기평가 레벨과 무관하게 Q11·Q12 를 롤플레이로 낸다.
+    초급이라고 섹션을 빼면 사용자가 롤플레이를 연습할 기회가 없다."""
+    questions = generator.mock_front(level, BACKGROUND) + generator.mock_tail(
+        effective_level=level, background=BACKGROUND
+    )
+    validate_mock_blueprint(questions)
+    assert questions[10].exam_section is ExamSection.ROLEPLAY
+    assert questions[11].exam_section is ExamSection.ROLEPLAY
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_low_level_mock_has_a_real_roleplay_prompt(
+    generator: FallbackQuestionGenerator, level: int
+) -> None:
+    """섹션만 롤플레이로 두고 내용이 묘사 문항이면 연습 효과가 없다.
+    난이도는 문장 길이로만 낮춘다."""
+    questions = generator.mock_tail(effective_level=level, background=BACKGROUND)
+    roleplay = [
+        item for item in questions if item.question_style is QuestionStyle.ROLEPLAY
+    ]
+    assert roleplay, f"level={level} 롤플레이 스타일 문항이 없다"
+    for item in roleplay:
+        assert _sentence_count(item.prompt) <= 2, f"level={level} 롤플레이 문장 과다"
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4, 5, 6])
+def test_every_reachable_style_has_its_own_prompt(level: int) -> None:
+    """_prompt_for_level 에 분기가 없는 스타일은 함수 끝의 과거경험 문장으로
+    조용히 떨어진다. 그러면 롤플레이 칸에 과거경험 문항이 들어간다."""
+    label = "movies"
+    default = FallbackQuestionGenerator._prompt_for_level(
+        level=level, question_type=QuestionStyle.PAST_EXPERIENCE, topic_label=label
+    )
+    fell_through = []
+    for style in QuestionStyle:
+        if style is QuestionStyle.PAST_EXPERIENCE:
+            continue
+        # 의도적으로 강등되는 스타일은 대상이 아니다.
+        if FallbackQuestionGenerator._level_question_type(level, style) is not style:
+            continue
+        prompt = FallbackQuestionGenerator._prompt_for_level(
+            level=level, question_type=style, topic_label=label
+        )
+        if prompt == default:
+            fell_through.append(style.value)
+    assert not fell_through, f"level={level} 분기 누락={fell_through}"

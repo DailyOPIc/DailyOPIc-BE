@@ -327,17 +327,19 @@ class FallbackQuestionGenerator:
         # PAST_EXPERIENCE 를 강등하면 콤보(묘사/루틴/과거경험)의 1번과 3번이 같은
         # 프롬프트가 되어 유일성 검증에 걸린다. _validate_level_rules 도 레벨 1 에서
         # PAST_EXPERIENCE 를 금지하지 않으므로 그대로 유지한다.
+        # ROLEPLAY 는 초급에서도 유지한다. 실제 시험에 반드시 나오는 유형이라
+        # 빼면 연습 기회가 사라진다. 난이도는 프롬프트 문장으로 낮춘다.
         if level <= 1 and requested not in {
             QuestionStyle.DESCRIPTION,
             QuestionStyle.ROUTINE,
             QuestionStyle.PAST_EXPERIENCE,
+            QuestionStyle.ROLEPLAY,
         }:
             return QuestionStyle.DESCRIPTION
         if level <= 2 and requested in {
             QuestionStyle.COMPARISON,
             QuestionStyle.PROBLEM_SOLVING,
             QuestionStyle.OPINION,
-            QuestionStyle.ROLEPLAY,
         }:
             return QuestionStyle.PAST_EXPERIENCE
         if level <= 3 and requested in {
@@ -350,22 +352,6 @@ class FallbackQuestionGenerator:
         return requested
 
     @staticmethod
-    def _broad_type_for_level(
-        level: int, requested: ExamSection, question_type: QuestionStyle
-    ) -> ExamSection:
-        if requested in {ExamSection.SURVEY, ExamSection.UNEXPECTED}:
-            return requested
-        if requested is ExamSection.ADVANCED and question_type is QuestionStyle.COMPARISON:
-            return ExamSection.COMPARISON
-        if level <= 2 and requested in {
-            ExamSection.ROLEPLAY,
-            ExamSection.COMPARISON,
-            ExamSection.ADVANCED,
-        }:
-            return ExamSection.UNEXPECTED
-        return requested
-
-    @staticmethod
     def _prompt_for_level(
         *, level: int, question_type: QuestionStyle, topic_label: str
     ) -> str:
@@ -374,18 +360,26 @@ class FallbackQuestionGenerator:
                 return f"What do you usually do when you enjoy {topic_label}."
             if question_type is QuestionStyle.PAST_EXPERIENCE:
                 return f"Tell me about the last time you enjoyed {topic_label}."
+            if question_type is QuestionStyle.ROLEPLAY:
+                return f"Call your friend and ask two simple questions about {topic_label}."
             return f"Describe {topic_label} in your daily life."
         if level == 2:
             if question_type is QuestionStyle.PAST_EXPERIENCE:
                 return f"Tell me about a simple experience related to {topic_label}. Why do you remember it."
             if question_type is QuestionStyle.ROUTINE:
                 return f"What do you usually do when you spend time with {topic_label}. Give one simple reason."
+            if question_type is QuestionStyle.ROLEPLAY:
+                return f"You want to try {topic_label} with a friend. Ask two questions to plan it."
             return f"Tell me about {topic_label}. Why do you like it."
         if level == 3:
             if question_type is QuestionStyle.ROUTINE:
                 return f"Explain your usual routine for {topic_label}. Give one reason why it fits your life."
             if question_type is QuestionStyle.DESCRIPTION:
                 return f"Tell me about {topic_label} in your daily life. Explain one reason you enjoy it."
+            if question_type is QuestionStyle.COMPARISON:
+                return f"Compare two things you like about {topic_label}. Explain which one you prefer."
+            if question_type is QuestionStyle.ROLEPLAY:
+                return f"Call a friend to make a plan about {topic_label}. Ask two questions and confirm the time."
             return f"Tell me about a memorable experience with {topic_label}. Explain why it was memorable."
         if level == 4:
             if question_type is QuestionStyle.COMPARISON:
@@ -394,6 +388,10 @@ class FallbackQuestionGenerator:
                 return f"Describe {topic_label} in detail. Explain what makes it different from other things you enjoy."
             if question_type is QuestionStyle.ROUTINE:
                 return f"Explain your usual routine for {topic_label}. Tell me why that routine works for you."
+            if question_type is QuestionStyle.ROLEPLAY:
+                return f"You need help with {topic_label}. Call someone, explain your situation, and ask two questions."
+            if question_type is QuestionStyle.PROBLEM_SOLVING:
+                return f"Describe a problem you had with {topic_label}. Explain how you solved it."
             return f"Tell me about a specific experience with {topic_label}. Explain the situation and why it mattered to you."
         if level == 5:
             if question_type is QuestionStyle.ROLEPLAY:
@@ -406,6 +404,8 @@ class FallbackQuestionGenerator:
                 return f"Describe the key features of {topic_label}. Explain what makes them distinctive. Tell me why they matter to you."
             if question_type is QuestionStyle.ROUTINE:
                 return f"Explain your usual routine involving {topic_label}. Describe how you organize it. Tell me why that routine works well for you."
+            if question_type is QuestionStyle.OPINION:
+                return f"Explain what people usually think about {topic_label}. Give your own opinion with one reason. Tell me why that reason matters to you."
             return f"Describe a detailed experience related to {topic_label}. Explain the background and the result. Tell me how that experience changed your thinking."
         if question_type is QuestionStyle.OPINION:
             return f"Discuss how {topic_label} influences people or society today. Explain both advantages and disadvantages. Predict one important change in the future."
@@ -439,8 +439,10 @@ class FallbackQuestionGenerator:
         category: str,
         requested_type: QuestionStyle,
     ) -> GeneratedQuestion:
+        # examSection 은 시험 구조이므로 레벨에 따라 바꾸지 않는다. 실제 OPIc 도
+        # 자기평가 레벨과 무관하게 롤플레이·비교·고난도 섹션을 그대로 낸다.
+        # 난이도는 questionStyle 과 프롬프트 문장으로만 조절한다.
         question_type = self._level_question_type(level, requested_type)
-        broad_type = self._broad_type_for_level(level, broad_type, question_type)
         topic_label = self._topic_label(topic_id)
         return GeneratedQuestion(
             number=number,
