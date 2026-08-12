@@ -29,7 +29,12 @@ from app.services.rate_limit import (
 QUESTION_PATTERN_FILE = Path("app/data/question_patterns.json")
 REQUEST_RESULT_TTL_HOURS = 24
 AUDIO_MAX_SECONDS = 180
-AUDIO_MAX_BYTES = 4 * 1024 * 1024
+# 상한은 "iOS가 실제로 만드는 180초 파일"에서 역산한다. 앱스토어에 나가 있는
+# 클라이언트는 AVAssetExportPresetAppleM4A로 내보내는데, 48kHz 마이크 입력에서는
+# 약 256kbps AAC가 나온다(측정: 180초 → 5.43MiB). 여기에 타이머·탭 지연 여유
+# 185초(5.65MiB)와 컨테이너 오버헤드를 더해 8MiB로 잡는다.
+# 4MiB였을 때는 약 131초짜리 정상 녹음이 "audio file is too large"로 거절됐다.
+AUDIO_MAX_BYTES = 8 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 

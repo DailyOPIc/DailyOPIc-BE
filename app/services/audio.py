@@ -14,6 +14,12 @@ from app.models.api import AudioMetrics
 SILENCE_START = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END = re.compile(r"silence_end:\s*([0-9.]+)")
 
+# 앱이 180초에서 녹음을 멈춰도 컨테이너 길이는 그보다 조금 길게 찍힌다.
+# AAC 인코더 패딩 때문이다(측정: 180.000초 원본 → 180.053초 m4a). 여기에 1초
+# 단위 타이머와 엔진 정지 지연이 더해진다. 정상 길이 녹음을 "너무 길다"로
+# 되돌리지 않도록 짧은 허용치를 둔다. 진짜 초과 녹음은 그대로 막힌다.
+DURATION_TOLERANCE_SECONDS = 2.0
+
 
 class AudioValidationError(ValueError):
     pass
@@ -73,7 +79,7 @@ class AudioMetricsService:
             duration = max(1.0, words / 130 * 60)
             estimated = True
 
-        if duration > self._max_seconds:
+        if duration > self._max_seconds + DURATION_TOLERANCE_SECONDS:
             raise AudioValidationError(f"audio must be {self._max_seconds} seconds or shorter")
 
         silence_seconds = 0.0
