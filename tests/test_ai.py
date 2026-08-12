@@ -19,6 +19,7 @@ from app.models.api import (
     RubricDimension,
 )
 from app.services.ai import (
+    RUBRIC_SCORE_BY_BAND,
     AIQuestionGenerationError,
     AIService,
     AIServiceConfigurationError,
@@ -657,3 +658,80 @@ async def test_practice_fallback_survives_provider_outage_at_every_level(
     assert result.fallback_used is True
     assert result.provider == "catalog"
     assert [item.number for item in result.questions] == list(range(1, 8))
+
+
+def _contradictory_practice_payload() -> str:
+    """전 항목 developing 인데 등급만 IH 로 말하는 응답."""
+    return json.dumps(
+        {
+            "predictedLevel": "IH",
+            "confidence": "medium",
+            "rubrics": [
+                {
+                    "dimension": dimension.value,
+                    "band": "developing",
+                    "evidence": "근거",
+                    "nextAction": "액션",
+                }
+                for dimension in RubricDimension
+            ],
+            "strengths": ["문장을 완성했습니다."],
+            "improvements": ["예시를 덧붙이세요."],
+            "correctedAnswer": "I watch movies with my family on weekends.",
+            "targetGap": "세부 묘사를 보강하세요.",
+            "sampleAnswer": "I usually watch movies at home with my family.",
+        }
+    )
+
+
+async def test_practice_evaluation_reconciles_contradictory_level() -> None:
+    """항목별 밴드가 낮은데 등급만 높은 응답은 상한으로 끌어내리고 기록을 남긴다."""
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    service._client = FakeTextOpenAIClient([_contradictory_practice_payload()])  # type: ignore[assignment]
+    question = FallbackQuestionGenerator(repository).practice_front(
+        4, BackgroundProfile(interests=["movies", "music"])
+    )[1]
+
+    result = await service.evaluate_practice(
+        question=question,
+        transcript="I watch movies on weekends with my family.",
+        target=OPIcLevel.IM2,
+        metrics=AudioMetrics(
+            durationSeconds=40.0,
+            speakingSeconds=20.0,
+            silenceRatio=0.5,
+            wordsPerMinute=70.0,
+        ),
+    )
+
+    assert result.predicted_level is OPIcLevel.IM3
+    assert "levelReconciled" in result.warnings
+    # 점수는 밴드에서 그대로 파생된다(스케일 변경 없음).
+    assert result.scores.task_fulfillment == RUBRIC_SCORE_BY_BAND[RubricBand.DEVELOPING]
+
+
+async def test_practice_evaluation_keeps_consistent_level_untouched() -> None:
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    payload = json.loads(_contradictory_practice_payload())
+    payload["predictedLevel"] = "IM1"
+    service._client = FakeTextOpenAIClient([json.dumps(payload)])  # type: ignore[assignment]
+    question = FallbackQuestionGenerator(repository).practice_front(
+        4, BackgroundProfile(interests=["movies", "music"])
+    )[1]
+
+    result = await service.evaluate_practice(
+        question=question,
+        transcript="I watch movies on weekends with my family.",
+        target=OPIcLevel.IM2,
+        metrics=AudioMetrics(
+            durationSeconds=40.0,
+            speakingSeconds=20.0,
+            silenceRatio=0.5,
+            wordsPerMinute=70.0,
+        ),
+    )
+
+    assert result.predicted_level is OPIcLevel.IM1
+    assert "levelReconciled" not in result.warnings

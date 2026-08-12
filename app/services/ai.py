@@ -37,6 +37,7 @@ from app.models.api import (
     RubricDimension,
 )
 from app.services import answer_quality
+from app.services import telemetry
 from app.services.plans import AnalysisDepth
 from app.services.questions import (
     FallbackQuestionGenerator,
@@ -77,6 +78,76 @@ RUBRIC_SCORE_BY_BAND = {
     RubricBand.STRONG: 80,
     RubricBand.ADVANCED: 95,
 }
+
+# 예상 등급 보정에 쓰는 등급 순서(IL~AL). predictedLevel 은 _clamp_min_level 을
+# 통과한 뒤 이 범위 안에 있다.
+_RECONCILE_SCALE = [
+    OPIcLevel.IL,
+    OPIcLevel.IM1,
+    OPIcLevel.IM2,
+    OPIcLevel.IM3,
+    OPIcLevel.IH,
+    OPIcLevel.AL,
+]
+_BAND_ORDINAL = {
+    RubricBand.FOUNDATION: 0,
+    RubricBand.DEVELOPING: 1,
+    RubricBand.FUNCTIONAL: 2,
+    RubricBand.STRONG: 3,
+    RubricBand.ADVANCED: 4,
+}
+
+
+def _reconcile_with_rubrics(
+    level: OPIcLevel, rubrics: list[RubricAssessment]
+) -> tuple[OPIcLevel, bool]:
+    """항목별 밴드가 뒷받침하지 못하는 예상 등급을 상한까지 끌어내린다.
+
+    모델은 predictedLevel 과 rubrics 를 한 응답에서 각각 내보내고, 둘을 대조하는
+    지점이 없었다. 그래서 전 항목이 developing 인데 predictedLevel 이 IH 인 응답도
+    그대로 통과했다.
+
+    임의 임계값을 만들지 않기 위해 **평균 점수 구간을 쓰지 않는다.** 공식 등급
+    기준에서 곧바로 끌어낼 수 있는 상한만 적용한다.
+
+    - 모든 항목이 최하 밴드면 하한(IL) 이상을 주장할 근거가 없다.
+    - IH 는 "예측 못한 복잡한 상황을 설명하고 문제를 효과적으로 해결"이다.
+      어느 항목도 strong 에 못 미치거나, 과제수행·구성이 functional 미만이면
+      IH 이상을 주장할 수 없다.
+    - AL 은 시제·형용사·접속사·문단을 "일관되게" 관리하는 수준이다. 한 항목이라도
+      strong 미만이거나 advanced 가 하나도 없으면 AL 이 될 수 없다.
+
+    보정은 상한만 적용하므로 등급을 올리는 방향으로는 절대 움직이지 않는다.
+    등급 구간을 새로 발명하지 않고 근거 없는 주장만 걷어내는 것이 목적이다.
+    """
+    if level not in _RECONCILE_SCALE:
+        return level, False
+
+    bands = {item.dimension: item.band for item in rubrics}
+    ordinals = [_BAND_ORDINAL[band] for band in bands.values()]
+    if not ordinals:
+        return level, False
+
+    strong = _BAND_ORDINAL[RubricBand.STRONG]
+    functional = _BAND_ORDINAL[RubricBand.FUNCTIONAL]
+    cap = OPIcLevel.AL
+
+    def tighten(candidate: OPIcLevel) -> OPIcLevel:
+        return min(cap, candidate, key=_RECONCILE_SCALE.index)
+
+    if max(ordinals) == _BAND_ORDINAL[RubricBand.FOUNDATION]:
+        cap = tighten(MIN_PREDICTED_LEVEL)
+    if max(ordinals) < strong:
+        cap = tighten(OPIcLevel.IM3)
+    for dimension in (RubricDimension.TASK_FULFILLMENT, RubricDimension.DISCOURSE):
+        if _BAND_ORDINAL[bands[dimension]] < functional:
+            cap = tighten(OPIcLevel.IM3)
+    if min(ordinals) < strong or max(ordinals) < _BAND_ORDINAL[RubricBand.ADVANCED]:
+        cap = tighten(OPIcLevel.IH)
+
+    if _RECONCILE_SCALE.index(level) <= _RECONCILE_SCALE.index(cap):
+        return level, False
+    return cap, True
 logger = logging.getLogger(__name__)
 
 BriefKorean = Annotated[str, Field(min_length=1, max_length=140)]
@@ -1668,9 +1739,18 @@ class AIService:
             result = structured.payload
         assert isinstance(result, AIPracticeResult)
         result_dump = result.model_dump(by_alias=True)
-        # 예상 등급 하한 IL 적용(IL~AL).
+        # 예상 등급 하한 IL 적용(IL~AL) 후 항목별 밴드와 대조해 상한을 적용한다.
         level, clamped = _clamp_min_level(result.predicted_level)
+        level, reconciled = _reconcile_with_rubrics(level, result.rubrics)
         result_dump["predictedLevel"] = level.value
+        if reconciled:
+            telemetry.emit(
+                "evaluation_level_reconciled",
+                mode="practice",
+                modelLevel=result.predicted_level.value,
+                finalLevel=level.value,
+                promptVersion=PROMPT_VERSION,
+            )
         if strip_long:
             # 하위 티어는 교정/모범답안/목표갭을 제공하지 않음(누락은 경고 대상 아님).
             result_dump["correctedAnswer"] = None
@@ -1683,7 +1763,10 @@ class AIService:
                 "targetGap": result.target_gap,
                 "sampleAnswer": result.sample_answer,
             }
-        warnings = [name for name, value in warning_source.items() if not value]
+        missing = [name for name, value in warning_source.items() if not value]
+        # 등급 보정은 선택 필드 누락과 성격이 다르다. 결과가 불완전한 것은 아니므로
+        # warnings 에만 남기고 resultStatus 는 누락 여부로만 결정한다.
+        warnings = missing + (["levelReconciled"] if reconciled else [])
         return PracticeEvaluation(
             **result_dump,
             scores=self._scores_from_rubrics(result.rubrics),
@@ -1691,7 +1774,7 @@ class AIService:
             disclaimer=DISCLAIMER,
             modelVersion=self.model,
             promptVersion=PROMPT_VERSION,
-            resultStatus="partial" if warnings else "complete",
+            resultStatus="partial" if missing else "complete",
             warnings=warnings,
             scoreScaleVersion=SCORE_SCALE_VERSION,
             answerQuality=answer_quality.classify(
@@ -1773,7 +1856,16 @@ class AIService:
         assert isinstance(result, AIMockResult)
         mock_dump = result.model_dump(by_alias=True)
         level, clamped = _clamp_min_level(result.predicted_level)
+        level, reconciled = _reconcile_with_rubrics(level, result.rubrics)
         mock_dump["predictedLevel"] = level.value
+        if reconciled:
+            telemetry.emit(
+                "evaluation_level_reconciled",
+                mode="mock",
+                modelLevel=result.predicted_level.value,
+                finalLevel=level.value,
+                promptVersion=PROMPT_VERSION,
+            )
         return MockEvaluation(
             **mock_dump,
             scores=self._scores_from_rubrics(result.rubrics),
@@ -1784,7 +1876,7 @@ class AIService:
             modelVersion=self.model,
             promptVersion=PROMPT_VERSION,
             resultStatus="complete",
-            warnings=[],
+            warnings=["levelReconciled"] if reconciled else [],
             scoreScaleVersion=SCORE_SCALE_VERSION,
             answerQuality=answer_quality.classify_many(
                 transcripts=transcripts,
