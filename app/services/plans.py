@@ -4,8 +4,9 @@ IAP BM의 단일 진실 소스. 서버는 이 매핑을 근거로 사용량을 �
 클라이언트는 /v1/capabilities 로 플랜별 정책을 받아 UI를 게이팅한다.
 
 플랜 4단계: free / basic / plus / pro
-- basic = "가성비 히어로"(₩2,900): 광고 제거 + 매일 모의고사 + 데일리 3회
-- 시험 대비 패스는 기간 내 pro 동급으로 취급(entitlement.plan == pro)
+- basic = "가성비 히어로"(₩2,900): 광고 제거 + 결과 전체 해제 + 데일리 3회
+- 분석 내용의 차이는 무료↔유료 한 곳뿐이다(AnalysisDepth 참고).
+  유료 플랜끼리의 차이는 하루 횟수 · 기록 보관 기간 · 복습 세트뿐이다.
 """
 
 from __future__ import annotations
@@ -29,18 +30,16 @@ class Plan(StrEnum):
 
 
 class AnalysisDepth(StrEnum):
-    SUMMARY = "summary"  # 예상 등급 + 요약(교정/모범답안 없음) — 무료
-    BASIC = "basic"  # 기본 분석 — 베이직
-    DETAILED = "detailed"  # 상세(풀 루브릭 + 교정/모범답안) — 플러스
-    FOCUS = "focus"  # 집중(상세 + 답변별 코칭) — 프로
+    """AI가 실제로 다르게 만들어내는 깊이는 두 단계뿐이다.
 
+    이전에는 summary/basic/detailed/focus 네 값이 있었지만 `ai.py`는
+    summary·basic을 똑같이 축약하고 detailed·focus를 똑같이 전체 생성해서,
+    베이직↔플러스↔프로의 "더 깊은 분석" 차이가 실제로는 존재하지 않았다.
+    있지도 않은 차이를 이름으로만 유지하지 않는다.
+    """
 
-class FeatureTier(StrEnum):
-    NONE = "none"
-    LIMITED = "limited"
-    BASIC = "basic"
-    DETAILED = "detailed"
-    ADVANCED = "advanced"
+    SUMMARY = "summary"  # 예상 등급 + 강점/개선점 + 5영역 피드백 — 무료
+    FULL = "full"  # 위 전부 + 교정 답안 · 모범 답안 · 목표 갭 — 유료 전체
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,12 +53,12 @@ class PlanLimits:
     mock_is_trial: bool  # True면 mock_daily가 '평생 1회 체험'을 의미(무료)
     history_days: int | None  # 학습 기록 열람 범위(None = 전체)
     analysis_depth: AnalysisDepth
-    grade_trend: FeatureTier  # 예상 등급 추이
-    weakness_analysis: FeatureTier  # 취약 유형 분석
-    review_set: bool  # 취약점 복습 세트 자동 생성
-    weekly_report: bool  # 학습 리포트(주간)
-    mock_comparison: FeatureTier  # 모의고사 비교(v2 준비값)
+    review_set: bool  # 취약점 복습 세트 자동 생성(routes.py에서 실제 강제)
     ads_enabled: bool  # 배너/리워드 광고 노출 여부
+    # 삭제한 필드: grade_trend / weakness_analysis / weekly_report /
+    # mock_comparison. 스마트 인사이트 3종은 앱이 로컬 기록으로 계산해 전 플랜
+    # 무료로 제공하고, 모의고사 비교는 서버·앱 어디에도 구현이 없었다.
+    # 강제하지 않는 플랜 게이트를 capabilities로 내려보내면 그 자체가 거짓 약속이다.
 
 
 _MOCK_REWARD_GATES = 3  # start / adjustment / result
@@ -75,11 +74,7 @@ _DEFAULT_LIMITS = PlanLimits(
     mock_is_trial=True,
     history_days=7,
     analysis_depth=AnalysisDepth.SUMMARY,
-    grade_trend=FeatureTier.LIMITED,
-    weakness_analysis=FeatureTier.NONE,
     review_set=False,
-    weekly_report=False,
-    mock_comparison=FeatureTier.NONE,
     ads_enabled=True,
 )
 
@@ -93,8 +88,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "mock_requires_ad": False,
         "mock_is_trial": False,
         "history_days": 30,
-        "analysis_depth": AnalysisDepth.BASIC,
-        "grade_trend": FeatureTier.BASIC,
+        "analysis_depth": AnalysisDepth.FULL,
         "ads_enabled": False,
     },
     Plan.PLUS: {
@@ -105,9 +99,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "mock_requires_ad": False,
         "mock_is_trial": False,
         "history_days": 30,
-        "analysis_depth": AnalysisDepth.DETAILED,
-        "grade_trend": FeatureTier.BASIC,
-        "weakness_analysis": FeatureTier.BASIC,
+        "analysis_depth": AnalysisDepth.FULL,
         "ads_enabled": False,
     },
     Plan.PRO: {
@@ -118,12 +110,8 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "mock_requires_ad": False,
         "mock_is_trial": False,
         "history_days": None,
-        "analysis_depth": AnalysisDepth.FOCUS,
-        "grade_trend": FeatureTier.DETAILED,
-        "weakness_analysis": FeatureTier.ADVANCED,
+        "analysis_depth": AnalysisDepth.FULL,
         "review_set": True,
-        "weekly_report": True,
-        "mock_comparison": FeatureTier.DETAILED,
         "ads_enabled": False,
     },
 }
@@ -139,14 +127,21 @@ def limits_for(plan: Plan | str | None) -> PlanLimits:
     return PLAN_LIMITS[Plan(plan) if plan is not None else Plan.FREE]
 
 
-# RevenueCat 대시보드의 엔타이틀먼트 식별자 → 플랜. 동명 매핑을 기본으로 하되
-# 하위 호환용 별칭을 포함한다. 시험 대비 패스는 pro 엔타이틀먼트에 연결.
+# RevenueCat 대시보드의 엔타이틀먼트 식별자 → 플랜.
+# 현재 판매 중인 상품은 basic / plus / pro 세 개뿐이다.
+# premium·exam_pass는 과거 명칭이며 지금은 발급되지 않는다. 그래도 남겨 둔다:
+# 아직 만료되지 않은 구독자가 있다면 매핑을 지우는 순간 무료로 강등되기 때문이다.
+# 새 상품을 이 별칭으로 만들지 않는다.
+_LEGACY_ENTITLEMENT_ALIASES: dict[str, Plan] = {
+    "premium": Plan.PRO,
+    "exam_pass": Plan.PRO,
+}
+
 _ENTITLEMENT_TO_PLAN: dict[str, Plan] = {
     "basic": Plan.BASIC,
     "plus": Plan.PLUS,
     "pro": Plan.PRO,
-    "premium": Plan.PRO,
-    "exam_pass": Plan.PRO,
+    **_LEGACY_ENTITLEMENT_ALIASES,
 }
 
 _PLAN_RANK = {Plan.FREE: 0, Plan.BASIC: 1, Plan.PLUS: 2, Plan.PRO: 3}

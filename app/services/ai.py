@@ -36,6 +36,8 @@ from app.models.api import (
     RubricBand,
     RubricDimension,
 )
+from app.services import answer_quality
+from app.services.plans import AnalysisDepth
 from app.services.questions import (
     FallbackQuestionGenerator,
     QuestionPatternRepository,
@@ -56,10 +58,16 @@ LEVELS = list(OPIcLevel)
 MIN_PREDICTED_LEVEL = OPIcLevel.IL
 
 
-def _clamp_min_level(level: OPIcLevel) -> OPIcLevel:
-    """예상 등급 하한을 IL로 고정(IL~AL 범위). NL/NM/NH로 내려가지 않도록."""
+def _clamp_min_level(level: OPIcLevel) -> tuple[OPIcLevel, bool]:
+    """예상 등급 하한을 IL로 고정(IL~AL 범위). NL/NM/NH로 내려가지 않도록.
+
+    올렸는지 여부를 함께 돌려준다. 올린 IL은 "진짜 IL"이 아니라 "IL이라고
+    말할 근거가 없음"이므로 답변 품질 판정(answer_quality)에서 구분한다.
+    """
     floor = LEVELS.index(MIN_PREDICTED_LEVEL)
-    return level if LEVELS.index(level) >= floor else MIN_PREDICTED_LEVEL
+    if LEVELS.index(level) >= floor:
+        return level, False
+    return MIN_PREDICTED_LEVEL, True
 
 
 RUBRIC_SCORE_BY_BAND = {
@@ -1534,7 +1542,7 @@ class AIService:
             (0.44, OPIcLevel.IM2),
             (0.34, OPIcLevel.IM1),
         ]
-        level = _clamp_min_level(
+        level, _ = _clamp_min_level(
             next(
                 (level for minimum, level in thresholds if total >= minimum),
                 OPIcLevel.IL,
@@ -1604,9 +1612,11 @@ class AIService:
         metrics: AudioMetrics,
         depth: str = "detailed",
     ) -> PracticeEvaluation:
-        # 하위 티어(summary=무료, basic=베이직)는 교정/모범답안/목표갭을 생성·반환하지
-        # 않아 토큰·비용을 절감한다. 상세(plus)·집중(pro)만 전체 생성.
-        strip_long = str(depth) in {"summary", "basic"}
+        # 무료(summary)만 교정/모범답안/목표갭을 생성·반환하지 않는다.
+        # 유료 플랜은 모두 같은 전체 분석을 받는다. 베이직↔플러스↔프로 사이에
+        # 분석 깊이 차이는 없으며(차이는 횟수·기록 범위·복습 세트), 페이월도
+        # 그렇게만 말한다.
+        strip_long = str(depth) == str(AnalysisDepth.SUMMARY)
         if self._mock:
             level, scores = self._fallback_score(transcript, metrics)
             result = AIPracticeResult(
@@ -1665,7 +1675,8 @@ class AIService:
         assert isinstance(result, AIPracticeResult)
         result_dump = result.model_dump(by_alias=True)
         # 예상 등급 하한 IL 적용(IL~AL).
-        result_dump["predictedLevel"] = _clamp_min_level(result.predicted_level).value
+        level, clamped = _clamp_min_level(result.predicted_level)
+        result_dump["predictedLevel"] = level.value
         if strip_long:
             # 하위 티어는 교정/모범답안/목표갭을 제공하지 않음(누락은 경고 대상 아님).
             result_dump["correctedAnswer"] = None
@@ -1689,6 +1700,11 @@ class AIService:
             resultStatus="partial" if warnings else "complete",
             warnings=warnings,
             scoreScaleVersion=SCORE_SCALE_VERSION,
+            answerQuality=answer_quality.classify(
+                transcript=transcript,
+                metrics=metrics,
+                level_was_clamped=clamped,
+            ),
         )
 
     async def evaluate_mock(
@@ -1700,8 +1716,9 @@ class AIService:
         metrics: list[AudioMetrics],
         depth: str = "detailed",
     ) -> MockEvaluation:
-        # depth는 클라이언트 표시 게이팅용으로 전달받는다. 모의고사는 무료도
-        # 광고 게이트(3회) + 1일 1회로 빈도가 낮아 서버 생성은 항상 전체로 유지한다.
+        # 모의고사는 무료도 광고 게이트(3회) + 1일 1회로 빈도가 낮아 플랜과
+        # 무관하게 항상 전체 분석을 생성한다. 즉 모의고사 결과에는 플랜별
+        # 내용 차이가 없다 — 화면에서도 잠그지 않는다.
         del depth
         if self._mock:
             combined = " ".join(transcripts)
@@ -1761,10 +1778,13 @@ class AIService:
             result = structured.payload
         assert isinstance(result, AIMockResult)
         mock_dump = result.model_dump(by_alias=True)
-        mock_dump["predictedLevel"] = _clamp_min_level(result.predicted_level).value
+        level, clamped = _clamp_min_level(result.predicted_level)
+        mock_dump["predictedLevel"] = level.value
         return MockEvaluation(
             **mock_dump,
             scores=self._scores_from_rubrics(result.rubrics),
+            # 프롬프트가 문항별 피드백을 명시적으로 금지하므로 항상 비어 있다.
+            # "프로는 문항별 코칭" 같은 약속을 여기에 근거해 만들지 않는다.
             perQuestion=[],
             disclaimer=DISCLAIMER,
             modelVersion=self.model,
@@ -1772,4 +1792,9 @@ class AIService:
             resultStatus="complete",
             warnings=[],
             scoreScaleVersion=SCORE_SCALE_VERSION,
+            answerQuality=answer_quality.classify_many(
+                transcripts=transcripts,
+                metrics=metrics,
+                level_was_clamped=clamped,
+            ),
         )

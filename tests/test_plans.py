@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from app.services.plans import (
     AnalysisDepth,
-    FeatureTier,
     PLAN_LIMITS,
     Plan,
     PlanLimits,
@@ -41,11 +42,7 @@ class TestPlanLimitsFree:
         # 기능 제한
         assert limits.history_days == 7
         assert limits.analysis_depth == AnalysisDepth.SUMMARY
-        assert limits.grade_trend == FeatureTier.LIMITED
-        assert limits.weakness_analysis == FeatureTier.NONE
         assert limits.review_set is False
-        assert limits.weekly_report is False
-        assert limits.mock_comparison == FeatureTier.NONE
 
     def test_plan_limits_free_immutability(self) -> None:
         """FREE PlanLimits는 불변(frozen=True)."""
@@ -73,12 +70,8 @@ class TestPlanLimitsBasic:
         # FREE와 동일한 값들
         assert limits.mock_daily == 1
         assert limits.history_days == 30
-        assert limits.analysis_depth == AnalysisDepth.BASIC
-        assert limits.grade_trend == FeatureTier.BASIC
-        assert limits.weakness_analysis == FeatureTier.NONE
+        assert limits.analysis_depth == AnalysisDepth.FULL
         assert limits.review_set is False
-        assert limits.weekly_report is False
-        assert limits.mock_comparison == FeatureTier.NONE
 
 
 class TestPlanLimitsPlus:
@@ -95,17 +88,13 @@ class TestPlanLimitsPlus:
         assert limits.refresh_ad_bonus == 20
         assert limits.mock_daily == 3
         assert limits.history_days == 30
-        assert limits.analysis_depth == AnalysisDepth.DETAILED
-        assert limits.weakness_analysis == FeatureTier.BASIC
+        assert limits.analysis_depth == AnalysisDepth.FULL
         assert limits.mock_requires_ad is False
         assert limits.mock_is_trial is False
         assert limits.ads_enabled is False
 
         # PLUS에서 공통값
-        assert limits.grade_trend == FeatureTier.BASIC
         assert limits.review_set is False
-        assert limits.weekly_report is False
-        assert limits.mock_comparison == FeatureTier.NONE
 
 
 class TestPlanLimitsPro:
@@ -122,12 +111,8 @@ class TestPlanLimitsPro:
         assert limits.refresh_ad_bonus == 30
         assert limits.mock_daily == 5
         assert limits.history_days is None  # 무제한
-        assert limits.analysis_depth == AnalysisDepth.FOCUS
-        assert limits.grade_trend == FeatureTier.DETAILED
-        assert limits.weakness_analysis == FeatureTier.ADVANCED
+        assert limits.analysis_depth == AnalysisDepth.FULL
         assert limits.review_set is True
-        assert limits.weekly_report is True
-        assert limits.mock_comparison == FeatureTier.DETAILED
         assert limits.mock_requires_ad is False
         assert limits.mock_is_trial is False
         assert limits.ads_enabled is False
@@ -198,17 +183,14 @@ class TestPlanComparisons:
         assert plus.practice_daily > basic.practice_daily
         assert pro.practice_daily > plus.practice_daily
 
-    def test_pro_most_generous_analysis(self) -> None:
-        """PRO는 분석 깊이가 가장 깊음."""
-        free = PLAN_LIMITS[Plan.FREE]
-        basic = PLAN_LIMITS[Plan.BASIC]
-        plus = PLAN_LIMITS[Plan.PLUS]
-        pro = PLAN_LIMITS[Plan.PRO]
+    def test_analysis_depth_has_one_paid_boundary(self) -> None:
+        """분석 깊이 차이는 무료↔유료 한 곳뿐이다.
 
-        assert free.analysis_depth == AnalysisDepth.SUMMARY
-        assert basic.analysis_depth == AnalysisDepth.BASIC
-        assert plus.analysis_depth == AnalysisDepth.DETAILED
-        assert pro.analysis_depth == AnalysisDepth.FOCUS
+        유료 플랜끼리 더 깊은 분석을 주지 않으므로 그렇게 팔지도 않는다.
+        """
+        assert PLAN_LIMITS[Plan.FREE].analysis_depth == AnalysisDepth.SUMMARY
+        for plan in (Plan.BASIC, Plan.PLUS, Plan.PRO):
+            assert PLAN_LIMITS[plan].analysis_depth == AnalysisDepth.FULL
 
     def test_paid_plans_no_ads(self) -> None:
         """유료 플랜(BASIC 이상)은 광고 비활성화."""
@@ -224,12 +206,12 @@ class TestPlanComparisons:
         assert PLAN_LIMITS[Plan.PLUS].review_set is False
         assert PLAN_LIMITS[Plan.PRO].review_set is True
 
-    def test_only_pro_has_weekly_report(self) -> None:
-        """주간 리포트는 PRO만."""
-        assert PLAN_LIMITS[Plan.FREE].weekly_report is False
-        assert PLAN_LIMITS[Plan.BASIC].weekly_report is False
-        assert PLAN_LIMITS[Plan.PLUS].weekly_report is False
-        assert PLAN_LIMITS[Plan.PRO].weekly_report is True
+    def test_smart_insights_are_not_plan_gated(self) -> None:
+        """등급 추이·취약 유형·주간 리포트는 전 플랜 무료 → 플랜 한도에 없다."""
+        fields = {field.name for field in dataclasses.fields(PlanLimits)}
+        assert fields.isdisjoint(
+            {"grade_trend", "weakness_analysis", "weekly_report", "mock_comparison"}
+        )
 
 
 class TestIsPaidFunction:
