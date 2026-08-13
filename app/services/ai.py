@@ -97,6 +97,36 @@ _BAND_ORDINAL = {
     RubricBand.ADVANCED: 4,
 }
 
+# 시뮬레이션 레벨별 프롬프트 문장 수 범위. (최소, 최대) 이고 최대 None 은 상한 없음.
+# 검증기(_validate_level_rules)와 모델 지시문(_question_generation_instructions)이
+# 이 표 하나만 참조한다. 두 곳에 숫자를 따로 적으면 어긋난다.
+LEVEL_PROMPT_SENTENCES: dict[int, tuple[int, int | None]] = {
+    1: (1, 2),
+    2: (1, 2),
+    3: (1, 3),
+    4: (2, 3),
+    5: (2, None),
+    6: (2, 4),
+}
+
+
+def _sentence_range(level: int) -> tuple[int, int | None]:
+    return LEVEL_PROMPT_SENTENCES[min(6, max(1, level))]
+
+
+def _sentence_rule_text() -> str:
+    """모델 지시문에 넣을 문장 수 안내를 표에서 생성한다."""
+    lines = []
+    for level in sorted(LEVEL_PROMPT_SENTENCES):
+        minimum, maximum = LEVEL_PROMPT_SENTENCES[level]
+        if maximum is None:
+            lines.append(f"Level {level}: at least {minimum} sentences.")
+        elif minimum == maximum:
+            lines.append(f"Level {level}: exactly {minimum} sentence.")
+        else:
+            lines.append(f"Level {level}: {minimum} to {maximum} sentences.")
+    return " ".join(lines)
+
 
 def _reconcile_with_rubrics(
     level: OPIcLevel, rubrics: list[RubricAssessment]
@@ -1364,21 +1394,20 @@ class AIService:
             "Do not copy official OPIc wording or catalog examples. "
             "Do not reuse forbidden prompt meanings or any fixedQuestions. "
             "\n\n"
-            "Sentence count rules by effectiveLevel: "
-            "Level 1: prompt must be exactly 1 sentence. "
-            "Level 2: prompt must be 1 or 2 sentences. "
-            "Level 3: prompt must be exactly 2 sentences. "
-            "Level 4: prompt must be 2 or 3 sentences. "
-            "Level 5: prompt must be at least 3 sentences. "
-            "Level 6: prompt must be 3 or 4 sentences. "
+            "Sentence count rules by effectiveLevel. The backend rejects prompts outside these ranges: "
+            + _sentence_rule_text()
+            + " "
             "\n\n"
-            "Difficulty rules: "
-            "Level 1 questions must be very short, concrete, and descriptive. "
-            "Level 2 may include simple reasons. "
-            "Level 3 may include simple past experiences. "
-            "Level 4 may include comparison or change. "
-            "Level 5 may include experience, comparison, roleplay, and problem solving. "
-            "Level 6 may include abstract opinions, social impact, advantages and disadvantages, and hypothetical situations. "
+            "Difficulty rules. The blueprint fixes the questionStyle of every slot, and the exam structure "
+            "is the same at every level, exactly like the real test. Write a question of the given "
+            "questionStyle and adjust only the language demand to effectiveLevel. Never swap a slot for an "
+            "easier question type. "
+            "Level 1: everyday wording, one concrete thing to say, no reasoning required. "
+            "Level 2: everyday wording plus one simple reason. "
+            "Level 3: connected sentences about a familiar situation. "
+            "Level 4: specific detail and one contrast or change. "
+            "Level 5: an unfamiliar or unexpected situation that needs explanation and a solution. "
+            "Level 6: abstract or hypothetical framing that needs a structured argument. "
         )
 
         if mode == "practice":
@@ -1508,43 +1537,25 @@ class AIService:
     def _validate_level_rules(
         cls, simulation_level: int, questions: list[GeneratedQuestion]
     ) -> None:
-        forbidden: set[QuestionStyle] = set()
-
-        # ROLEPLAY 는 초급에서도 허용한다. 실제 시험에 반드시 나오므로 유형을
-        # 빼지 않고 프롬프트 문장 길이로만 난이도를 낮춘다.
-        if simulation_level <= 2:
-            forbidden = {
-                QuestionStyle.COMPARISON,
-                QuestionStyle.PROBLEM_SOLVING,
-                QuestionStyle.OPINION,
-            }
-        elif simulation_level == 3:
-            forbidden = {
-                QuestionStyle.PROBLEM_SOLVING,
-                QuestionStyle.OPINION,
-            }
-
+        # 문항 유형은 레벨로 제한하지 않는다. 실제 OPIc 은 자기평가 레벨과 무관하게
+        # 롤플레이·비교·의견 문항을 모두 낸다. 초급에서 유형을 빼면 시험에 반드시
+        # 나오는 문항을 연습할 기회가 사라진다. 난이도는 문장 수로만 제한한다.
         for item in questions:
-            if item.question_style in forbidden:
-                raise ValueError("generated question type is too difficult for level")
-
             if item.exam_section is ExamSection.INTRODUCTION:
                 continue
 
             sentence_count = cls._sentence_count(item.prompt)
+            minimum, maximum = _sentence_range(simulation_level)
 
-            if simulation_level <= 1 and sentence_count > 2:
-                raise ValueError("level 1 prompts must be one or two sentences")
-            if simulation_level == 2 and not 1 <= sentence_count <= 2:
-                raise ValueError("level 2 prompts must be one or two sentences")
-            if simulation_level == 3 and not 1 <= sentence_count <= 3:
-                raise ValueError("level 3 prompts must be one to three sentences")
-            if simulation_level == 4 and not 2 <= sentence_count <= 3:
-                raise ValueError("level 4 prompts must be two or three sentences")
-            if simulation_level == 5 and sentence_count < 2:
-                raise ValueError("level 5 prompts must be at least two sentences")
-            if simulation_level >= 6 and not 2 <= sentence_count <= 4:
-                raise ValueError("level 6 prompts must be two to four sentences")
+            if sentence_count < minimum or (
+                maximum is not None and sentence_count > maximum
+            ):
+                raise ValueError(
+                    "generated prompt sentence count is outside the level range: "
+                    f"level={simulation_level} expected={minimum}"
+                    f"-{maximum if maximum is not None else 'unbounded'} "
+                    f"actual={sentence_count}"
+                )
 
     @staticmethod
     def _sentence_count(prompt: str) -> int:

@@ -307,7 +307,13 @@ async def test_mock_front_keeps_q1_fixed_and_generates_only_q2_to_q7() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() -> None:
+async def test_mock_tail_low_effective_level_keeps_structure_and_lowers_wording() -> None:
+    """초급에서도 시험 구조는 그대로 유지하고 난이도는 문장으로만 낮춘다.
+
+    예전에는 비교·문제해결·의견 유형을 금지 목록으로 걸러냈다. 실제 OPIc 은
+    자기평가 레벨과 무관하게 이 유형을 모두 내므로 금지를 없앴다. 대신 레벨 2 의
+    문장 수 제한(1~2문장)을 지키는지 확인한다.
+    """
     repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
     service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
     generated = FallbackQuestionGenerator(repository).mock_tail(
@@ -324,23 +330,14 @@ async def test_mock_tail_low_effective_level_does_not_require_forbidden_types() 
         effective_level=2,
     )
 
-    # ROLEPLAY 는 초급에서도 유지한다(실제 시험에 반드시 나오는 유형).
-    # 난이도는 프롬프트 문장 길이로 낮추고, 인지 부하가 큰 세 유형만 제외한다.
-    forbidden = {
-        QuestionStyle.COMPARISON,
-        QuestionStyle.PROBLEM_SOLVING,
-        QuestionStyle.OPINION,
-    }
     styles = {item.question_style for item in result.questions}
     assert [item.number for item in result.questions] == list(range(8, 16))
-    assert styles.isdisjoint(forbidden)
     assert QuestionStyle.ROLEPLAY in styles
+    for item in result.questions:
+        assert 1 <= AIService._sentence_count(item.prompt) <= 2, item.prompt
     request = service._client.responses.requests[0]  # type: ignore[union-attr]
     input_text = json.loads(str(request["input"]))
     assert input_text["effectiveLevel"] == 2
-    assert {
-        item["questionStyle"] for item in input_text["blueprint"]
-    }.isdisjoint({value.value for value in forbidden})
 
 
 @pytest.mark.asyncio
@@ -735,3 +732,37 @@ async def test_practice_evaluation_keeps_consistent_level_untouched() -> None:
 
     assert result.predicted_level is OPIcLevel.IM1
     assert "levelReconciled" not in result.warnings
+
+
+@pytest.mark.parametrize("level", [1, 2, 3, 4, 5, 6])
+async def test_ai_path_accepts_every_style_at_every_level(level: int) -> None:
+    """AI 가 생성한 문항도 레벨과 무관하게 모든 유형을 통과해야 한다.
+
+    지금까지의 검증은 대부분 폴백 경로였다. 사용자가 실제로 받는 것은 AI 문항이므로,
+    초급 블루프린트에 롤플레이·비교·의견이 들어간 상태에서 AI 응답이 검증을 통과하는지
+    확인한다.
+    """
+    repository = QuestionPatternRepository(Path("app/data/question_patterns.json"))
+    service = AIService(api_key="test-key", model="test-model", mock=False, repository=repository)
+    blueprint = FallbackQuestionGenerator(repository).mock_tail(
+        effective_level=level,
+        background=BackgroundProfile(interests=["movies", "music"]),
+    )
+    service._client = FakeOpenAIClient([blueprint])  # type: ignore[assignment]
+
+    result = await service.generate_mock(
+        level, BackgroundProfile(interests=["movies", "music"]), stage="tail",
+        effective_level=level,
+    )
+
+    assert result.fallback_used is False
+    assert result.provider == "openai"
+    assert [item.number for item in result.questions] == list(range(8, 16))
+    # 블루프린트가 보낸 유형이 그대로 유지된다(레벨에 따른 강등 없음).
+    assert [item.question_style for item in result.questions] == [
+        item.question_style for item in blueprint
+    ]
+    styles = {item.question_style for item in result.questions}
+    assert QuestionStyle.ROLEPLAY in styles
+    assert QuestionStyle.OPINION in styles
+    assert QuestionStyle.COMPARISON in styles
