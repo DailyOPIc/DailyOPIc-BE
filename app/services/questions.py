@@ -65,6 +65,14 @@ TOPIC_LABELS = {
     "camping": "camping",
     "staycation": "hotel staycations",
     "food_travel": "food trips",
+    # 설문 토픽이 아닌 고정 슬롯(롤플레이·돌발·비교·고난도)의 표시용 라벨.
+    # 라벨이 없으면 topic_id 의 밑줄만 공백으로 바꿔 문장에 넣기 때문에
+    # "ask two questions about roleplay service" 처럼 영어가 깨진다.
+    "roleplay_service": "a place you often visit",
+    "roleplay_problem": "a service you use",
+    "unexpected_daily": "your daily routine",
+    "general_comparison": "your free time",
+    "general_opinion": "life in your city",
 }
 SURVEY_CATEGORY_PRIORITY = {"leisure", "hobbies", "sports", "travel"}
 
@@ -321,56 +329,44 @@ class FallbackQuestionGenerator:
         return TOPIC_LABELS.get(topic_id, topic_id.replace("_", " "))
 
     @staticmethod
-    def _level_question_type(
-        level: int, requested: QuestionStyle
-    ) -> QuestionStyle:
-        # PAST_EXPERIENCE 를 강등하면 콤보(묘사/루틴/과거경험)의 1번과 3번이 같은
-        # 프롬프트가 되어 유일성 검증에 걸린다. _validate_level_rules 도 레벨 1 에서
-        # PAST_EXPERIENCE 를 금지하지 않으므로 그대로 유지한다.
-        # ROLEPLAY 는 초급에서도 유지한다. 실제 시험에 반드시 나오는 유형이라
-        # 빼면 연습 기회가 사라진다. 난이도는 프롬프트 문장으로 낮춘다.
-        if level <= 1 and requested not in {
-            QuestionStyle.DESCRIPTION,
-            QuestionStyle.ROUTINE,
-            QuestionStyle.PAST_EXPERIENCE,
-            QuestionStyle.ROLEPLAY,
-        }:
-            return QuestionStyle.DESCRIPTION
-        if level <= 2 and requested in {
-            QuestionStyle.COMPARISON,
-            QuestionStyle.PROBLEM_SOLVING,
-            QuestionStyle.OPINION,
-        }:
-            return QuestionStyle.PAST_EXPERIENCE
-        if level <= 3 and requested in {
-            QuestionStyle.PROBLEM_SOLVING,
-            QuestionStyle.OPINION,
-        }:
-            return QuestionStyle.PAST_EXPERIENCE
-        if level <= 4 and requested is QuestionStyle.OPINION:
-            return QuestionStyle.COMPARISON
-        return requested
-
-    @staticmethod
     def _prompt_for_level(
         *, level: int, question_type: QuestionStyle, topic_label: str
     ) -> str:
+        """레벨 × 스타일마다 고유한 프롬프트를 돌려준다.
+
+        시험 구조와 문항 유형은 레벨에 따라 바꾸지 않는다(실제 OPIc 과 동일).
+        난이도는 문장 수와 요구하는 사고의 깊이로만 조절한다. 그래서 모든 레벨이
+        7개 스타일 전부에 대한 분기를 가져야 한다. 분기가 빠지면 다른 스타일의
+        문장으로 떨어져 프롬프트가 중복되고 유일성 검증에 걸린다.
+        """
         if level <= 1:
             if question_type is QuestionStyle.ROUTINE:
-                return f"What do you usually do when you enjoy {topic_label}."
+                return f"What do you usually do when you enjoy {topic_label}?"
             if question_type is QuestionStyle.PAST_EXPERIENCE:
                 return f"Tell me about the last time you enjoyed {topic_label}."
             if question_type is QuestionStyle.ROLEPLAY:
                 return f"Call your friend and ask two simple questions about {topic_label}."
+            if question_type is QuestionStyle.COMPARISON:
+                return f"Tell me two things you like about {topic_label}."
+            if question_type is QuestionStyle.PROBLEM_SOLVING:
+                return f"Something went wrong with {topic_label}. Tell your friend about it."
+            if question_type is QuestionStyle.OPINION:
+                return f"Do you like {topic_label}? Tell me one reason."
             return f"Describe {topic_label} in your daily life."
         if level == 2:
             if question_type is QuestionStyle.PAST_EXPERIENCE:
-                return f"Tell me about a simple experience related to {topic_label}. Why do you remember it."
+                return f"Tell me about a simple experience related to {topic_label}. Why do you remember it?"
             if question_type is QuestionStyle.ROUTINE:
-                return f"What do you usually do when you spend time with {topic_label}. Give one simple reason."
+                return f"What do you usually do when you spend time with {topic_label}? Give one simple reason."
             if question_type is QuestionStyle.ROLEPLAY:
                 return f"You want to try {topic_label} with a friend. Ask two questions to plan it."
-            return f"Tell me about {topic_label}. Why do you like it."
+            if question_type is QuestionStyle.COMPARISON:
+                return f"Tell me two things you like about {topic_label}. Which one do you like more?"
+            if question_type is QuestionStyle.PROBLEM_SOLVING:
+                return f"You have a problem with {topic_label}. Ask someone for help in two sentences."
+            if question_type is QuestionStyle.OPINION:
+                return f"Do you think {topic_label} is good for people? Give one simple reason."
+            return f"Tell me about {topic_label}. Why do you like it?"
         if level == 3:
             if question_type is QuestionStyle.ROUTINE:
                 return f"Explain your usual routine for {topic_label}. Give one reason why it fits your life."
@@ -380,6 +376,10 @@ class FallbackQuestionGenerator:
                 return f"Compare two things you like about {topic_label}. Explain which one you prefer."
             if question_type is QuestionStyle.ROLEPLAY:
                 return f"Call a friend to make a plan about {topic_label}. Ask two questions and confirm the time."
+            if question_type is QuestionStyle.PROBLEM_SOLVING:
+                return f"You have a problem with {topic_label}. Explain the situation and ask for what you need."
+            if question_type is QuestionStyle.OPINION:
+                return f"What do people usually think about {topic_label}? Give your own opinion with one reason."
             return f"Tell me about a memorable experience with {topic_label}. Explain why it was memorable."
         if level == 4:
             if question_type is QuestionStyle.COMPARISON:
@@ -392,6 +392,8 @@ class FallbackQuestionGenerator:
                 return f"You need help with {topic_label}. Call someone, explain your situation, and ask two questions."
             if question_type is QuestionStyle.PROBLEM_SOLVING:
                 return f"Describe a problem you had with {topic_label}. Explain how you solved it."
+            if question_type is QuestionStyle.OPINION:
+                return f"What do people around you think about {topic_label}? Explain your own view with one example."
             return f"Tell me about a specific experience with {topic_label}. Explain the situation and why it mattered to you."
         if level == 5:
             if question_type is QuestionStyle.ROLEPLAY:
@@ -438,12 +440,13 @@ class FallbackQuestionGenerator:
         topic_id: str,
         category: str,
         requested_type: QuestionStyle,
+        topic_label: str | None = None,
     ) -> GeneratedQuestion:
-        # examSection 은 시험 구조이므로 레벨에 따라 바꾸지 않는다. 실제 OPIc 도
-        # 자기평가 레벨과 무관하게 롤플레이·비교·고난도 섹션을 그대로 낸다.
-        # 난이도는 questionStyle 과 프롬프트 문장으로만 조절한다.
-        question_type = self._level_question_type(level, requested_type)
-        topic_label = self._topic_label(topic_id)
+        # examSection 과 questionStyle 은 시험 구조이므로 레벨에 따라 바꾸지 않는다.
+        # 실제 OPIc 도 자기평가 레벨과 무관하게 같은 구성을 낸다. 난이도는
+        # 프롬프트 문장으로만 조절한다.
+        question_type = requested_type
+        topic_label = topic_label or self._topic_label(topic_id)
         return GeneratedQuestion(
             number=number,
             examSection=broad_type,
@@ -702,6 +705,9 @@ class FallbackQuestionGenerator:
                 topic_id=topic if index == 0 else f"unexpected_{index + 1}_{topic}",
                 category="unexpected",
                 requested_type=question_type,
+                # topic_id 는 이력 중복 회피용으로 접미사를 붙이지만, 문장에 들어가는
+                # 라벨은 원래 설문 토픽을 쓴다. 스타일이 서로 달라 프롬프트는 겹치지 않는다.
+                topic_label=self._topic_label(topic),
             )
             for index, (number, question_type) in enumerate(zip(range(8, 11), sequence))
         ]
@@ -749,8 +755,12 @@ class FallbackQuestionGenerator:
             ExamSection.UNEXPECTED,
         ]
         questions: list[GeneratedQuestion] = []
+        half = len(sequence) // 2
         for index, number in enumerate(range(2, 16)):
-            base_topic = topics[index % len(topics)]
+            # 스타일 배열이 전반/후반으로 한 번 반복되므로, 후반은 토픽을 한 칸 밀어
+            # (스타일, 토픽) 조합이 겹치지 않게 한다. 겹치면 프롬프트가 중복된다.
+            offset = index if index < half else index + 1
+            base_topic = topics[offset % len(topics)]
             topic_id = base_topic if index < len(topics) else f"{base_topic}_daily_{number}"
             questions.append(
                 self._generated_question(
@@ -761,6 +771,7 @@ class FallbackQuestionGenerator:
                     topic_id=topic_id,
                     category="daily",
                     requested_type=sequence[index],
+                    topic_label=self._topic_label(base_topic),
                 )
             )
         return questions

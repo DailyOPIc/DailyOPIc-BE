@@ -127,14 +127,15 @@ def test_fallback_prompts_are_unique_for_every_level(
 # 수정 대상이 아닌 레벨의 문구를 고정한다. 레벨 3·4 의 DESCRIPTION 분기를 추가하면서
 # 다른 레벨 문구가 함께 바뀌면 이 테스트가 먼저 실패해야 한다.
 UNTOUCHED_PRACTICE_FRONT_PROMPTS = {
+    # 의문문 부호 수정(작업 5)으로 갱신했다. 문장 구성은 그대로다.
     2: [
         "Introduce yourself.",
-        "Tell me about movies. Why do you like it.",
-        "What do you usually do when you spend time with movies. Give one simple reason.",
-        "Tell me about a simple experience related to movies. Why do you remember it.",
-        "Tell me about music. Why do you like it.",
-        "What do you usually do when you spend time with music. Give one simple reason.",
-        "Tell me about a simple experience related to music. Why do you remember it.",
+        "Tell me about movies. Why do you like it?",
+        "What do you usually do when you spend time with movies? Give one simple reason.",
+        "Tell me about a simple experience related to movies. Why do you remember it?",
+        "Tell me about music. Why do you like it?",
+        "What do you usually do when you spend time with music? Give one simple reason.",
+        "Tell me about a simple experience related to music. Why do you remember it?",
     ],
     5: [
         "Introduce yourself.",
@@ -218,24 +219,7 @@ def test_low_level_mock_has_a_real_roleplay_prompt(
         assert _sentence_count(item.prompt) <= 2, f"level={level} 롤플레이 문장 과다"
 
 
-@pytest.mark.parametrize("level", [1, 2, 3, 4, 5, 6])
-def test_every_reachable_style_has_its_own_prompt(level: int) -> None:
-    """_prompt_for_level 에 분기가 없는 스타일은 함수 끝의 과거경험 문장으로
-    조용히 떨어진다. 그러면 롤플레이 칸에 과거경험 문항이 들어간다."""
-    label = "movies"
-    default = FallbackQuestionGenerator._prompt_for_level(
-        level=level, question_type=QuestionStyle.PAST_EXPERIENCE, topic_label=label
-    )
-    fell_through = []
-    for style in QuestionStyle:
-        if style is QuestionStyle.PAST_EXPERIENCE:
-            continue
-        # 의도적으로 강등되는 스타일은 대상이 아니다.
-        if FallbackQuestionGenerator._level_question_type(level, style) is not style:
-            continue
-        prompt = FallbackQuestionGenerator._prompt_for_level(
-            level=level, question_type=style, topic_label=label
-        )
-        if prompt == default:
-            fell_through.append(style.value)
-    assert not fell_through, f"level={level} 분기 누락={fell_through}"
+# 스타일 강등이 사라졌으므로 "강등되지 않은 스타일만 검사" 하던 예전 테스트는
+# tests/test_question_set_integration.py 의
+# test_every_style_is_reachable_and_has_its_own_prompt 로 대체했다.
+# 이제 7개 스타일 전부가 검사 대상이다.

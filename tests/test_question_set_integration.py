@@ -211,3 +211,71 @@ async def test_practice_full_set_matches_blueprint() -> None:
             _service(repository), "practice", "tail", level, BACKGROUNDS["student"]
         )
         validate_practice_blueprint(front + tail)
+
+
+# 합성 topic_id 가 라벨로 새어 나오면 영어 문장이 깨진다.
+# 예: "ask two simple questions about roleplay service.", "... music daily 6."
+_LABEL_ARTIFACTS = re.compile(
+    r"\b(?:roleplay|unexpected|general)\b|\bdaily\s+\d+\b|\b\d+\b", re.IGNORECASE
+)
+
+
+@pytest.mark.parametrize("background_name", sorted(BACKGROUNDS))
+@pytest.mark.parametrize("level", LEVELS)
+@pytest.mark.parametrize("mode,stage,expected_numbers", CASES)
+async def test_prompts_do_not_leak_synthetic_topic_ids(
+    background_name: str,
+    level: int,
+    mode: str,
+    stage: str,
+    expected_numbers: list[int],
+) -> None:
+    repository = QuestionPatternRepository(CATALOG)
+    questions = await _generate(
+        _service(repository), mode, stage, level, BACKGROUNDS[background_name]
+    )
+    for item in questions:
+        leaked = _LABEL_ARTIFACTS.findall(item.topic)
+        assert not leaked, f"Q{item.number} topic 라벨 오염={item.topic!r}"
+        leaked = _LABEL_ARTIFACTS.findall(item.prompt)
+        assert not leaked, f"Q{item.number} 프롬프트 라벨 오염={item.prompt!r}"
+
+
+@pytest.mark.parametrize("background_name", sorted(BACKGROUNDS))
+@pytest.mark.parametrize("level", LEVELS)
+@pytest.mark.parametrize("mode,stage,expected_numbers", CASES)
+async def test_interrogative_prompts_end_with_question_mark(
+    background_name: str,
+    level: int,
+    mode: str,
+    stage: str,
+    expected_numbers: list[int],
+) -> None:
+    """의문사로 시작하는 문장은 물음표로 끝나야 한다."""
+    repository = QuestionPatternRepository(CATALOG)
+    questions = await _generate(
+        _service(repository), mode, stage, level, BACKGROUNDS[background_name]
+    )
+    openers = ("what ", "why ", "how ", "when ", "where ", "who ", "which ")
+    for item in questions:
+        for sentence in re.findall(r"[^.?!]+[.?!]", item.prompt):
+            text = sentence.strip()
+            if text.lower().startswith(openers):
+                assert text.endswith("?"), f"Q{item.number} 의문문에 물음표 없음: {text!r}"
+
+
+@pytest.mark.parametrize("level", LEVELS)
+def test_every_style_is_reachable_and_has_its_own_prompt(level: int) -> None:
+    """시험 구조를 유지하는 정책이므로 강등이 없어야 하고,
+    따라서 모든 스타일이 자기 분기의 프롬프트를 받아야 한다."""
+    label = "movies"
+    prompts = {
+        style: FallbackQuestionGenerator._prompt_for_level(
+            level=level, question_type=style, topic_label=label
+        )
+        for style in QuestionStyle
+    }
+    duplicated = sorted(
+        {value for value in prompts.values() if list(prompts.values()).count(value) > 1}
+    )
+    assert not duplicated, f"level={level} 스타일 간 프롬프트 중복={duplicated}"
