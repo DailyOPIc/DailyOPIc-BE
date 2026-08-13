@@ -13,6 +13,7 @@ import pytest
 
 from app.models.api import ExamSection, GeneratedQuestion, OPIcLevel, QuestionStyle
 from app.services.ai import LEVEL_PROMPT_SENTENCES, AIService
+from app.services.questions import FallbackQuestionGenerator
 
 # level -> (최소 문장, 최대 문장 또는 None)
 # 리팩토링 전 `_validate_level_rules` 의 분기를 그대로 옮긴 값이다.
@@ -125,3 +126,47 @@ def test_instructions_tell_the_model_to_follow_the_blueprint_style(
     assert "questionStyle" in instructions
     assert "blueprint" in instructions
     assert "language demand" in instructions, "난이도가 문장·표현 수준으로 조절된다는 안내 누락"
+
+
+@pytest.mark.parametrize("level", sorted(EXPECTED_RANGES))
+def test_fallback_prompt_always_satisfies_its_level_rule(level: int) -> None:
+    """모델 응답이 검증에 걸리면 해당 슬롯만 폴백 문항으로 대체된다.
+    폴백이 자기 레벨의 문장 수 규칙을 위반하면 부분 실패가 전체 실패로 번진다.
+    7개 스타일 전부가 안전망 역할을 할 수 있어야 한다."""
+    for style in QuestionStyle:
+        prompt = FallbackQuestionGenerator._prompt_for_level(
+            level=level, question_type=style, topic_label="movies"
+        )
+        question = _question(1).model_copy(
+            update={"prompt": prompt, "question_style": style}
+        )
+        AIService._validate_level_rules(level, [question])
+
+
+@pytest.mark.parametrize("mode,stage", [("practice", "front"), ("mock", "front"), ("mock", "tail"), ("daily", "pool")])
+def test_instructions_help_low_levels_keep_the_sentence_limit(
+    mode: str, stage: str
+) -> None:
+    """초급에 롤플레이·문제해결·의견이 배정되는 것은 새 조합이다. 상황 설명이 길어져
+    문장 수 상한을 넘기기 쉬우므로 형태 안내가 있어야 재시도가 줄어든다."""
+    instructions = AIService._question_generation_instructions(mode, stage)
+    assert "Keeping the limit at Level 1 and Level 2" in instructions
+    assert "one short sentence to set the situation" in instructions
+
+
+@pytest.mark.parametrize("mode,stage", [("practice", "front"), ("mock", "front"), ("mock", "tail"), ("daily", "pool")])
+def test_instructions_do_not_hand_the_model_copyable_prompts(
+    mode: str, stage: str
+) -> None:
+    """예시 문장을 그대로 주면 모델이 복사해 '새 문항 생성' 요구와 충돌한다.
+    폴백 템플릿 문구가 지시문에 들어가 있지 않아야 한다."""
+    instructions = AIService._question_generation_instructions(mode, stage)
+    templates = [
+        FallbackQuestionGenerator._prompt_for_level(
+            level=level, question_type=style, topic_label="movies"
+        )
+        for level in EXPECTED_RANGES
+        for style in QuestionStyle
+    ]
+    leaked = [item for item in templates if item in instructions]
+    assert not leaked, f"지시문에 복사 가능한 폴백 문구가 들어 있다: {leaked}"

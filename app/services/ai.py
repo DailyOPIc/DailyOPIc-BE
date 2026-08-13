@@ -918,6 +918,16 @@ class AIService:
                     attempt,
                     [item.log_value() for item in last_issues],
                 )
+                # 어떤 (레벨, 필드) 조합이 자주 걸리는지 봐야 지시문을 고칠 수 있다.
+                telemetry.emit(
+                    "question_generation_retry",
+                    mode=mode,
+                    stage=stage,
+                    attempt=attempt,
+                    simulationLevel=simulation_level,
+                    failedSlots=len(pending_numbers),
+                    fields=sorted({item.field for item in last_issues}),
+                )
             except AIServiceConfigurationError:
                 raise
             except Exception as error:
@@ -985,6 +995,19 @@ class AIService:
             fallback_reason,
             fallback_numbers,
             max_attempts - 1,
+        )
+        # 폴백 전환률을 수치로 봐야 한다. 초급에 롤플레이·의견이 배정되면서 문장 수 제약을
+        # 지키기 어려운 조합이 늘었는지, 아니면 프로바이더 장애가 원인인지 구분하려면
+        # reason 과 슬롯 수가 함께 필요하다.
+        telemetry.emit(
+            "question_generation_fallback",
+            mode=mode,
+            stage=stage,
+            reason=fallback_reason,
+            simulationLevel=simulation_level,
+            fallbackSlots=len(fallback_numbers),
+            totalSlots=len(blueprint),
+            retryCount=max_attempts - 1,
         )
         return QuestionGenerationResult(
             questions=questions,
@@ -1408,6 +1431,15 @@ class AIService:
             "Level 4: specific detail and one contrast or change. "
             "Level 5: an unfamiliar or unexpected situation that needs explanation and a solution. "
             "Level 6: abstract or hypothetical framing that needs a structured argument. "
+            "\n\n"
+            # 초급에 롤플레이·문제해결·의견이 배정되는 것은 새로운 조합이다. 이 유형은
+            # 상황 설명이 길어지기 쉬워 문장 수 상한을 넘기기 쉽다. 형태를 알려주면
+            # 재시도 없이 한 번에 맞을 확률이 올라간다. 예시 문장을 그대로 주면 모델이
+            # 복사하므로 구조만 설명한다.
+            "Keeping the limit at Level 1 and Level 2. For roleplay, problem solving, and opinion at "
+            "these levels, use one short sentence to set the situation and one short sentence to state "
+            "the task, and stop there. Do not add background, do not list more than two things to say, "
+            "and do not stack conditions. If the situation is obvious from the topic, one sentence is enough."
         )
 
         if mode == "practice":
