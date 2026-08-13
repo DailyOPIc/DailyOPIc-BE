@@ -420,7 +420,9 @@ def _usage_defaults() -> dict[str, int]:
         "rewardCount": 0,
         "practiceCreditRewardCount": 0,
         "practiceRefreshRewardCount": 0,
-        "mockRewardCount": 0,
+        "mockStartRewardCount": 0,
+        "mockAdjustmentRewardCount": 0,
+        "mockResultRewardCount": 0,
         "targetLevelChangeRewardCount": 0,
     }
 
@@ -485,12 +487,16 @@ def _reward_count_key(purpose: RewardPurpose) -> str | None:
         return "practiceCreditRewardCount"
     if purpose is RewardPurpose.PRACTICE_REFRESH:
         return "practiceRefreshRewardCount"
-    if purpose in {
-        RewardPurpose.MOCK_START,
-        RewardPurpose.MOCK_ADJUSTMENT,
-        RewardPurpose.MOCK_RESULT,
-    }:
-        return "mockRewardCount"
+    # 모의고사 게이트 3종은 각자 센다. 예전에는 하나("mockRewardCount")를 같이
+    # 써서 한도가 "완벽한 1회차"에 딱 맞았고, 포기 후 재시작으로 시작 광고를
+    # 한 번 더 보면 마지막 게이트인 채점이 막혔다. 15문항을 다 답한 뒤
+    # "daily reward quota exhausted"로 끝나는 길이 여기서 생겼다.
+    if purpose is RewardPurpose.MOCK_START:
+        return "mockStartRewardCount"
+    if purpose is RewardPurpose.MOCK_ADJUSTMENT:
+        return "mockAdjustmentRewardCount"
+    if purpose is RewardPurpose.MOCK_RESULT:
+        return "mockResultRewardCount"
     if purpose is RewardPurpose.TARGET_LEVEL_CHANGE:
         return "targetLevelChangeRewardCount"
     return None

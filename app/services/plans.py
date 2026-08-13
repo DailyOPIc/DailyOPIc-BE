@@ -61,7 +61,11 @@ class PlanLimits:
     # 강제하지 않는 플랜 게이트를 capabilities로 내려보내면 그 자체가 거짓 약속이다.
 
 
-_MOCK_REWARD_GATES = 3  # start / adjustment / result
+# 모의고사 게이트(start/adjustment/result)는 각각 따로 센다. 한도는 "게이트 하나를
+# 하루에 몇 번까지 통과할 수 있나"이다. 회차 수와 똑같이 잡으면 포기 후 재시작이나
+# 광고 재시청에 여유가 0이 되고, 마지막 게이트인 채점에서 막혀 15문항을 다 답한
+# 사용자가 결과를 못 본다. 회차당 3번까지 허용한다.
+_MOCK_GATE_ATTEMPTS = 3
 
 # 공통 디폴트값 (FREE 플랜 기준)
 _DEFAULT_LIMITS = PlanLimits(
@@ -181,7 +185,8 @@ def reward_auto_verify(plan: Plan | str | None, purpose: RewardPurpose) -> bool:
 def reward_max_for(plan: Plan | str | None, purpose: RewardPurpose) -> int:
     """플랜·용도별 하루 리워드 상한.
 
-    - 모의고사 게이트: 하루 1회 모의고사에 필요한 3게이트(무료는 광고, 유료는 auto-verify).
+    - 모의고사 게이트: 게이트별로 회차당 3번까지(무료는 광고, 유료는 auto-verify).
+      실제 응시 횟수는 완료된 회차 수(mock_daily)로 따로 강제한다.
     - 데일리 광고 보너스/리프레시: 무료만 허용, 유료는 0(광고 없음).
     - 목표 등급(난이도) 변경: 전 플랜 하루 1회(무료 광고, 유료 auto-verify).
     """
@@ -192,7 +197,7 @@ def reward_max_for(plan: Plan | str | None, purpose: RewardPurpose) -> int:
         RewardPurpose.MOCK_ADJUSTMENT,
         RewardPurpose.MOCK_RESULT,
     }:
-        return _MOCK_REWARD_GATES * limits.mock_daily
+        return _MOCK_GATE_ATTEMPTS * limits.mock_daily
     if purpose is RewardPurpose.PRACTICE_CREDITS:
         return limits.practice_ad_bonus
     if purpose is RewardPurpose.PRACTICE_REFRESH:

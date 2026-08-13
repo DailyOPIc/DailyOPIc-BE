@@ -1769,6 +1769,20 @@ async def usage(
     )
 
 
+# 리워드 한도 초과 메시지. 코드(reward_quota_exhausted)가 계약이고 메시지는 표시용인데,
+# 이미 배포된 앱은 서버 message를 그대로 보여준다. 그래서 영어 예외 문구
+# ("daily reward quota exhausted") 대신 용도별로 다음 행동이 보이는 문장을 내려준다.
+_REWARD_QUOTA_MESSAGES: dict[RewardPurpose, str] = {
+    RewardPurpose.PRACTICE_CREDITS: "오늘 받을 수 있는 추가 학습 보상을 모두 사용했어요. 내일 다시 받을 수 있어요.",
+    RewardPurpose.PRACTICE_REFRESH: "오늘 문제 새로고침 기회를 모두 사용했어요. 내일 다시 받을 수 있어요.",
+    RewardPurpose.TARGET_LEVEL_CHANGE: "난이도 변경은 하루 한 번만 가능해요. 내일 다시 시도해 주세요.",
+    RewardPurpose.MOCK_START: "오늘 모의고사 시작 기회를 모두 사용했어요. 내일 다시 시작할 수 있어요.",
+    RewardPurpose.MOCK_ADJUSTMENT: "오늘 난이도 조정 기회를 모두 사용했어요. 조정 없이 계속 진행할 수 있어요.",
+    RewardPurpose.MOCK_RESULT: "오늘 결과 확인 기회를 모두 사용했어요. 내일 다시 확인할 수 있어요.",
+}
+_REWARD_QUOTA_DEFAULT_MESSAGE = "오늘 받을 수 있는 보상을 모두 사용했어요. 내일 다시 시도해 주세요."
+
+
 @router.post("/v1/ad-rewards/intents", response_model=RewardIntentResponse)
 async def create_reward_intent(
     payload: RewardIntentRequest,
@@ -1806,7 +1820,12 @@ async def create_reward_intent(
     except UsageLimitExceeded as error:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"code": "reward_quota_exhausted", "message": str(error)},
+            detail={
+                "code": "reward_quota_exhausted",
+                "message": _REWARD_QUOTA_MESSAGES.get(
+                    payload.purpose, _REWARD_QUOTA_DEFAULT_MESSAGE
+                ),
+            },
         ) from error
     return RewardIntentResponse(
         nonce=nonce,
