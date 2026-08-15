@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time
 from enum import StrEnum
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -547,6 +548,92 @@ class CapabilitiesResponse(BaseModel):
     guide_schema_version: int = Field(alias="guideSchemaVersion", ge=1)
     plan: str = "free"
     quota_policy: CapabilityQuotaPolicy = Field(alias="quotaPolicy")
+
+
+class StudyIntensity(StrEnum):
+    LIGHT = "light"
+    STEADY = "steady"
+    FOCUSED = "focused"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StudyIntensity | None":
+        if isinstance(value, str):
+            return cls.__members__.get(_normalize_enum_input(value).upper())
+        return None
+
+
+# 학습 캘린더 설정. 목표 등급은 여기 두지 않는다 — userProfiles.targetLevel이
+# 이미 진실이고(PUT /v1/users/me/target-level), 복제하면 두 값이 갈라진다.
+class StudyPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    exam_date: date | None = Field(default=None, alias="examDate")
+    study_weekdays: list[int] = Field(alias="studyWeekdays", min_length=1, max_length=7)
+    intensity: StudyIntensity
+    preferred_study_time: str = Field(alias="preferredStudyTime")
+    timezone_identifier: str = Field(alias="timezoneIdentifier", max_length=64)
+
+    @field_validator("study_weekdays")
+    @classmethod
+    def validate_weekdays(cls, value: list[int]) -> list[int]:
+        """ISO 8601 요일(월=1 … 일=7). 중복은 사용자 의도가 모호하므로 거절한다."""
+        if any(day < 1 or day > 7 for day in value):
+            raise ValueError("studyWeekdays must be ISO weekdays between 1 and 7")
+        if len(set(value)) != len(value):
+            raise ValueError("studyWeekdays must not contain duplicates")
+        return sorted(value)
+
+    @field_validator("preferred_study_time")
+    @classmethod
+    def validate_preferred_time(cls, value: str) -> str:
+        """로컬 벽시계 시각 "HH:MM". 알림은 G5에서 이 값을 쓴다."""
+        try:
+            parsed = time.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError("preferredStudyTime must be HH:MM") from error
+        if parsed.second or parsed.microsecond or parsed.tzinfo is not None:
+            raise ValueError("preferredStudyTime must be HH:MM")
+        return f"{parsed.hour:02d}:{parsed.minute:02d}"
+
+    @field_validator("timezone_identifier")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError("timezoneIdentifier must be a valid IANA timezone") from error
+        return value
+
+    @model_validator(mode="after")
+    def validate_exam_date(self) -> "StudyPlanRequest":
+        """시험일은 사용자의 로컬 오늘 기준으로 판단한다. UTC로 재면 타임존에
+        따라 방금 고른 오늘 날짜가 과거로 취급된다."""
+        if self.exam_date is None:
+            return self
+        today = datetime.now(ZoneInfo(self.timezone_identifier)).date()
+        if self.exam_date < today:
+            raise ValueError("examDate must not be in the past")
+        return self
+
+
+class StudyPlanSettings(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_version: int = Field(alias="schemaVersion", ge=1)
+    exam_date: date | None = Field(default=None, alias="examDate")
+    study_weekdays: list[int] = Field(alias="studyWeekdays")
+    intensity: StudyIntensity
+    preferred_study_time: str = Field(alias="preferredStudyTime")
+    timezone_identifier: str = Field(alias="timezoneIdentifier")
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+
+
+class StudyPlanResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    configured: bool
+    study_plan: StudyPlanSettings | None = Field(default=None, alias="studyPlan")
 
 
 class RevenueCatEvent(BaseModel):

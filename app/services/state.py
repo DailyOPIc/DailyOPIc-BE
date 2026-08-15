@@ -269,6 +269,14 @@ class StateStore(ABC):
     ) -> dict[str, Any]: ...
 
     @abstractmethod
+    async def get_study_plan(self, uid: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def set_study_plan(
+        self, uid: str, *, study_plan: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
     async def apply_question_set_adjustment(
         self,
         *,
@@ -595,6 +603,10 @@ class InMemoryStateStore(StateStore):
         self._mock_sessions: dict[str, dict[str, Any]] = {}
         self._entitlements: dict[str, dict[str, Any]] = {}
         self._iap_events: dict[str, dict[str, Any]] = {}
+        # 엔타이틀먼트와 같은 이유로 프로필 dict와 분리한다: set_initial_level이
+        # 프로필을 통째로 갈아끼우므로 같은 dict에 두면 목표 등급을 바꿀 때마다
+        # 학습 계획이 지워진다. Firestore 쪽은 merge=True라 한 문서에 담아도 된다.
+        self._study_plans: dict[str, dict[str, Any]] = {}
 
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None:
         async with self._lock:
@@ -991,6 +1003,26 @@ class InMemoryStateStore(StateStore):
                 previous=previous,
                 reward_consumed=reward_consumed,
             )
+
+    async def get_study_plan(self, uid: str) -> dict[str, Any] | None:
+        async with self._lock:
+            plan = self._study_plans.get(uid)
+            return deepcopy(plan) if plan else None
+
+    async def set_study_plan(
+        self, uid: str, *, study_plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        async with self._lock:
+            now = datetime.now(UTC)
+            previous = self._study_plans.get(uid)
+            stored = {
+                **deepcopy(study_plan),
+                "uid": uid,
+                "createdAt": (previous or {}).get("createdAt", now),
+                "updatedAt": now,
+            }
+            self._study_plans[uid] = stored
+            return deepcopy(stored)
 
     async def set_target_level(
         self, *, uid: str, target_level: str, reward_nonce: str | None
@@ -1732,6 +1764,33 @@ class FirestoreStateStore(StateStore):
             )
 
         await asyncio.to_thread(write)
+
+    async def get_study_plan(self, uid: str) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            data = snapshot.to_dict() if snapshot.exists else None
+            study_plan = (data or {}).get("studyPlan")
+            return dict(study_plan) if study_plan else None
+
+        return await asyncio.to_thread(read)
+
+    async def set_study_plan(
+        self, uid: str, *, study_plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        """설정을 통째로 교체한다(멱등). 목표 등급 등 프로필의 다른 필드는
+        merge=True 덕분에 그대로 남는다."""
+
+        def write() -> dict[str, Any]:
+            now = datetime.now(UTC)
+            ref = self._client.collection("userProfiles").document(uid)
+            snapshot = ref.get()
+            previous = (snapshot.to_dict() or {}).get("studyPlan") if snapshot.exists else None
+            created_at = (previous or {}).get("createdAt") or now
+            stored = {**study_plan, "createdAt": created_at, "updatedAt": now}
+            ref.set({"uid": uid, "studyPlan": stored, "updatedAt": now}, merge=True)
+            return stored
+
+        return await asyncio.to_thread(write)
 
     async def is_iap_event_completed(self, event_id: str) -> bool:
         def read() -> bool:

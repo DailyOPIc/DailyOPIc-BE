@@ -278,6 +278,8 @@ OpenAPI 문서는 `/docs`에서 확인할 수 있습니다. 보호되는 endpoin
 
 Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. 새 요청은 `initialLevel` 1~6을 보내며, 기존 `targetLevel`만 저장된 사용자는 서버가 자동으로 단계 값으로 매핑합니다. 최초 설정과 같은 단계 재확정은 무료이고, 기존 단계에서 다른 단계로 바꿀 때는 `target_level_change` reward intent를 만들고 SSV 검증이 끝난 뒤 `rewardNonce`를 함께 보내야 합니다.
 
+학습 캘린더 설정은 `GET/PUT /v1/users/me/study-plan`으로 읽고 씁니다. 저장 위치는 `userProfiles/{uid}.studyPlan` 한 곳이며 시험일(선택), 공부 요일(ISO 월=1~일=7, 최소 1개), 학습 강도(`light|steady|focused`), 선호 학습 시각(`HH:MM` 로컬), 타임존 식별자만 담습니다. **목표 등급은 여기에 복제하지 않고 `PUT /v1/users/me/target-level`이 계속 진실입니다.** PUT은 전체 교체(멱등)이고 `schemaVersion`/`createdAt`/`updatedAt`은 서버가 매깁니다. 시험일은 요청에 담긴 타임존 기준으로 과거인지 판단합니다. 설정한 적 없는 기존 사용자에게는 오류가 아니라 `{"configured": false, "studyPlan": null}`을 돌려줍니다.
+
 Daily 문제와 Mock 문제 생성은 서로 다르게 동작합니다.
 
 ```text
