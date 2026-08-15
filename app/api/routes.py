@@ -116,6 +116,10 @@ def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
         analysisDepth=str(limits.analysis_depth),
         reviewSet=limits.review_set,
         adsEnabled=limits.ads_enabled,
+        calendarEnabled=limits.calendar_enabled,
+        calendarAutoReplan=limits.calendar_auto_replan,
+        calendarEvaluationAdaptive=limits.calendar_evaluation_adaptive,
+        calendarExamBackplan=limits.calendar_exam_backplan,
     )
 
 

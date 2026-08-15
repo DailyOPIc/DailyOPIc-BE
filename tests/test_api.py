@@ -1,9 +1,12 @@
 import json
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.api.routes import _quota_policy_for
 from app.main import app
+from app.services.plans import Plan, plan_from_entitlement_ids
 from app.services.admob import VerifiedReward
 from app.services.ai import AIQuestionGenerationError, AIServiceUnavailable
 
@@ -887,9 +890,78 @@ def test_capabilities_endpoint_plan_quota_fields_present() -> None:
         "analysisDepth",
         "reviewSet",
         "adsEnabled",
+        "calendarEnabled",
+        "calendarAutoReplan",
+        "calendarEvaluationAdaptive",
+        "calendarExamBackplan",
     ]
     for field in required_fields:
         assert field in policy, f"Missing field in quotaPolicy: {field}"
+
+
+def test_capabilities_free_gets_calendar_without_automation() -> None:
+    """무료도 캘린더는 열리고, 자동화 3종만 꺼진 채로 내려온다."""
+    with TestClient(app) as client:
+        response = client.get("/v1/capabilities", headers=_headers())
+
+    policy = response.json()["quotaPolicy"]
+    assert policy["calendarEnabled"] is True
+    assert policy["calendarAutoReplan"] is False
+    assert policy["calendarEvaluationAdaptive"] is False
+    assert policy["calendarExamBackplan"] is False
+
+
+def test_capabilities_never_advertises_weakness_planner() -> None:
+    """구현이 없는 취약점 기반 일정은 어떤 이름으로도 내려보내지 않는다."""
+    with TestClient(app) as client:
+        response = client.get("/v1/capabilities", headers=_headers())
+
+    assert "weakness" not in response.text.lower()
+
+
+@pytest.mark.parametrize(
+    ("plan", "auto_replan", "evaluation", "backplan"),
+    [
+        (Plan.FREE, False, False, False),
+        (Plan.BASIC, True, False, False),
+        (Plan.PLUS, True, True, True),
+        (Plan.PRO, True, True, True),
+    ],
+)
+def test_quota_policy_serializes_calendar_capabilities_per_plan(
+    plan: Plan, auto_replan: bool, evaluation: bool, backplan: bool
+) -> None:
+    """플랜별 캘린더 자동화가 quotaPolicy 별칭 그대로 직렬화된다."""
+    policy = _quota_policy_for(plan).model_dump(by_alias=True)
+
+    assert policy["calendarEnabled"] is True
+    assert policy["calendarAutoReplan"] is auto_replan
+    assert policy["calendarEvaluationAdaptive"] is evaluation
+    assert policy["calendarExamBackplan"] is backplan
+
+
+def test_quota_policy_keeps_existing_quota_and_depth_values() -> None:
+    """캘린더 필드를 더해도 기존 한도·분석 깊이 값은 그대로다."""
+    free = _quota_policy_for(Plan.FREE)
+    pro = _quota_policy_for(Plan.PRO)
+
+    assert (free.practice_daily, free.practice_ad_bonus) == (1, 1)
+    assert (free.history_days, free.analysis_depth, free.review_set) == (7, "summary", False)
+    assert (pro.practice_daily, pro.mock_sessions_per_day) == (20, 5)
+    assert (pro.history_days, pro.analysis_depth, pro.review_set) == (None, "full", True)
+
+
+@pytest.mark.parametrize(
+    ("entitlements", "expected"),
+    [(["premium"], Plan.PRO), (["exam_pass"], Plan.PRO), (["basic"], Plan.BASIC)],
+)
+def test_legacy_entitlements_still_map_to_calendar_capabilities(
+    entitlements: list[str], expected: Plan
+) -> None:
+    """레거시 엔타이틀먼트도 같은 플랜의 캘린더 기능을 그대로 받는다."""
+    plan = plan_from_entitlement_ids(entitlements)
+    assert plan is expected
+    assert _quota_policy_for(plan).calendar_auto_replan is True
 
 
 def _mock_session_payload() -> dict[str, object]:

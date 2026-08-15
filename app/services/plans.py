@@ -55,6 +55,12 @@ class PlanLimits:
     analysis_depth: AnalysisDepth
     review_set: bool  # 취약점 복습 세트 자동 생성(routes.py에서 실제 강제)
     ads_enabled: bool  # 배너/리워드 광고 노출 여부
+    # 캘린더는 전 플랜이 쓴다. 유료가 사는 것은 접근권이 아니라 자동화 깊이다.
+    calendar_enabled: bool  # 캘린더 자체(항상 True. 무료도 잠그지 않는다)
+    calendar_auto_replan: bool  # 놓친/추가 학습을 앞으로의 일정에 반영
+    calendar_evaluation_adaptive: bool  # 최근 평가 등급을 권장 학습량에 반영
+    calendar_exam_backplan: bool  # 시험일 역산 압축 일정
+    # 없는 필드: calendar_weakness_planner. 취약점 기반 일정은 G8이고 구현이 없다.
     # 삭제한 필드: grade_trend / weakness_analysis / weekly_report /
     # mock_comparison. 스마트 인사이트 3종은 앱이 로컬 기록으로 계산해 전 플랜
     # 무료로 제공하고, 모의고사 비교는 서버·앱 어디에도 구현이 없었다.
@@ -80,6 +86,10 @@ _DEFAULT_LIMITS = PlanLimits(
     analysis_depth=AnalysisDepth.SUMMARY,
     review_set=False,
     ads_enabled=True,
+    calendar_enabled=True,
+    calendar_auto_replan=False,
+    calendar_evaluation_adaptive=False,
+    calendar_exam_backplan=False,
 )
 
 # 플랜별 변경점만 정의
@@ -94,6 +104,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "history_days": 30,
         "analysis_depth": AnalysisDepth.FULL,
         "ads_enabled": False,
+        "calendar_auto_replan": True,
     },
     Plan.PLUS: {
         "practice_daily": 10,
@@ -105,6 +116,9 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "history_days": 30,
         "analysis_depth": AnalysisDepth.FULL,
         "ads_enabled": False,
+        "calendar_auto_replan": True,
+        "calendar_evaluation_adaptive": True,
+        "calendar_exam_backplan": True,
     },
     Plan.PRO: {
         "practice_daily": 20,
@@ -117,6 +131,10 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "analysis_depth": AnalysisDepth.FULL,
         "review_set": True,
         "ads_enabled": False,
+        # 프로는 플러스의 캘린더 기능을 그대로 갖는다. G4에서 프로 전용 일정 기능은 없다.
+        "calendar_auto_replan": True,
+        "calendar_evaluation_adaptive": True,
+        "calendar_exam_backplan": True,
     },
 }
 
