@@ -50,6 +50,9 @@ from app.models.api import (
     RewardIntentRequest,
     RewardIntentResponse,
     RewardPurpose,
+    StudyPlanRequest,
+    StudyPlanResponse,
+    StudyPlanSettings,
     TargetLevelRequest,
     TargetLevelResponse,
     UsageResponse,
@@ -89,6 +92,9 @@ KST = ZoneInfo("Asia/Seoul")
 QUESTION_LIST = TypeAdapter(list[GeneratedQuestion])
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 MOCK_AUDIO_AGGREGATE_MAX_BYTES = 30 * 1024 * 1024
+# 학습 계획 설정 스키마 버전. 서버가 매긴다 — 클라이언트가 보내면 자기 문서의
+# 해석 방식을 스스로 정하게 된다.
+STUDY_PLAN_SCHEMA_VERSION = 1
 
 
 async def _current_plan(request: Request, uid: str) -> Plan:
@@ -110,6 +116,10 @@ def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
         analysisDepth=str(limits.analysis_depth),
         reviewSet=limits.review_set,
         adsEnabled=limits.ads_enabled,
+        calendarEnabled=limits.calendar_enabled,
+        calendarAutoReplan=limits.calendar_auto_replan,
+        calendarEvaluationAdaptive=limits.calendar_evaluation_adaptive,
+        calendarExamBackplan=limits.calendar_exam_backplan,
     )
 
 
@@ -741,6 +751,47 @@ async def update_target_level(
         changed=result["changed"],
         rewardConsumed=result["rewardConsumed"],
     )
+
+
+def _study_plan_settings(stored: dict[str, object]) -> StudyPlanSettings:
+    return StudyPlanSettings.model_validate(stored)
+
+
+@router.get("/v1/users/me/study-plan", response_model=StudyPlanResponse)
+async def read_study_plan(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> StudyPlanResponse:
+    """캘린더를 쓰지 않는 기존 사용자는 설정 문서가 없다. 그건 오류가 아니라
+    `configured=false`다."""
+    stored = await request.app.state.state_store.get_study_plan(user.uid)
+    if not stored:
+        return StudyPlanResponse(configured=False)
+    try:
+        settings = _study_plan_settings(stored)
+    except ValidationError:
+        # 스키마가 바뀌어 읽을 수 없는 문서는 지우지 않고 미설정으로 되돌린다.
+        # 사용자는 다시 설정하면 되고, 원본은 조사할 수 있게 남는다.
+        logger.warning("unreadable study plan uidHash=%s", _uid_hash(user.uid))
+        return StudyPlanResponse(configured=False)
+    return StudyPlanResponse(configured=True, studyPlan=settings)
+
+
+@router.put("/v1/users/me/study-plan", response_model=StudyPlanResponse)
+async def update_study_plan(
+    payload: StudyPlanRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> StudyPlanResponse:
+    """생성과 교체를 구분하지 않는다. 설정은 통째로 덮어쓰는 값 하나다."""
+    stored = await request.app.state.state_store.set_study_plan(
+        user.uid,
+        study_plan={
+            "schemaVersion": STUDY_PLAN_SCHEMA_VERSION,
+            **payload.model_dump(by_alias=True, mode="json"),
+        },
+    )
+    return StudyPlanResponse(configured=True, studyPlan=_study_plan_settings(stored))
 
 
 @router.post("/v1/question-sets/practice", response_model=QuestionSetResponse)
