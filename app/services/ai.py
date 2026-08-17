@@ -443,7 +443,7 @@ class AIService:
                     )
                 except ValidationError as error:
                     if attempt >= max_attempts:
-                        raise
+                        raise AIServiceUnavailable("AI returned malformed structured output") from error
                     validation_errors = self._validation_error_messages(error)
                     logger.warning(
                         "OpenAI structured output failed validation; retrying. "
@@ -453,7 +453,7 @@ class AIService:
                         attempt,
                         validation_errors,
                     )
-            raise ValueError("OpenAI structured request exhausted attempts")
+            raise AIServiceUnavailable("AI structured output exhausted all attempts")
         except AIServiceError:
             raise
         except Exception as error:
