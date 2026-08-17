@@ -214,6 +214,57 @@ class TestPlanComparisons:
         )
 
 
+class TestCalendarCapabilities:
+    """G4: 캘린더는 전 플랜 접근 가능하고, 유료는 자동화 깊이만 산다."""
+
+    def test_calendar_is_enabled_for_every_plan(self) -> None:
+        """무료 포함 모든 플랜에서 캘린더 자체는 열린다."""
+        for plan in Plan:
+            assert PLAN_LIMITS[plan].calendar_enabled is True
+
+    def test_free_has_no_calendar_automation(self) -> None:
+        """무료는 캘린더를 쓰지만 자동화는 전부 꺼져 있다."""
+        limits = PLAN_LIMITS[Plan.FREE]
+        assert limits.calendar_auto_replan is False
+        assert limits.calendar_evaluation_adaptive is False
+        assert limits.calendar_exam_backplan is False
+
+    def test_basic_unlocks_only_auto_replan(self) -> None:
+        """베이직이 사는 것은 자동 일정 재조정 하나뿐이다."""
+        limits = PLAN_LIMITS[Plan.BASIC]
+        assert limits.calendar_auto_replan is True
+        assert limits.calendar_evaluation_adaptive is False
+        assert limits.calendar_exam_backplan is False
+
+    def test_plus_unlocks_every_implemented_calendar_capability(self) -> None:
+        """플러스는 평가 반영과 시험일 역산까지 모두 켠다."""
+        limits = PLAN_LIMITS[Plan.PLUS]
+        assert limits.calendar_auto_replan is True
+        assert limits.calendar_evaluation_adaptive is True
+        assert limits.calendar_exam_backplan is True
+
+    def test_pro_matches_plus_calendar_capabilities(self) -> None:
+        """프로는 플러스의 캘린더 기능을 그대로 포함한다(추가 기능을 지어내지 않는다)."""
+        plus = PLAN_LIMITS[Plan.PLUS]
+        pro = PLAN_LIMITS[Plan.PRO]
+        for field in ("calendar_enabled", "calendar_auto_replan",
+                      "calendar_evaluation_adaptive", "calendar_exam_backplan"):
+            assert getattr(pro, field) == getattr(plus, field)
+
+    def test_no_weakness_planner_capability_exists(self) -> None:
+        """취약점 기반 일정(G8)은 구현이 없으므로 한도 필드로도 존재하지 않는다."""
+        fields = {field.name for field in dataclasses.fields(PlanLimits)}
+        assert "calendar_weakness_planner" not in fields
+
+    def test_calendar_capabilities_are_monotonic_by_plan(self) -> None:
+        """상위 플랜이 하위 플랜의 캘린더 기능을 잃지 않는다."""
+        order = [Plan.FREE, Plan.BASIC, Plan.PLUS, Plan.PRO]
+        for field in ("calendar_auto_replan", "calendar_evaluation_adaptive",
+                      "calendar_exam_backplan"):
+            values = [getattr(PLAN_LIMITS[plan], field) for plan in order]
+            assert values == sorted(values), field
+
+
 class TestIsPaidFunction:
     """is_paid() 함수 테스트."""
 
