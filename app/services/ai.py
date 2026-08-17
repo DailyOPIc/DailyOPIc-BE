@@ -37,6 +37,7 @@ from app.models.api import (
     RubricDimension,
 )
 from app.services import answer_quality
+from app.services import telemetry
 from app.services.plans import AnalysisDepth
 from app.services.questions import (
     FallbackQuestionGenerator,
@@ -77,6 +78,106 @@ RUBRIC_SCORE_BY_BAND = {
     RubricBand.STRONG: 80,
     RubricBand.ADVANCED: 95,
 }
+
+# 예상 등급 보정에 쓰는 등급 순서(IL~AL). predictedLevel 은 _clamp_min_level 을
+# 통과한 뒤 이 범위 안에 있다.
+_RECONCILE_SCALE = [
+    OPIcLevel.IL,
+    OPIcLevel.IM1,
+    OPIcLevel.IM2,
+    OPIcLevel.IM3,
+    OPIcLevel.IH,
+    OPIcLevel.AL,
+]
+_BAND_ORDINAL = {
+    RubricBand.FOUNDATION: 0,
+    RubricBand.DEVELOPING: 1,
+    RubricBand.FUNCTIONAL: 2,
+    RubricBand.STRONG: 3,
+    RubricBand.ADVANCED: 4,
+}
+
+# 시뮬레이션 레벨별 프롬프트 문장 수 범위. (최소, 최대) 이고 최대 None 은 상한 없음.
+# 검증기(_validate_level_rules)와 모델 지시문(_question_generation_instructions)이
+# 이 표 하나만 참조한다. 두 곳에 숫자를 따로 적으면 어긋난다.
+LEVEL_PROMPT_SENTENCES: dict[int, tuple[int, int | None]] = {
+    1: (1, 2),
+    2: (1, 2),
+    3: (1, 3),
+    4: (2, 3),
+    5: (2, None),
+    6: (2, 4),
+}
+
+
+def _sentence_range(level: int) -> tuple[int, int | None]:
+    return LEVEL_PROMPT_SENTENCES[min(6, max(1, level))]
+
+
+def _sentence_rule_text() -> str:
+    """모델 지시문에 넣을 문장 수 안내를 표에서 생성한다."""
+    lines = []
+    for level in sorted(LEVEL_PROMPT_SENTENCES):
+        minimum, maximum = LEVEL_PROMPT_SENTENCES[level]
+        if maximum is None:
+            lines.append(f"Level {level}: at least {minimum} sentences.")
+        elif minimum == maximum:
+            lines.append(f"Level {level}: exactly {minimum} sentence.")
+        else:
+            lines.append(f"Level {level}: {minimum} to {maximum} sentences.")
+    return " ".join(lines)
+
+
+def _reconcile_with_rubrics(
+    level: OPIcLevel, rubrics: list[RubricAssessment]
+) -> tuple[OPIcLevel, bool]:
+    """항목별 밴드가 뒷받침하지 못하는 예상 등급을 상한까지 끌어내린다.
+
+    모델은 predictedLevel 과 rubrics 를 한 응답에서 각각 내보내고, 둘을 대조하는
+    지점이 없었다. 그래서 전 항목이 developing 인데 predictedLevel 이 IH 인 응답도
+    그대로 통과했다.
+
+    임의 임계값을 만들지 않기 위해 **평균 점수 구간을 쓰지 않는다.** 공식 등급
+    기준에서 곧바로 끌어낼 수 있는 상한만 적용한다.
+
+    - 모든 항목이 최하 밴드면 하한(IL) 이상을 주장할 근거가 없다.
+    - IH 는 "예측 못한 복잡한 상황을 설명하고 문제를 효과적으로 해결"이다.
+      어느 항목도 strong 에 못 미치거나, 과제수행·구성이 functional 미만이면
+      IH 이상을 주장할 수 없다.
+    - AL 은 시제·형용사·접속사·문단을 "일관되게" 관리하는 수준이다. 한 항목이라도
+      strong 미만이거나 advanced 가 하나도 없으면 AL 이 될 수 없다.
+
+    보정은 상한만 적용하므로 등급을 올리는 방향으로는 절대 움직이지 않는다.
+    등급 구간을 새로 발명하지 않고 근거 없는 주장만 걷어내는 것이 목적이다.
+    """
+    if level not in _RECONCILE_SCALE:
+        return level, False
+
+    bands = {item.dimension: item.band for item in rubrics}
+    ordinals = [_BAND_ORDINAL[band] for band in bands.values()]
+    if not ordinals:
+        return level, False
+
+    strong = _BAND_ORDINAL[RubricBand.STRONG]
+    functional = _BAND_ORDINAL[RubricBand.FUNCTIONAL]
+    cap = OPIcLevel.AL
+
+    def tighten(candidate: OPIcLevel) -> OPIcLevel:
+        return min(cap, candidate, key=_RECONCILE_SCALE.index)
+
+    if max(ordinals) == _BAND_ORDINAL[RubricBand.FOUNDATION]:
+        cap = tighten(MIN_PREDICTED_LEVEL)
+    if max(ordinals) < strong:
+        cap = tighten(OPIcLevel.IM3)
+    for dimension in (RubricDimension.TASK_FULFILLMENT, RubricDimension.DISCOURSE):
+        if _BAND_ORDINAL[bands[dimension]] < functional:
+            cap = tighten(OPIcLevel.IM3)
+    if min(ordinals) < strong or max(ordinals) < _BAND_ORDINAL[RubricBand.ADVANCED]:
+        cap = tighten(OPIcLevel.IH)
+
+    if _RECONCILE_SCALE.index(level) <= _RECONCILE_SCALE.index(cap):
+        return level, False
+    return cap, True
 logger = logging.getLogger(__name__)
 
 BriefKorean = Annotated[str, Field(min_length=1, max_length=140)]
@@ -342,7 +443,7 @@ class AIService:
                     )
                 except ValidationError as error:
                     if attempt >= max_attempts:
-                        raise
+                        raise AIServiceUnavailable("AI returned malformed structured output") from error
                     validation_errors = self._validation_error_messages(error)
                     logger.warning(
                         "OpenAI structured output failed validation; retrying. "
@@ -352,7 +453,7 @@ class AIService:
                         attempt,
                         validation_errors,
                     )
-            raise ValueError("OpenAI structured request exhausted attempts")
+            raise AIServiceUnavailable("AI structured output exhausted all attempts")
         except AIServiceError:
             raise
         except Exception as error:
@@ -817,6 +918,18 @@ class AIService:
                     attempt,
                     [item.log_value() for item in last_issues],
                 )
+                # 어떤 (레벨, 필드) 조합이 자주 걸리는지 봐야 지시문을 고칠 수 있다.
+                # 마지막 시도 실패는 폴백으로 처리되므로 실제 재시도가 일어날 때만 발행.
+                if attempt < max_attempts:
+                    telemetry.emit(
+                        "question_generation_retry",
+                        mode=mode,
+                        stage=stage,
+                        attempt=attempt,
+                        simulationLevel=simulation_level,
+                        failedSlots=len(pending_numbers),
+                        fields=sorted({item.field for item in last_issues}),
+                    )
             except AIServiceConfigurationError:
                 raise
             except Exception as error:
@@ -884,6 +997,19 @@ class AIService:
             fallback_reason,
             fallback_numbers,
             max_attempts - 1,
+        )
+        # 폴백 전환률을 수치로 봐야 한다. 초급에 롤플레이·의견이 배정되면서 문장 수 제약을
+        # 지키기 어려운 조합이 늘었는지, 아니면 프로바이더 장애가 원인인지 구분하려면
+        # reason 과 슬롯 수가 함께 필요하다.
+        telemetry.emit(
+            "question_generation_fallback",
+            mode=mode,
+            stage=stage,
+            reason=fallback_reason,
+            simulationLevel=simulation_level,
+            fallbackSlots=len(fallback_numbers),
+            totalSlots=len(blueprint),
+            retryCount=max_attempts - 1,
         )
         return QuestionGenerationResult(
             questions=questions,
@@ -1293,21 +1419,29 @@ class AIService:
             "Do not copy official OPIc wording or catalog examples. "
             "Do not reuse forbidden prompt meanings or any fixedQuestions. "
             "\n\n"
-            "Sentence count rules by effectiveLevel: "
-            "Level 1: prompt must be exactly 1 sentence. "
-            "Level 2: prompt must be 1 or 2 sentences. "
-            "Level 3: prompt must be exactly 2 sentences. "
-            "Level 4: prompt must be 2 or 3 sentences. "
-            "Level 5: prompt must be at least 3 sentences. "
-            "Level 6: prompt must be 3 or 4 sentences. "
+            "Sentence count rules by effectiveLevel. The backend rejects prompts outside these ranges: "
+            + _sentence_rule_text()
+            + " "
             "\n\n"
-            "Difficulty rules: "
-            "Level 1 questions must be very short, concrete, and descriptive. "
-            "Level 2 may include simple reasons. "
-            "Level 3 may include simple past experiences. "
-            "Level 4 may include comparison or change. "
-            "Level 5 may include experience, comparison, roleplay, and problem solving. "
-            "Level 6 may include abstract opinions, social impact, advantages and disadvantages, and hypothetical situations. "
+            "Difficulty rules. The blueprint fixes the questionStyle of every slot, and the exam structure "
+            "is the same at every level, exactly like the real test. Write a question of the given "
+            "questionStyle and adjust only the language demand to effectiveLevel. Never swap a slot for an "
+            "easier question type. "
+            "Level 1: everyday wording, one concrete thing to say, no reasoning required. "
+            "Level 2: everyday wording plus one simple reason. "
+            "Level 3: connected sentences about a familiar situation. "
+            "Level 4: specific detail and one contrast or change. "
+            "Level 5: an unfamiliar or unexpected situation that needs explanation and a solution. "
+            "Level 6: abstract or hypothetical framing that needs a structured argument. "
+            "\n\n"
+            # 초급에 롤플레이·문제해결·의견이 배정되는 것은 새로운 조합이다. 이 유형은
+            # 상황 설명이 길어지기 쉬워 문장 수 상한을 넘기기 쉽다. 형태를 알려주면
+            # 재시도 없이 한 번에 맞을 확률이 올라간다. 예시 문장을 그대로 주면 모델이
+            # 복사하므로 구조만 설명한다.
+            "Keeping the limit at Level 1 and Level 2. For roleplay, problem solving, and opinion at "
+            "these levels, use one short sentence to set the situation and one short sentence to state "
+            "the task, and stop there. Do not add background, do not list more than two things to say, "
+            "and do not stack conditions. If the situation is obvious from the topic, one sentence is enough."
         )
 
         if mode == "practice":
@@ -1437,49 +1571,25 @@ class AIService:
     def _validate_level_rules(
         cls, simulation_level: int, questions: list[GeneratedQuestion]
     ) -> None:
-        forbidden: set[QuestionStyle] = set()
-
-        if simulation_level <= 1:
-            forbidden = {
-                QuestionStyle.COMPARISON,
-                QuestionStyle.PROBLEM_SOLVING,
-                QuestionStyle.OPINION,
-                QuestionStyle.ROLEPLAY,
-            }
-        elif simulation_level == 2:
-            forbidden = {
-                QuestionStyle.COMPARISON,
-                QuestionStyle.PROBLEM_SOLVING,
-                QuestionStyle.OPINION,
-                QuestionStyle.ROLEPLAY,
-            }
-        elif simulation_level == 3:
-            forbidden = {
-                QuestionStyle.PROBLEM_SOLVING,
-                QuestionStyle.OPINION,
-            }
-
+        # 문항 유형은 레벨로 제한하지 않는다. 실제 OPIc 은 자기평가 레벨과 무관하게
+        # 롤플레이·비교·의견 문항을 모두 낸다. 초급에서 유형을 빼면 시험에 반드시
+        # 나오는 문항을 연습할 기회가 사라진다. 난이도는 문장 수로만 제한한다.
         for item in questions:
-            if item.question_style in forbidden:
-                raise ValueError("generated question type is too difficult for level")
-
             if item.exam_section is ExamSection.INTRODUCTION:
                 continue
 
             sentence_count = cls._sentence_count(item.prompt)
+            minimum, maximum = _sentence_range(simulation_level)
 
-            if simulation_level <= 1 and sentence_count > 2:
-                raise ValueError("level 1 prompts must be one or two sentences")
-            if simulation_level == 2 and not 1 <= sentence_count <= 2:
-                raise ValueError("level 2 prompts must be one or two sentences")
-            if simulation_level == 3 and not 1 <= sentence_count <= 3:
-                raise ValueError("level 3 prompts must be one to three sentences")
-            if simulation_level == 4 and not 2 <= sentence_count <= 3:
-                raise ValueError("level 4 prompts must be two or three sentences")
-            if simulation_level == 5 and sentence_count < 2:
-                raise ValueError("level 5 prompts must be at least two sentences")
-            if simulation_level >= 6 and not 2 <= sentence_count <= 4:
-                raise ValueError("level 6 prompts must be two to four sentences")
+            if sentence_count < minimum or (
+                maximum is not None and sentence_count > maximum
+            ):
+                raise ValueError(
+                    "generated prompt sentence count is outside the level range: "
+                    f"level={simulation_level} expected={minimum}"
+                    f"-{maximum if maximum is not None else 'unbounded'} "
+                    f"actual={sentence_count}"
+                )
 
     @staticmethod
     def _sentence_count(prompt: str) -> int:
@@ -1674,9 +1784,18 @@ class AIService:
             result = structured.payload
         assert isinstance(result, AIPracticeResult)
         result_dump = result.model_dump(by_alias=True)
-        # 예상 등급 하한 IL 적용(IL~AL).
+        # 예상 등급 하한 IL 적용(IL~AL) 후 항목별 밴드와 대조해 상한을 적용한다.
         level, clamped = _clamp_min_level(result.predicted_level)
+        level, reconciled = _reconcile_with_rubrics(level, result.rubrics)
         result_dump["predictedLevel"] = level.value
+        if reconciled:
+            telemetry.emit(
+                "evaluation_level_reconciled",
+                mode="practice",
+                modelLevel=result.predicted_level.value,
+                finalLevel=level.value,
+                promptVersion=PROMPT_VERSION,
+            )
         if strip_long:
             # 하위 티어는 교정/모범답안/목표갭을 제공하지 않음(누락은 경고 대상 아님).
             result_dump["correctedAnswer"] = None
@@ -1689,7 +1808,10 @@ class AIService:
                 "targetGap": result.target_gap,
                 "sampleAnswer": result.sample_answer,
             }
-        warnings = [name for name, value in warning_source.items() if not value]
+        missing = [name for name, value in warning_source.items() if not value]
+        # 등급 보정은 선택 필드 누락과 성격이 다르다. 결과가 불완전한 것은 아니므로
+        # warnings 에만 남기고 resultStatus 는 누락 여부로만 결정한다.
+        warnings = missing + (["levelReconciled"] if reconciled else [])
         return PracticeEvaluation(
             **result_dump,
             scores=self._scores_from_rubrics(result.rubrics),
@@ -1697,7 +1819,7 @@ class AIService:
             disclaimer=DISCLAIMER,
             modelVersion=self.model,
             promptVersion=PROMPT_VERSION,
-            resultStatus="partial" if warnings else "complete",
+            resultStatus="partial" if missing else "complete",
             warnings=warnings,
             scoreScaleVersion=SCORE_SCALE_VERSION,
             answerQuality=answer_quality.classify(
@@ -1779,7 +1901,16 @@ class AIService:
         assert isinstance(result, AIMockResult)
         mock_dump = result.model_dump(by_alias=True)
         level, clamped = _clamp_min_level(result.predicted_level)
+        level, reconciled = _reconcile_with_rubrics(level, result.rubrics)
         mock_dump["predictedLevel"] = level.value
+        if reconciled:
+            telemetry.emit(
+                "evaluation_level_reconciled",
+                mode="mock",
+                modelLevel=result.predicted_level.value,
+                finalLevel=level.value,
+                promptVersion=PROMPT_VERSION,
+            )
         return MockEvaluation(
             **mock_dump,
             scores=self._scores_from_rubrics(result.rubrics),
@@ -1790,7 +1921,7 @@ class AIService:
             modelVersion=self.model,
             promptVersion=PROMPT_VERSION,
             resultStatus="complete",
-            warnings=[],
+            warnings=["levelReconciled"] if reconciled else [],
             scoreScaleVersion=SCORE_SCALE_VERSION,
             answerQuality=answer_quality.classify_many(
                 transcripts=transcripts,
