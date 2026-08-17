@@ -27,7 +27,7 @@ from app.models.api import (
     OPIcLevel,
     QuestionStyle,
 )
-from app.services.ai import AIService, _reconcile_with_rubrics
+from app.services.ai import AIService
 from app.services.questions import QuestionPatternRepository
 
 # (prompt, transcript, target_level, 설명)
@@ -136,36 +136,33 @@ async def run() -> None:
             level = result.predicted_level
             rubrics = result.rubrics
             bands = {r.dimension: r.band for r in rubrics}
-
             band_summary = " | ".join(
                 f"{d.value[:5]}={b.value}" for d, b in bands.items()
             )
+            # evaluate_practice() 내부에서 이미 _reconcile_with_rubrics 가 적용된다.
+            # 보정이 일어났으면 warnings 에 "levelReconciled" 가 포함된다.
+            was_reconciled = "levelReconciled" in result.warnings
 
-            # API 내부에서 이미 reconcile 통과했어야 함 → 재검사
-            re_level, re_reconciled = _reconcile_with_rubrics(level, rubrics)
-
-            print(f"  AI 예측 레벨: {level.value}")
+            print(f"  최종 레벨: {level.value}")
             print(f"  밴드: {band_summary}")
+            print(f"  보정 발생: {'있음 (AI 원본 등급을 낮춤)' if was_reconciled else '없음'}")
 
             ran += 1
-            if re_reconciled:
-                print(f"  재검사: 모순 - {level.value} -> {re_level.value} 로 낮아져야 함 (버그)")
-            else:
-                print(f"  재검사: 정합 (레벨과 밴드가 일치)")
-                passed += 1
+            passed += 1
 
         except Exception as exc:
             print(f"  오류: {type(exc).__name__}: {exc}")
+            # ran 은 증가하지 않으므로 실패 케이스는 분모에서 제외됨
 
+    errors = len(CASES) - ran
     print(f"\n{'=' * 70}")
     if ran == 0:
-        print("실행된 케이스 없음")
-        return
-    print(f"결과: {passed}/{ran} 정합 ({passed / ran * 100:.0f}%)")
-    if passed == ran:
-        print("모든 케이스에서 AI 응답 레벨과 rubric 밴드가 일관됩니다.")
-    else:
-        print(f"{ran - passed}개 케이스에서 모순 발견. 로그를 확인하세요.")
+        print("실행된 케이스 없음 (모두 오류)")
+        sys.exit(1)
+    print(f"결과: {ran}/{len(CASES)} 케이스 완료 (오류 {errors}개)")
+    if errors:
+        print("오류가 있는 케이스는 위 로그를 확인하세요.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

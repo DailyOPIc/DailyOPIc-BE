@@ -919,15 +919,17 @@ class AIService:
                     [item.log_value() for item in last_issues],
                 )
                 # 어떤 (레벨, 필드) 조합이 자주 걸리는지 봐야 지시문을 고칠 수 있다.
-                telemetry.emit(
-                    "question_generation_retry",
-                    mode=mode,
-                    stage=stage,
-                    attempt=attempt,
-                    simulationLevel=simulation_level,
-                    failedSlots=len(pending_numbers),
-                    fields=sorted({item.field for item in last_issues}),
-                )
+                # 마지막 시도 실패는 폴백으로 처리되므로 실제 재시도가 일어날 때만 발행.
+                if attempt < max_attempts:
+                    telemetry.emit(
+                        "question_generation_retry",
+                        mode=mode,
+                        stage=stage,
+                        attempt=attempt,
+                        simulationLevel=simulation_level,
+                        failedSlots=len(pending_numbers),
+                        fields=sorted({item.field for item in last_issues}),
+                    )
             except AIServiceConfigurationError:
                 raise
             except Exception as error:
