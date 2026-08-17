@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import _quota_policy_for
 from app.main import app
+from app.models.api import CapabilityQuotaPolicy
 from app.services.plans import Plan, plan_from_entitlement_ids
 from app.services.admob import VerifiedReward
 from app.services.ai import AIQuestionGenerationError, AIServiceUnavailable
@@ -894,6 +895,7 @@ def test_capabilities_endpoint_plan_quota_fields_present() -> None:
         "calendarAutoReplan",
         "calendarEvaluationAdaptive",
         "calendarExamBackplan",
+        "calendarStudyReminder",
     ]
     for field in required_fields:
         assert field in policy, f"Missing field in quotaPolicy: {field}"
@@ -909,6 +911,8 @@ def test_capabilities_free_gets_calendar_without_automation() -> None:
     assert policy["calendarAutoReplan"] is False
     assert policy["calendarEvaluationAdaptive"] is False
     assert policy["calendarExamBackplan"] is False
+    # 학습 알림은 유료 기능이라 무료에서는 잠긴 채로 내려온다.
+    assert policy["calendarStudyReminder"] is False
 
 
 def test_capabilities_never_advertises_weakness_planner() -> None:
@@ -920,24 +924,41 @@ def test_capabilities_never_advertises_weakness_planner() -> None:
 
 
 @pytest.mark.parametrize(
-    ("plan", "auto_replan", "evaluation", "backplan"),
+    ("plan", "auto_replan", "evaluation", "backplan", "reminder"),
     [
-        (Plan.FREE, False, False, False),
-        (Plan.BASIC, True, False, False),
-        (Plan.PLUS, True, True, True),
-        (Plan.PRO, True, True, True),
+        (Plan.FREE, False, False, False, False),
+        (Plan.BASIC, True, False, False, True),
+        (Plan.PLUS, True, True, True, True),
+        (Plan.PRO, True, True, True, True),
     ],
 )
 def test_quota_policy_serializes_calendar_capabilities_per_plan(
-    plan: Plan, auto_replan: bool, evaluation: bool, backplan: bool
+    plan: Plan, auto_replan: bool, evaluation: bool, backplan: bool, reminder: bool
 ) -> None:
-    """플랜별 캘린더 자동화가 quotaPolicy 별칭 그대로 직렬화된다."""
+    """플랜별 캘린더 자동화와 학습 알림이 quotaPolicy 별칭 그대로 직렬화된다."""
     policy = _quota_policy_for(plan).model_dump(by_alias=True)
 
     assert policy["calendarEnabled"] is True
     assert policy["calendarAutoReplan"] is auto_replan
     assert policy["calendarEvaluationAdaptive"] is evaluation
     assert policy["calendarExamBackplan"] is backplan
+    assert policy["calendarStudyReminder"] is reminder
+
+
+def test_quota_policy_defaults_study_reminder_to_locked() -> None:
+    """필드를 모르는 쪽에서 만들어도 기본값은 잠김이다(구버전 호환)."""
+    assert CapabilityQuotaPolicy(
+        dailyAnalysisFree=1, dailyRefreshRewards=1
+    ).calendar_study_reminder is False
+
+
+def test_capabilities_never_promises_push_notifications() -> None:
+    """학습 알림은 기기 로컬 알림이다. 서버 푸시를 암시하는 필드를 내려보내지 않는다."""
+    with TestClient(app) as client:
+        payload = client.get("/v1/capabilities", headers=_headers()).text.lower()
+
+    for forbidden in ("fcm", "apns", "pushtoken", "remotepush"):
+        assert forbidden not in payload
 
 
 def test_quota_policy_keeps_existing_quota_and_depth_values() -> None:

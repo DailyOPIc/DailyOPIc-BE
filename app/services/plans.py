@@ -62,6 +62,9 @@ class PlanLimits:
     calendar_auto_replan: bool  # 놓친/추가 학습을 앞으로의 일정에 반영
     calendar_evaluation_adaptive: bool  # 최근 평가 등급을 권장 학습량에 반영
     calendar_exam_backplan: bool  # 시험일 역산 압축 일정
+    # 학습 알림은 자동화 깊이가 아니라 유료 기능 자체다. 무료는 잠기고 베이직부터 열린다.
+    # 앱의 로컬 알림 예약 권한을 뜻하며 서버가 푸시를 보내지 않는다(FCM/APNs 없음).
+    calendar_study_reminder: bool
     # 없는 필드: calendar_weakness_planner. 취약점 기반 일정은 G8이고 구현이 없다.
     # 삭제한 필드: grade_trend / weakness_analysis / weekly_report /
     # mock_comparison. 스마트 인사이트 3종은 앱이 로컬 기록으로 계산해 전 플랜
@@ -92,6 +95,7 @@ _DEFAULT_LIMITS = PlanLimits(
     calendar_auto_replan=False,
     calendar_evaluation_adaptive=False,
     calendar_exam_backplan=False,
+    calendar_study_reminder=False,
 )
 
 # 플랜별 변경점만 정의
@@ -107,6 +111,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "analysis_depth": AnalysisDepth.FULL,
         "ads_enabled": False,
         "calendar_auto_replan": True,
+        "calendar_study_reminder": True,
     },
     Plan.PLUS: {
         "practice_daily": 10,
@@ -121,6 +126,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "calendar_auto_replan": True,
         "calendar_evaluation_adaptive": True,
         "calendar_exam_backplan": True,
+        "calendar_study_reminder": True,
     },
     Plan.PRO: {
         "practice_daily": 20,
@@ -137,6 +143,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "calendar_auto_replan": True,
         "calendar_evaluation_adaptive": True,
         "calendar_exam_backplan": True,
+        "calendar_study_reminder": True,
     },
 }
 
