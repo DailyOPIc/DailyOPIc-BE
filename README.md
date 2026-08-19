@@ -280,7 +280,7 @@ Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. �
 
 학습 캘린더 설정은 `GET/PUT /v1/users/me/study-plan`으로 읽고 씁니다. 저장 위치는 `userProfiles/{uid}.studyPlan` 한 곳이며 시험일(선택), 공부 요일(ISO 월=1~일=7, 최소 1개), 학습 강도(`light|steady|focused`), 선호 학습 시각(`HH:MM` 로컬), 타임존 식별자만 담습니다. **목표 등급은 여기에 복제하지 않고 `PUT /v1/users/me/target-level`이 계속 진실입니다.** PUT은 전체 교체(멱등)이고 `schemaVersion`/`createdAt`/`updatedAt`은 서버가 매깁니다. 시험일은 요청에 담긴 타임존 기준으로 과거인지 판단합니다. 설정한 적 없는 기존 사용자에게는 오류가 아니라 `{"configured": false, "studyPlan": null}`을 돌려줍니다.
 
-`GET /v1/capabilities`의 `quotaPolicy`는 캘린더 관련 권한 5개를 함께 내려줍니다. **캘린더 자체는 전 플랜이 사용하므로 `calendarEnabled`는 항상 `true`이고, 플랜이 나누는 것은 자동화 깊이와 학습 알림 사용 여부뿐입니다.**
+`GET /v1/capabilities`의 `quotaPolicy`는 캘린더 관련 권한 6개를 함께 내려줍니다. **캘린더 자체는 전 플랜이 사용하므로 `calendarEnabled`는 항상 `true`이고, 플랜이 나누는 것은 자동화 깊이와 개인 일정 알림 사용 여부뿐입니다.**
 
 | 필드 | 무료 | 베이직 | 플러스 | 프로 |
 |---|---|---|---|---|
@@ -288,9 +288,15 @@ Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. �
 | `calendarAutoReplan` | false | true | true | true |
 | `calendarEvaluationAdaptive` | false | false | true | true |
 | `calendarExamBackplan` | false | false | true | true |
-| `calendarStudyReminder` | false | true | true | true |
+| `calendarStudyReminder` | true | true | true | true |
+| `calendarEventReminder` | false | true | true | true |
 
-`calendarStudyReminder`는 앱이 **기기에서 로컬 알림을 예약할 수 있는 권한**입니다. 서버는 알림을 보내지 않습니다(FCM·APNs 없음). 자동화 깊이와 달리 유료 3개 플랜 사이에 차이가 없습니다.
+알림 필드 2개는 모두 앱이 **기기에서 로컬 알림을 예약할 수 있는 권한**입니다. 서버는 알림을 보내지 않습니다(FCM·APNs 없음).
+
+- `calendarStudyReminder` — 매일 학습 리마인더. **P9부터 무료를 포함한 전 플랜이 `true`입니다.** 매일 공부하라고 깨워 주는 것까지 유료로 막으면 습관이 붙기 전에 무료 사용자가 떠납니다. P4의 "베이직부터" 정책은 폐기됐습니다.
+- `calendarEventReminder` — 개인 일정 알림. 새 유료 경계입니다. 개인 일정 자체(추가·수정·삭제)는 전 플랜이 쓰고, **알림 옵션만** 무료에서 잠깁니다.
+
+구버전 앱이 새 서버를 만나면 `calendarStudyReminder=true`를 받아 학습 알림이 그대로 열립니다(의도한 동작). 새 앱은 학습 알림을 이 필드로 잠그지 않으므로, 구버전 서버가 무료에 `false`를 내려줘도 잠기지 않습니다.
 
 기존 필드는 그대로이며 추가만 했으므로 구버전 클라이언트는 영향을 받지 않습니다. 새 필드를 모르는 앱은 무시하고, 새 앱이 이 필드가 없는 구버전 서버를 만나면 플랜 기준 폴백을 씁니다. 취약점 기반 일정(`calendarWeaknessPlanner`)은 구현이 없으므로 **capability로 노출하지 않습니다.**
 

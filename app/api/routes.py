@@ -121,6 +121,7 @@ def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
         calendarEvaluationAdaptive=limits.calendar_evaluation_adaptive,
         calendarExamBackplan=limits.calendar_exam_backplan,
         calendarStudyReminder=limits.calendar_study_reminder,
+        calendarEventReminder=limits.calendar_event_reminder,
     )
 
 

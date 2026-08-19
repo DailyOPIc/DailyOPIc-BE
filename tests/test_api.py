@@ -896,6 +896,7 @@ def test_capabilities_endpoint_plan_quota_fields_present() -> None:
         "calendarEvaluationAdaptive",
         "calendarExamBackplan",
         "calendarStudyReminder",
+        "calendarEventReminder",
     ]
     for field in required_fields:
         assert field in policy, f"Missing field in quotaPolicy: {field}"
@@ -911,8 +912,9 @@ def test_capabilities_free_gets_calendar_without_automation() -> None:
     assert policy["calendarAutoReplan"] is False
     assert policy["calendarEvaluationAdaptive"] is False
     assert policy["calendarExamBackplan"] is False
-    # 학습 알림은 유료 기능이라 무료에서는 잠긴 채로 내려온다.
-    assert policy["calendarStudyReminder"] is False
+    # 학습 알림은 무료도 쓴다(P9). 무료에서 잠기는 알림은 개인 일정 알림뿐이다.
+    assert policy["calendarStudyReminder"] is True
+    assert policy["calendarEventReminder"] is False
 
 
 def test_capabilities_never_advertises_weakness_planner() -> None:
@@ -924,7 +926,7 @@ def test_capabilities_never_advertises_weakness_planner() -> None:
 
 
 @pytest.mark.parametrize(
-    ("plan", "auto_replan", "evaluation", "backplan", "reminder"),
+    ("plan", "auto_replan", "evaluation", "backplan", "event_reminder"),
     [
         (Plan.FREE, False, False, False, False),
         (Plan.BASIC, True, False, False, True),
@@ -933,23 +935,25 @@ def test_capabilities_never_advertises_weakness_planner() -> None:
     ],
 )
 def test_quota_policy_serializes_calendar_capabilities_per_plan(
-    plan: Plan, auto_replan: bool, evaluation: bool, backplan: bool, reminder: bool
+    plan: Plan, auto_replan: bool, evaluation: bool, backplan: bool, event_reminder: bool
 ) -> None:
-    """플랜별 캘린더 자동화와 학습 알림이 quotaPolicy 별칭 그대로 직렬화된다."""
+    """플랜별 캘린더 자동화와 알림 2종이 quotaPolicy 별칭 그대로 직렬화된다."""
     policy = _quota_policy_for(plan).model_dump(by_alias=True)
 
     assert policy["calendarEnabled"] is True
     assert policy["calendarAutoReplan"] is auto_replan
     assert policy["calendarEvaluationAdaptive"] is evaluation
     assert policy["calendarExamBackplan"] is backplan
-    assert policy["calendarStudyReminder"] is reminder
+    # 학습 알림은 플랜과 무관하게 항상 열려 있다(P9).
+    assert policy["calendarStudyReminder"] is True
+    assert policy["calendarEventReminder"] is event_reminder
 
 
-def test_quota_policy_defaults_study_reminder_to_locked() -> None:
-    """필드를 모르는 쪽에서 만들어도 기본값은 잠김이다(구버전 호환)."""
-    assert CapabilityQuotaPolicy(
-        dailyAnalysisFree=1, dailyRefreshRewards=1
-    ).calendar_study_reminder is False
+def test_quota_policy_defaults_match_the_free_plan() -> None:
+    """필드를 모르는 쪽에서 만들어도 무료 플랜과 같은 값이 나온다(구버전 호환)."""
+    policy = CapabilityQuotaPolicy(dailyAnalysisFree=1, dailyRefreshRewards=1)
+    assert policy.calendar_study_reminder is True
+    assert policy.calendar_event_reminder is False
 
 
 def test_capabilities_never_promises_push_notifications() -> None:
