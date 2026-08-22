@@ -663,8 +663,11 @@ def _make_practice_form(client: TestClient) -> dict[str, str]:
     }
 
 
-def test_basic_plan_gets_three_daily_sets() -> None:
-    """토큰 모델: 토큰 = 하루 새 문제 세트 수. 베이직은 하루 3세트."""
+def test_basic_plan_gets_three_daily_tokens() -> None:
+    """토큰 모델(P13): 새 세트 1개 = 토큰 1개, AI 분석 1회 = 토큰 1개.
+
+    베이직의 하루 3토큰은 "3세트"가 아니라 "AI 작업 3회"다.
+    """
     refresh_payload = {
         "targetLevel": "IH",
         "background": {"interests": ["news"]},
@@ -677,29 +680,27 @@ def test_basic_plan_gets_three_daily_sets() -> None:
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["freeRemaining"] == 2
 
-        # 세트 내 평가는 무제한(토큰 미소모).
-        for _ in range(3):
-            response = client.post(
-                "/v1/evaluations/practice",
-                headers=_headers(str(uuid.uuid4())),
-                data=form,
-            )
-            assert response.status_code == 200, response.text
+        # AI 분석 1회 = 토큰 1개.
+        response = client.post(
+            "/v1/evaluations/practice",
+            headers=_headers(str(uuid.uuid4())),
+            data=form,
+        )
+        assert response.status_code == 200, response.text
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 2  # 평가는 토큰을 쓰지 않음
+        assert usage["freeRemaining"] == 1  # 세트 1 + 분석 1 = 정상 1사이클 2토큰
 
-        # 리프레시 2회 = 토큰 2개(총 3세트 소진).
-        for index in range(2):
-            refreshed = client.post(
-                "/v1/question-sets/practice/refresh",
-                headers={**_headers(), "Idempotency-Key": f"basic-refresh-{index}"},
-                json=refresh_payload,
-            )
-            assert refreshed.status_code == 200, refreshed.text
+        # 남은 1토큰으로 리프레시 1회.
+        refreshed = client.post(
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "basic-refresh-0"},
+            json=refresh_payload,
+        )
+        assert refreshed.status_code == 200, refreshed.text
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["freeRemaining"] == 0
 
-        # 4번째 세트는 토큰 소진으로 402.
+        # 토큰이 없으면 새 세트도 402.
         blocked = client.post(
             "/v1/question-sets/practice/refresh",
             headers={**_headers(), "Idempotency-Key": "basic-refresh-blocked"},
