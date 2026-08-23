@@ -49,9 +49,9 @@ class FailingMockEvaluationAIService:
         raise AIServiceUnavailable("forced evaluation failure")
 
 
-def _headers(request_id: str | None = None) -> dict[str, str]:
+def _headers(request_id: str | None = None, *, uid: str = USER_ID) -> dict[str, str]:
     value = {
-        "X-DailyOPIc-User-ID": USER_ID,
+        "X-DailyOPIc-User-ID": uid,
         "X-Firebase-AppCheck": "test-app-check-token",
     }
     if request_id:
@@ -59,25 +59,29 @@ def _headers(request_id: str | None = None) -> dict[str, str]:
     return value
 
 
-def _verify_reward(client: TestClient, nonce: str) -> None:
-    client.app.state.ssv_verifier = FakeSSVVerifier(nonce=nonce)
+def _verify_reward(client: TestClient, nonce: str, *, uid: str = USER_ID) -> None:
+    client.app.state.ssv_verifier = FakeSSVVerifier(nonce=nonce, user_id=uid)
     response = client.get(f"/v1/admob/ssv?custom_data={nonce}&fake=1")
     assert response.status_code == 200, response.text
 
 
-def _grant_practice_token(client: TestClient) -> None:
-    """광고 보너스로 데일리 토큰 1개를 확보한다.
+def _grant_practice_token(client: TestClient, *, uid: str = USER_ID) -> None:
+    """광고 보너스로 데일리 토큰 **정확히 1개**를 확보한다.
 
     P13 이후 분석도 토큰을 쓰므로, 세트 생성으로 무료 토큰을 소진한 테스트가
-    분석까지 가려면 보너스가 하나 더 필요하다.
+    분석까지 가려면 보너스가 하나 더 필요하다. 무료 플랜의 광고 보너스 한도가
+    1개라 이 helper 는 플랜을 승격시키지 않고 딱 한 개만 더 준다.
+
+    `uid` 를 넘기면 임의의 사용자에게 줄 수 있다 — E2E 테스트처럼 매번 새 uid 를
+    쓰는 곳에서 재사용하기 위한 것이다.
     """
     reward = client.post(
         "/v1/ad-rewards/intents",
-        headers=_headers(),
+        headers=_headers(uid=uid),
         json={"purpose": "practice_credits"},
     )
     assert reward.status_code == 200, reward.text
-    _verify_reward(client, reward.json()["nonce"])
+    _verify_reward(client, reward.json()["nonce"], uid=uid)
 
 
 def _mock_audio_files() -> list[tuple[str, tuple[str, bytes, str]]]:
