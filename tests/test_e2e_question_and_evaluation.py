@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.models.api import OPIcLevel, RubricAssessment, RubricDimension
 from app.services.ai import RUBRIC_SCORE_BY_BAND, _reconcile_with_rubrics
+from tests.test_api import _grant_practice_token
 
 TARGET_LEVELS = ["IL", "IM1", "IM2", "IM3", "IH", "AL"]
 GRADABLE_RANGE = [
@@ -113,6 +114,10 @@ def test_practice_evaluation_endpoint_returns_a_consistent_grade(
         },
     ).json()
 
+    # 세트 생성이 무료 토큰 1개를 썼다(P13). 이 테스트가 보려는 것은 평가 응답의
+    # 규약이지 쿼터가 아니므로, 분석에 필요한 토큰 1개를 명시적으로 마련한다.
+    _grant_practice_token(client, uid=uid)
+
     response = client.post(
         "/v1/evaluations/practice",
         headers=_headers(uid, idempotency_key=str(uuid.uuid4())),
@@ -161,6 +166,8 @@ def test_empty_transcript_is_marked_insufficient(client: TestClient) -> None:
         headers=_headers(uid),
         json={"targetLevel": "IM2", "background": {"interests": ["movies"]}},
     ).json()
+
+    _grant_practice_token(client, uid=uid)
 
     response = client.post(
         "/v1/evaluations/practice",
