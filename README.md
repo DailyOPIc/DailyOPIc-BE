@@ -280,7 +280,7 @@ Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. �
 
 학습 캘린더 설정은 `GET/PUT /v1/users/me/study-plan`으로 읽고 씁니다. 저장 위치는 `userProfiles/{uid}.studyPlan` 한 곳이며 시험일(선택), 공부 요일(ISO 월=1~일=7, 최소 1개), 학습 강도(`light|steady|focused`), 선호 학습 시각(`HH:MM` 로컬), 타임존 식별자만 담습니다. **목표 등급은 여기에 복제하지 않고 `PUT /v1/users/me/target-level`이 계속 진실입니다.** PUT은 전체 교체(멱등)이고 `schemaVersion`/`createdAt`/`updatedAt`은 서버가 매깁니다. 시험일은 요청에 담긴 타임존 기준으로 과거인지 판단합니다. 설정한 적 없는 기존 사용자에게는 오류가 아니라 `{"configured": false, "studyPlan": null}`을 돌려줍니다.
 
-`GET /v1/capabilities`의 `quotaPolicy`는 캘린더 자동화 권한 4개를 함께 내려줍니다. **캘린더 자체는 전 플랜이 사용하므로 `calendarEnabled`는 항상 `true`이고, 플랜이 나누는 것은 자동화 깊이뿐입니다.**
+`GET /v1/capabilities`의 `quotaPolicy`는 캘린더 관련 권한 6개를 함께 내려줍니다. **캘린더 자체는 전 플랜이 사용하므로 `calendarEnabled`는 항상 `true`이고, 플랜이 나누는 것은 자동화 깊이와 개인 일정 알림 사용 여부뿐입니다.**
 
 | 필드 | 무료 | 베이직 | 플러스 | 프로 |
 |---|---|---|---|---|
@@ -288,18 +288,34 @@ Self Assessment 단계는 `PUT /v1/users/me/target-level`로 저장합니다. �
 | `calendarAutoReplan` | false | true | true | true |
 | `calendarEvaluationAdaptive` | false | false | true | true |
 | `calendarExamBackplan` | false | false | true | true |
+| `calendarStudyReminder` | true | true | true | true |
+| `calendarEventReminder` | false | true | true | true |
 
-기존 필드는 그대로이며 추가만 했으므로 구버전 클라이언트는 영향을 받지 않습니다. 취약점 기반 일정(`calendarWeaknessPlanner`)은 구현이 없으므로 **capability로 노출하지 않습니다.**
+알림 필드 2개는 모두 앱이 **기기에서 로컬 알림을 예약할 수 있는 권한**입니다. 서버는 알림을 보내지 않습니다(FCM·APNs 없음).
+
+- `calendarStudyReminder` — 매일 학습 리마인더. **P9부터 무료를 포함한 전 플랜이 `true`입니다.** 매일 공부하라고 깨워 주는 것까지 유료로 막으면 습관이 붙기 전에 무료 사용자가 떠납니다. P4의 "베이직부터" 정책은 폐기됐습니다.
+- `calendarEventReminder` — 개인 일정 알림. 새 유료 경계입니다. 개인 일정 자체(추가·수정·삭제)는 전 플랜이 쓰고, **알림 옵션만** 무료에서 잠깁니다.
+
+구버전 앱이 새 서버를 만나면 `calendarStudyReminder=true`를 받아 학습 알림이 그대로 열립니다(의도한 동작). 새 앱은 학습 알림을 이 필드로 잠그지 않으므로, 구버전 서버가 무료에 `false`를 내려줘도 잠기지 않습니다.
+
+기존 필드는 그대로이며 추가만 했으므로 구버전 클라이언트는 영향을 받지 않습니다. 새 필드를 모르는 앱은 무시하고, 새 앱이 이 필드가 없는 구버전 서버를 만나면 플랜 기준 폴백을 씁니다. 취약점 기반 일정(`calendarWeaknessPlanner`)은 구현이 없으므로 **capability로 노출하지 않습니다.**
 
 Daily 문제와 Mock 문제 생성은 서로 다르게 동작합니다.
 
 ```text
 POST /v1/question-sets/practice
-  -> 오늘의 무료 Daily 랜덤 풀, Q2~Q15, status=complete
+  -> 오늘의 Daily 랜덤 풀, Q2~Q15, status=complete (데일리 토큰 1개 소모)
 
 POST /v1/question-sets/practice/refresh
   body: {"initialLevel":5, "adjustment":"easier|same|harder", "survey":{...}}
-  -> practice quota 1개 소모 후 새 Daily 랜덤 풀 생성
+  -> 데일리 토큰 1개 소모 후 새 Daily 랜덤 풀 생성
+
+POST /v1/question-sets/review
+  body: {..., "focusDimension":"fluency"}
+  -> 취약점 복습 세트(프로 전용). mode=daily 새 세트이므로 데일리 토큰 1개 소모
+
+POST /v1/evaluations/practice  (= /v2)
+  -> AI 분석 1회. 데일리 토큰 1개 소모
 
 POST /v1/mock-exams
   -> Mock Q1~Q7, status=awaiting_adjustment
@@ -309,21 +325,77 @@ POST /v1/question-sets/{setId}/adjustment
   -> Mock Q8~Q15 append
 ```
 
-Daily는 자기소개 Q1을 포함하지 않습니다. 첫 Daily 풀은 매일 무료이며 같은 날 같은 조건으로 다시 요청하면 archived free pool을 반환합니다. Mock은 Q1을 항상 `Introduce yourself.`로 고정하고, Q7 이후 adjustment를 적용해 15문항으로 완성합니다. 같은 `setId`에 같은 adjustment를 다시 보내면 완성된 세트를 그대로 반환하고, 다른 adjustment를 다시 보내면 `409 adjustment_already_applied`를 반환합니다.
+Daily는 자기소개 Q1을 포함하지 않습니다. 첫 Daily 풀도 데일리 토큰 1개를 쓰며, 같은 날 같은 조건으로 다시 요청하면 이미 만든 풀을 그대로 반환합니다(추가 차감 없음). Mock은 Q1을 항상 `Introduce yourself.`로 고정하고, Q7 이후 adjustment를 적용해 15문항으로 완성합니다. 같은 `setId`에 같은 adjustment를 다시 보내면 완성된 세트를 그대로 반환하고, 다른 adjustment를 다시 보내면 `409 adjustment_already_applied`를 반환합니다.
 
 오디오는 요청 처리 중 임시 파일로만 분석하며 OpenAI로 보내지 않습니다. 요청 처리가 끝나면 임시 오디오는 삭제됩니다.
 
-## 사용량 정책
+## 사용량 정책 — 데일리 토큰
 
-v1에서는 첫 Daily 문제 풀 생성은 매일 무료입니다. Daily에서 새 랜덤 풀을 더 불러오는 refresh와 AI 피드백/평가 호출은 같은 practice quota를 공유합니다. Self Assessment 단계 변경은 새 문제 재생성을 유발하므로 보상형 광고 검증 후 허용합니다. Mock Q7 이후 `easier/same/harder` 난이도 조정은 시험 진행의 일부이므로 별도 보상을 요구하지 않습니다. 날짜 기준은 KST `YYYYMMDD`입니다.
+**사용자가 시작한 AI 작업은 무료가 아닙니다. 사용자 조작 1회 = 데일리 토큰 1개.**
 
-- 기본 무료 피드백: `FREE_PRACTICE_LIMIT=3`
-- 리워드 광고 1회 시 추가 피드백: `REWARD_PRACTICE_CREDITS=1`
+| 사용자 행동 | 비용 |
+|---|---|
+| 새 Daily 문제 세트(첫 생성 · refresh · 복습 세트) | 데일리 토큰 1개 |
+| AI 분석 1회 | 데일리 토큰 1개 |
+| 사용자가 의도적으로 다시 분석 | 데일리 토큰 1개 더 |
+| 이미 받은 결과 다시 보기 · 이미 받은 문항 다시 열기 | 0 |
+| 녹음 · 다시 녹음 · 기기 TTS/STT | 0 |
+| 플래너 · 하루 시트 · 학습 기록 · 시험 가이드 | 0 |
+| 모의고사 | 데일리 토큰과 별개(플랜별 `mock_daily` 횟수) |
+
+폐기된 계약: *"토큰 1개 = 새 Daily 문제 세트 1개, 세트 내 평가는 무제한."* 세트 내
+평가는 더 이상 무료가 아닙니다.
+
+### 서버가 과금 권한을 가진다
+
+- 차감은 서버에서만 일어납니다. 앱의 사전 확인은 UX용이고 신뢰 대상이 아닙니다.
+- 순서는 **인증 → 검증 → 토큰 예약(원자적) → AI 호출**입니다. 토큰이 없으면
+  OpenAI를 호출하지 않고 `402 practice_quota_exhausted`로 끝냅니다.
+- 예약은 `dailyUsage/{uid}:{dateKey}` 문서에 대한 Firestore 트랜잭션
+  (`FirestoreStateStore.reserve_practice`)이라, 마지막 1개를 두고 두 요청이
+  경합하면 정확히 하나만 성공하고 잔액은 절대 음수가 되지 않습니다.
+- 과금 단위는 HTTP 요청 수가 아니라 **사용자 조작 1회**이고, 그 정체성은
+  `Idempotency-Key`입니다. 같은 키 재전송은 캐시된 결과를 돌려주고 추가로
+  차감하지 않습니다. 사용자가 "다시 분석"을 누르면 앱이 새 키를 보냅니다.
+- 쓸 만한 결과를 내지 못한 실패(제공자 오류·예외)는 예약한 토큰을 정확히 한 번
+  되돌립니다(`fail_request`). 이중 환불도, 이중 차감도 없습니다.
+
+### 플랜별 하루 데일리 토큰 (`app/services/plans.py`가 진실)
+
+| | 무료 | 베이직 | 플러스 | 프로 |
+|---|---|---|---|---|
+| `practice_daily` | 1 | 3 | 10 | 20 |
+| `practice_ad_bonus` (리워드 광고) | 1 | 0 | 0 | 0 |
+| 하루 최대 | **2** | 3 | 10 | 20 |
+
+**정상 Daily 1사이클 = 세트 1개 + 분석 1회 = 토큰 2개.** 같은 세트에서 문항을 하나
+더 분석하면 +1개입니다(세트는 14문항이므로 전 문항 분석은 15개).
+
+**무료 플랜의 결과: 무료 사용자는 광고 보너스 1개를 받아야만 하루 1사이클을 끝낼 수
+있습니다.** 광고를 보지 않으면 세트를 받고 분석을 하지 못합니다. 이 문서는 그 사실을
+숨기지 않으며, 무료 한도를 1에서 2로 올리는 것은 별도 결정 사항입니다.
+
 - 하루 최대 리워드 intent 수: `MAX_DAILY_REWARD_COUNT=3`
-- `MAX_DAILY_REWARD_COUNT`는 피드백 credit/모의고사 결과용 리워드 남용 방지 제한입니다.
-- Self Assessment 단계 변경용 리워드는 피드백 credit을 지급하지 않고 변경 권한만 1회 소비하며, 위 practice reward quota로 차단하지 않습니다.
+- 광고 보너스 토큰은 새 세트와 AI 분석 **양쪽 모두**에 쓸 수 있습니다. 분석 전용
+  토큰 같은 별도 화폐는 없습니다.
+- Self Assessment 단계 변경용 리워드는 데일리 토큰을 지급하지 않고 변경 권한만 1회
+  소비하며, practice reward quota로 차단하지 않습니다.
+- `FREE_PRACTICE_LIMIT` / `REWARD_PRACTICE_CREDITS` 환경변수는 테스트 픽스처용
+  잔재이며 플랜 한도는 `plans.py`만 결정합니다.
 
-운영 손익은 AdMob 리워드 광고 1회 실수익이 Practice 분석 1회 평균 AI 비용보다 충분히 높아야 합니다. 서버는 OpenAI 응답 usage를 로그로 남기므로, 출시 후 `inputTokens`, `outputTokens`, `reasoningTokens`를 집계해 실제 비용을 주 단위로 확인합니다.
+날짜 기준은 KST `YYYYMMDD`입니다.
+
+### 데일리 토큰 ≠ OpenAI 토큰
+
+제품 화폐인 **데일리 토큰**은 "사용자가 시작한 AI 작업 1회"를 세는 단위입니다.
+OpenAI가 청구하는 토큰(`inputTokens`/`outputTokens`/`reasoningTokens`)은 모델
+입출력 단위이며 둘은 같은 것이 아닙니다. 사용자에게는 OpenAI 토큰 개념을 노출하지
+않습니다.
+
+운영 손익은 AdMob 리워드 광고 1회 실수익이 Practice 분석 1회 평균 AI 비용보다
+충분히 높아야 합니다. 서버는 OpenAI 응답 usage를 로그로 남기므로, 출시 후
+`inputTokens`, `outputTokens`, `reasoningTokens`를 집계해 실제 비용을 주 단위로
+확인합니다.
 
 ## CI 검증
 

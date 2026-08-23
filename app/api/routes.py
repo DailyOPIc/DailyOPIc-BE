@@ -120,6 +120,8 @@ def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
         calendarAutoReplan=limits.calendar_auto_replan,
         calendarEvaluationAdaptive=limits.calendar_evaluation_adaptive,
         calendarExamBackplan=limits.calendar_exam_backplan,
+        calendarStudyReminder=limits.calendar_study_reminder,
+        calendarEventReminder=limits.calendar_event_reminder,
     )
 
 
@@ -929,6 +931,33 @@ async def create_review_set(
     set_id = hashlib.sha256(
         f"{user.uid}:review:{operation_id}".encode()
     ).hexdigest()
+    # 토큰 모델(P13): 복습 세트도 mode=daily 새 문제 세트다. 새 세트 = 토큰 1개라는
+    # 기존 규칙을 그대로 적용한다(프로 전용 게이트는 접근권이지 사용량 계량이 아니다).
+    limits = plans.limits_for(plan)
+    token_request_id = hashlib.sha256(
+        f"{user.uid}:{operation}:{operation_id}".encode()
+    ).hexdigest()
+    try:
+        await request.app.state.state_store.reserve_practice(
+            user.uid, date_key, token_request_id, limits.practice_daily
+        )
+    except UsageLimitExceeded as error:
+        await request.app.state.state_store.fail_operation(
+            uid=user.uid,
+            operation=operation,
+            operation_id=operation_id,
+            retryable=False,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
+        ) from error
+    except RequestAlreadyProcessing as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "request_processing", "operationId": operation_id},
+            headers={"Retry-After": "2"},
+        ) from error
     try:
         response = await _create_daily_pool(
             request,
@@ -940,6 +969,11 @@ async def create_review_set(
             set_id=set_id,
             focus_dimension=str(payload.focus_dimension),
         )
+        await request.app.state.state_store.finalize_request(
+            token_request_id,
+            {"setId": response.set_id, "setHash": response.set_hash},
+            request.app.state.request_result_ttl_hours,
+        )
         await request.app.state.state_store.complete_operation(
             uid=user.uid,
             operation=operation,
@@ -949,6 +983,7 @@ async def create_review_set(
         )
         return response
     except Exception:
+        await request.app.state.state_store.fail_request(token_request_id)
         await request.app.state.state_store.fail_operation(
             uid=user.uid,
             operation=operation,
@@ -2097,12 +2132,34 @@ async def evaluate_practice(
 
     plan = await _current_plan(request, user.uid)
     limits = plans.limits_for(plan)
-    # 토큰 모델: 토큰은 "새 문제 세트"를 받을 때 소모되고, 세트 내 평가는 무제한이다.
-    # 따라서 평가는 쿼터를 차감하지 않고 요청 멱등성만 확보한다.
+
+    # 오디오 검증은 과금 앞에 둔다. 형식이 틀린 요청은 AI를 부르지 않으므로 토큰을
+    # 예약했다가 되돌릴 이유가 없다(§ "검증 실패 → 차감 없음"을 문자 그대로 지킨다).
     try:
-        reservation = await request.app.state.state_store.reserve_request(
-            user.uid, request_id
+        metrics = await request.app.state.audio_service.analyze(audio, transcript)
+    except AudioValidationError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_audio", "message": str(error)},
+        ) from error
+
+    # 토큰 모델(P13): 사용자가 시작한 Daily AI 작업은 무료가 아니다. AI 분석 1회 = 토큰 1개.
+    # 새 세트 획득과 같은 데일리 토큰 지갑(reserve_practice)을 쓴다 — 별도 지갑을 만들지 않는다.
+    #
+    # 과금 단위는 HTTP 요청이 아니라 "사용자 조작 1회"이고, 그 정체성이 Idempotency-Key다.
+    #   - 같은 조작 재전송 → cached 결과 반환, 추가 차감 없음
+    #   - 서버/제공자 실패 → fail_request가 정확히 한 번 환불
+    #   - 사용자가 "다시 분석"을 의도적으로 누르면 앱이 새 키를 보내고 그때 새로 1개 나간다
+    date_key = _date_key()
+    try:
+        reservation = await request.app.state.state_store.reserve_practice(
+            user.uid, date_key, request_id, limits.practice_daily
         )
+    except UsageLimitExceeded as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
+        ) from error
     except RequestAlreadyProcessing as error:
         raise HTTPException(status_code=409, detail={"code": "request_processing"}) from error
 
@@ -2110,7 +2167,6 @@ async def evaluate_practice(
         return PracticeEvaluation.model_validate(reservation.result)
 
     try:
-        metrics = await request.app.state.audio_service.analyze(audio, transcript)
         result = await request.app.state.ai_service.evaluate_practice(
             question=question,
             transcript=transcript.strip(),
@@ -2123,13 +2179,8 @@ async def evaluate_practice(
             request_id, serialized_result, request.app.state.request_result_ttl_hours
         )
         return result
-    except AudioValidationError as error:
-        await request.app.state.state_store.fail_request(request_id)
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "invalid_audio", "message": str(error)},
-        ) from error
     except AIServiceError as error:
+        # 쓸 만한 결과를 못 준 실패다 → 예약한 토큰을 정확히 한 번 되돌린다.
         await request.app.state.state_store.fail_request(request_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

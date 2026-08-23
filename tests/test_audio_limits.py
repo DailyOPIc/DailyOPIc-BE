@@ -25,7 +25,7 @@ from app.services.audio import (
     AudioValidationError,
 )
 
-from tests.test_api import _headers, _verify_reward
+from tests.test_api import _grant_practice_token, _headers, _verify_reward
 
 
 OLD_MAX_BYTES = 4 * 1024 * 1024
@@ -99,6 +99,8 @@ def _practice_form(client: TestClient) -> dict[str, str]:
         headers=_headers(),
         json={"initialLevel": 4, "background": {"interests": ["news"]}},
     ).json()
+    # P13: 분석도 데일리 토큰을 쓴다. 세트가 무료 토큰을 썼으니 분석용을 하나 더.
+    _grant_practice_token(client)
     return {
         "setId": question_set["setId"],
         "questionNumber": str(question_set["questions"][0]["number"]),
