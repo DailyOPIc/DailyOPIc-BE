@@ -537,6 +537,10 @@ class CapabilityQuotaPolicy(BaseModel):
     calendar_auto_replan: bool = Field(default=False, alias="calendarAutoReplan")
     calendar_evaluation_adaptive: bool = Field(default=False, alias="calendarEvaluationAdaptive")
     calendar_exam_backplan: bool = Field(default=False, alias="calendarExamBackplan")
+    # 로컬 알림 권한 2종(서버 푸시 아님). 학습 알림은 전 플랜이 쓰므로 기본값이 True다(P9).
+    calendar_study_reminder: bool = Field(default=True, alias="calendarStudyReminder")
+    # 개인 일정 알림은 유료 기능이라 무료 기본값(False)으로 두어 구버전과 안전하게 만난다.
+    calendar_event_reminder: bool = Field(default=False, alias="calendarEventReminder")
     # 제거: gradeTrend / weaknessAnalysis / weeklyReport / mockComparison.
     # 앞의 셋은 앱이 로컬 기록으로 계산하는 전 플랜 무료 기능이고, 마지막은
     # 구현이 없는 값이었다. 강제하지 않는 게이트는 내려보내지 않는다.

@@ -47,7 +47,7 @@ class AnalysisDepth(StrEnum):
 @dataclass(frozen=True, slots=True)
 class PlanLimits:
     plan: Plan
-    practice_daily: int  # 하루 데일리 학습(평가) 무료 한도
+    practice_daily: int  # 하루 데일리 토큰(= 사용자가 시작한 AI 작업 1회) 무료 한도
     practice_ad_bonus: int  # 광고로 얻는 추가 데일리(무료 전용)
     refresh_ad_bonus: int  # 광고로 얻는 문제 리프레시 횟수
     mock_daily: int  # 하루 모의고사 횟수
@@ -62,6 +62,11 @@ class PlanLimits:
     calendar_auto_replan: bool  # 놓친/추가 학습을 앞으로의 일정에 반영
     calendar_evaluation_adaptive: bool  # 최근 평가 등급을 권장 학습량에 반영
     calendar_exam_backplan: bool  # 시험일 역산 압축 일정
+    # 학습 알림은 전 플랜이 쓴다(P9). 매일 공부하라고 깨워 주는 것까지 돈을 받으면
+    # 습관이 붙기도 전에 무료 사용자가 떠난다. 유료가 사는 것은 개인 일정 알림이다.
+    # 둘 다 앱의 로컬 알림 예약 권한이고 서버는 푸시를 보내지 않는다(FCM/APNs 없음).
+    calendar_study_reminder: bool  # 매일 학습 리마인더(전 플랜 True)
+    calendar_event_reminder: bool  # 개인 일정 알림(무료 잠김, 베이직부터)
     # 없는 필드: calendar_weakness_planner. 취약점 기반 일정은 G8이고 구현이 없다.
     # 삭제한 필드: grade_trend / weakness_analysis / weekly_report /
     # mock_comparison. 스마트 인사이트 3종은 앱이 로컬 기록으로 계산해 전 플랜
@@ -92,6 +97,8 @@ _DEFAULT_LIMITS = PlanLimits(
     calendar_auto_replan=False,
     calendar_evaluation_adaptive=False,
     calendar_exam_backplan=False,
+    calendar_study_reminder=True,
+    calendar_event_reminder=False,
 )
 
 # 플랜별 변경점만 정의
@@ -107,6 +114,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "analysis_depth": AnalysisDepth.FULL,
         "ads_enabled": False,
         "calendar_auto_replan": True,
+        "calendar_event_reminder": True,
     },
     Plan.PLUS: {
         "practice_daily": 10,
@@ -121,6 +129,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "calendar_auto_replan": True,
         "calendar_evaluation_adaptive": True,
         "calendar_exam_backplan": True,
+        "calendar_event_reminder": True,
     },
     Plan.PRO: {
         "practice_daily": 20,
@@ -137,6 +146,7 @@ _PLAN_OVERRIDES: dict[Plan, dict] = {
         "calendar_auto_replan": True,
         "calendar_evaluation_adaptive": True,
         "calendar_exam_backplan": True,
+        "calendar_event_reminder": True,
     },
 }
 

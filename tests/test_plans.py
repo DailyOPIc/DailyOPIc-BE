@@ -230,11 +230,45 @@ class TestCalendarCapabilities:
         assert limits.calendar_exam_backplan is False
 
     def test_basic_unlocks_only_auto_replan(self) -> None:
-        """베이직이 사는 것은 자동 일정 재조정 하나뿐이다."""
+        """베이직이 사는 자동화는 자동 일정 재조정 하나뿐이다(학습 알림은 별개 기능)."""
         limits = PLAN_LIMITS[Plan.BASIC]
         assert limits.calendar_auto_replan is True
         assert limits.calendar_evaluation_adaptive is False
         assert limits.calendar_exam_backplan is False
+
+    def test_study_reminder_is_open_to_every_plan(self) -> None:
+        """학습 알림은 무료 포함 전 플랜이 쓴다(P9). 옛 유료 게이트는 폐기됐다."""
+        for plan in Plan:
+            assert PLAN_LIMITS[plan].calendar_study_reminder is True, plan
+
+    def test_event_reminder_is_locked_for_free_and_open_from_basic(self) -> None:
+        """개인 일정 알림이 새 유료 경계다. 무료만 잠기고 베이직부터 열린다."""
+        assert PLAN_LIMITS[Plan.FREE].calendar_event_reminder is False
+        assert PLAN_LIMITS[Plan.BASIC].calendar_event_reminder is True
+        assert PLAN_LIMITS[Plan.PLUS].calendar_event_reminder is True
+        assert PLAN_LIMITS[Plan.PRO].calendar_event_reminder is True
+
+    def test_event_reminder_has_no_paid_tier_difference(self) -> None:
+        """유료 사이에는 차이가 없다. 구분은 무료 vs 유료 하나뿐이다."""
+        paid = [PLAN_LIMITS[plan].calendar_event_reminder for plan in (Plan.BASIC, Plan.PLUS, Plan.PRO)]
+        assert paid == [True, True, True]
+
+    def test_notification_capabilities_do_not_change_other_calendar_capabilities(self) -> None:
+        """알림 정책 변경은 순수 가산이다. 기존 캘린더 3종 값이 그대로다."""
+        expected = {
+            Plan.FREE: (True, False, False, False),
+            Plan.BASIC: (True, True, False, False),
+            Plan.PLUS: (True, True, True, True),
+            Plan.PRO: (True, True, True, True),
+        }
+        for plan, values in expected.items():
+            limits = PLAN_LIMITS[plan]
+            assert (
+                limits.calendar_enabled,
+                limits.calendar_auto_replan,
+                limits.calendar_evaluation_adaptive,
+                limits.calendar_exam_backplan,
+            ) == values, plan
 
     def test_plus_unlocks_every_implemented_calendar_capability(self) -> None:
         """플러스는 평가 반영과 시험일 역산까지 모두 켠다."""
@@ -248,7 +282,8 @@ class TestCalendarCapabilities:
         plus = PLAN_LIMITS[Plan.PLUS]
         pro = PLAN_LIMITS[Plan.PRO]
         for field in ("calendar_enabled", "calendar_auto_replan",
-                      "calendar_evaluation_adaptive", "calendar_exam_backplan"):
+                      "calendar_evaluation_adaptive", "calendar_exam_backplan",
+                      "calendar_study_reminder", "calendar_event_reminder"):
             assert getattr(pro, field) == getattr(plus, field)
 
     def test_no_weakness_planner_capability_exists(self) -> None:
@@ -260,7 +295,8 @@ class TestCalendarCapabilities:
         """상위 플랜이 하위 플랜의 캘린더 기능을 잃지 않는다."""
         order = [Plan.FREE, Plan.BASIC, Plan.PLUS, Plan.PRO]
         for field in ("calendar_auto_replan", "calendar_evaluation_adaptive",
-                      "calendar_exam_backplan"):
+                      "calendar_exam_backplan", "calendar_study_reminder",
+                      "calendar_event_reminder"):
             values = [getattr(PLAN_LIMITS[plan], field) for plan in order]
             assert values == sorted(values), field
 

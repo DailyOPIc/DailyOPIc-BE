@@ -297,11 +297,6 @@ class StateStore(ABC):
     ) -> Reservation: ...
 
     @abstractmethod
-    async def reserve_request(self, uid: str, request_id: str) -> Reservation:
-        """쿼터 미차감 요청 멱등 예약(토큰 모델에서 평가는 쿼터를 쓰지 않음)."""
-        ...
-
-    @abstractmethod
     async def reserve_mock(
         self,
         uid: str,
@@ -1120,24 +1115,6 @@ class InMemoryStateStore(StateStore):
                 "createdAt": datetime.now(UTC),
             }
             return Reservation("new", source=source)
-
-    async def reserve_request(self, uid: str, request_id: str) -> Reservation:
-        async with self._lock:
-            existing = self._requests.get(request_id)
-            if existing:
-                if existing["uid"] != uid:
-                    raise UsageLimitExceeded("idempotency key belongs to another user")
-                if existing["status"] == "completed":
-                    return Reservation("cached", result=deepcopy(existing["result"]))
-                if existing["status"] == "processing":
-                    raise RequestAlreadyProcessing("request is already processing")
-            self._requests[request_id] = {
-                "uid": uid,
-                "status": "processing",
-                "source": "none",
-                "createdAt": datetime.now(UTC),
-            }
-            return Reservation("new", source="none")
 
     async def reserve_mock(
         self,
@@ -2086,39 +2063,6 @@ class FirestoreStateStore(StateStore):
 
         async with self._transaction_locks.hold(f"practice:{usage_id}"):
             return await _run_with_firestore_contention_retry(run)
-
-    async def reserve_request(self, uid: str, request_id: str) -> Reservation:
-        def run() -> Reservation:
-            transaction = self._client.transaction(max_attempts=5)
-            request_ref = self._client.collection("aiRequests").document(request_id)
-
-            @firestore.transactional
-            def apply(transaction: firestore.Transaction) -> Reservation:
-                existing = request_ref.get(transaction=transaction)
-                if existing.exists:
-                    data = existing.to_dict() or {}
-                    if data.get("uid") != uid:
-                        raise UsageLimitExceeded(
-                            "idempotency key belongs to another user"
-                        )
-                    if data.get("status") == "completed":
-                        return Reservation("cached", result=data.get("result"))
-                    if data.get("status") == "processing":
-                        raise RequestAlreadyProcessing("request is already processing")
-                transaction.set(
-                    request_ref,
-                    {
-                        "uid": uid,
-                        "status": "processing",
-                        "source": "none",
-                        "createdAt": datetime.now(UTC),
-                    },
-                )
-                return Reservation("new", source="none")
-
-            return apply(transaction)
-
-        return await _run_with_firestore_contention_retry(run)
 
     async def reserve_mock(
         self,

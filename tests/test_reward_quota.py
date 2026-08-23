@@ -21,6 +21,7 @@ from app.models.api import RewardPurpose
 
 from tests.test_api import (
     USER_ID,
+    _grant_practice_token,
     _headers,
     _mock_session_payload,
     _verify_reward,
@@ -135,25 +136,27 @@ def test_practice_evaluation_does_not_consume_reward_quota() -> None:
             headers=_headers(),
             json={"initialLevel": 4, "background": {"interests": ["news"]}},
         ).json()
+        # P13: 분석도 데일리 토큰을 쓴다. 분석용 토큰을 광고로 확보한 뒤 스냅샷을
+        # 찍는다 — 여기서 고정하려는 것은 "분석이 광고 리워드 한도를 먹지 않는다"이다.
+        _grant_practice_token(client)
         before = dict(_usage_counters(client))
         form = {
             "setId": question_set["setId"],
             "questionNumber": str(question_set["questions"][0]["number"]),
             "transcript": "I read the news every morning to stay informed about the world.",
         }
-        for _ in range(3):
-            evaluated = client.post(
-                "/v2/evaluations/practice",
-                headers=_headers(str(uuid.uuid4())),
-                data=form,
-            )
-            assert evaluated.status_code == 200, evaluated.text
+        evaluated = client.post(
+            "/v2/evaluations/practice",
+            headers=_headers(str(uuid.uuid4())),
+            data=form,
+        )
+        assert evaluated.status_code == 200, evaluated.text
         after = _usage_counters(client)
         for key, value in before.items():
             if key.endswith("RewardCount"):
                 assert after[key] == value, key
-        # 세트 안에서 답변을 몇 번 평가하든 광고 보상은 그대로 남아 있다.
-        assert _intent(client, "practice_credits").status_code == 200
+        # 분석은 데일리 토큰만 쓴다. 다른 용도의 광고 한도는 그대로 남아 있다.
+        assert _intent(client, "practice_refresh").status_code == 200
 
 
 def test_evaluation_retry_does_not_consume_reward_quota() -> None:
@@ -168,8 +171,10 @@ def test_evaluation_retry_does_not_consume_reward_quota() -> None:
             "questionNumber": str(question_set["questions"][0]["number"]),
             "transcript": "I read the news every morning to stay informed about the world.",
         }
+        _grant_practice_token(client)  # 분석 1회분 토큰
         key = str(uuid.uuid4())
         first = client.post("/v2/evaluations/practice", headers=_headers(key), data=form)
+        assert first.status_code == 200, first.text
         before = dict(_usage_counters(client))
         # 같은 Idempotency-Key 재시도 = 같은 결과, 추가 소모 없음.
         retried = client.post("/v2/evaluations/practice", headers=_headers(key), data=form)
