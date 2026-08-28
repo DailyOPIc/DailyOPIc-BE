@@ -668,3 +668,127 @@ class RevenueCatWebhook(BaseModel):
 
     event: RevenueCatEvent
     api_version: str | None = None
+
+
+# --- 단어장 AI 생성(P14.2) ----------------------------------------------------
+# 원시값은 iOS `Models/Vocabulary.swift`의 enum과 **글자 그대로** 같다. 두 곳이
+# 어긋나면 앱이 서버 응답을 디코딩하지 못하므로 값을 바꿀 때는 함께 바꾼다.
+
+
+class VocabularyItemType(StrEnum):
+    WORD = "word"
+    PHRASE = "phrase"
+    PATTERN = "pattern"
+
+
+class VocabularyTopic(StrEnum):
+    HOME_NEIGHBORHOOD = "home_neighborhood"
+    SCHOOL = "school"
+    WORK = "work"
+    CAFES = "cafes"
+    FOOD = "food"
+    MOVIES = "movies"
+    MUSIC = "music"
+    EXERCISE = "exercise"
+    PARK = "park"
+    SHOPPING = "shopping"
+    TRAVEL = "travel"
+    TRANSPORTATION = "transportation"
+    WEATHER = "weather"
+    VACATION = "vacation"
+    FAMILY_FRIENDS = "family_friends"
+    DAILY_LIFE = "daily_life"
+
+    @property
+    def label(self) -> str:
+        return _VOCABULARY_TOPIC_LABELS[self]
+
+
+_VOCABULARY_TOPIC_LABELS: dict[str, str] = {
+    "home_neighborhood": "집과 동네",
+    "school": "학교",
+    "work": "직장",
+    "cafes": "카페",
+    "food": "음식점과 음식",
+    "movies": "영화",
+    "music": "음악",
+    "exercise": "운동",
+    "park": "공원",
+    "shopping": "쇼핑",
+    "travel": "여행",
+    "transportation": "교통",
+    "weather": "날씨",
+    "vacation": "휴가",
+    "family_friends": "친구와 가족",
+    "daily_life": "일상",
+}
+
+
+class VocabularyUsageRole(StrEnum):
+    DESCRIPTION = "description"
+    ROUTINE = "routine"
+    FREQUENCY = "frequency"
+    PREFERENCE = "preference"
+    REASON = "reason"
+    EMOTION = "emotion"
+    PAST_EXPERIENCE = "pastExperience"
+    COMPARISON = "comparison"
+    CHANGE = "change"
+    PROBLEM_SOLUTION = "problemSolution"
+    TRANSITION = "transition"
+
+
+class VocabularyEntry(BaseModel):
+    """앱의 단어장 항목 계약(iOS `VocabularyEntry`와 동일 필드).
+
+    발음기호(IPA)·AI 신뢰도 점수·가짜 OPIc 점수는 담지 않는다.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    term: str
+    type: VocabularyItemType
+    meaning_ko: str = Field(alias="meaningKo")
+    example_en: str = Field(alias="exampleEn")
+    example_ko: str = Field(alias="exampleKo")
+    collocations: list[str] = Field(default_factory=list)
+    topics: list[VocabularyTopic]
+    usage_roles: list[VocabularyUsageRole] = Field(alias="usageRoles")
+    recommended_levels: list[OPIcLevel] = Field(alias="recommendedLevels")
+    source: str
+
+
+class VocabularyGenerationRequest(BaseModel):
+    """AI 맞춤 단어장 1회 생성 요청.
+
+    개수(30) · 구성(10/10/10) · 모델 · 토큰 비용(1)은 **서버가 소유한다**.
+    클라이언트가 정할 수 있는 것은 주제 · 목표 등급 · 제외 후보뿐이다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic: VocabularyTopic
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    # 중복 방지용 힌트. 시드 카탈로그 전체를 프롬프트에 넣지 않기 위해 개수와
+    # 길이를 모두 서버가 제한한다.
+    exclude_terms: list[str] = Field(
+        default_factory=list, alias="excludeTerms", max_length=200
+    )
+
+    @field_validator("exclude_terms")
+    @classmethod
+    def clean_exclude_terms(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        return [item for item in cleaned if 0 < len(item) <= 60]
+
+
+class VocabularyGeneratedSet(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    set_id: str = Field(alias="setId")
+    topic: VocabularyTopic
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    created_at: datetime = Field(alias="createdAt")
+    entries: list[VocabularyEntry]
+    source: str = "ai"

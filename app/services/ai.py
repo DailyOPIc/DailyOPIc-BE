@@ -35,9 +35,12 @@ from app.models.api import (
     RubricAssessment,
     RubricBand,
     RubricDimension,
+    VocabularyItemType,
+    VocabularyTopic,
 )
 from app.services import answer_quality
 from app.services import telemetry
+from app.services import vocabulary
 from app.services.plans import AnalysisDepth
 from app.services.questions import (
     FallbackQuestionGenerator,
@@ -209,6 +212,13 @@ class AIQuestionGenerationError(AIServiceError):
     pass
 
 
+class AIVocabularyGenerationError(AIServiceError):
+    """보충 시도까지 하고도 30개(10/10/10)를 채우지 못한 경우.
+
+    쓸 만한 결과가 없다는 뜻이므로 라우트는 예약한 토큰을 정확히 한 번 환불한다.
+    """
+
+
 class GeneratedQuestionsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[GeneratedQuestion]
@@ -256,6 +266,16 @@ class QuestionGenerationResult:
     retry_count: int = 0
     prompt_version: str = PROMPT_VERSION
     schema_version: str = QUESTION_SCHEMA_VERSION
+
+
+@dataclass(slots=True)
+class VocabularyGenerationResult:
+    """단어장 1세트. attempts는 내부 제공자 호출 횟수이지 과금 횟수가 아니다."""
+
+    drafts: list[vocabulary.VocabularyDraft]
+    provider: str
+    attempts: int
+    usage: AIUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,6 +723,88 @@ class AIService:
             retry_count=result.retry_count,
             prompt_version=result.prompt_version,
             schema_version=result.schema_version,
+        )
+
+    async def generate_vocabulary(
+        self,
+        *,
+        topic: VocabularyTopic,
+        target_level: OPIcLevel,
+        exclude_terms: list[str],
+    ) -> VocabularyGenerationResult:
+        """AI 맞춤 단어장 한 세트(단어 10 / 표현 10 / 패턴 10 = 30개).
+
+        여유분을 한 번에 더 받아 중복을 걸러내고, 그래도 모자라면 **딱 한 번** 더
+        보충한다. 이 내부 호출은 과금 단위가 아니다 — 사용자 조작 1회는 라우트가
+        잡은 데일리 토큰 1개뿐이고, 여기서 몇 번을 부르든 그 값은 변하지 않는다.
+
+        상한 안에서 30개를 채우지 못하면 쓸 만한 결과가 없는 것이므로 예외를
+        던진다(라우트가 환불한다). 부분 결과를 저장하지 않는다.
+        """
+        selection = vocabulary.VocabularySelection.create(exclude_terms)
+        attempts = 0
+        usage: AIUsage | None = None
+        for _ in range(vocabulary.MAX_PROVIDER_ATTEMPTS):
+            needed = selection.needed()
+            if not needed:
+                break
+            attempts += 1
+            if self._mock:
+                drafts = vocabulary.mock_drafts(topic=topic, needed=needed)
+            else:
+                result = await self._structured(
+                    instructions=vocabulary.instructions(target_level),
+                    input_text=vocabulary.input_text(
+                        topic=topic,
+                        target_level=target_level,
+                        needed=needed,
+                        # 이미 고른 표현이 가장 중요한 제외 대상이다 — 앞에 둔다.
+                        exclude_terms=selection.picked_terms() + exclude_terms,
+                    ),
+                    schema=vocabulary.VocabularyDraftPayload,
+                )
+                usage = result.usage
+                payload = result.payload
+                assert isinstance(payload, vocabulary.VocabularyDraftPayload)
+                drafts = payload.entries
+            selection.add(drafts)
+
+        if not selection.is_complete:
+            missing = {
+                item.value: count for item, count in selection.needed().items()
+            }
+            logger.warning(
+                "vocabulary generation incomplete. topic=%s targetLevel=%s "
+                "attempts=%s missing=%s",
+                topic.value,
+                target_level.value,
+                attempts,
+                missing,
+            )
+            raise AIVocabularyGenerationError(
+                f"vocabulary set is incomplete after {attempts} attempts: {missing}"
+            )
+
+        drafts = selection.drafts()
+        by_type = {
+            item.value: sum(1 for draft in drafts if draft.type is item)
+            for item in VocabularyItemType
+        }
+        logger.info(
+            "vocabulary generation succeeded. topic=%s targetLevel=%s provider=%s "
+            "model=%s attempts=%s composition=%s",
+            topic.value,
+            target_level.value,
+            "catalog" if self._mock else "openai",
+            self.model,
+            attempts,
+            by_type,
+        )
+        return VocabularyGenerationResult(
+            drafts=drafts,
+            provider="catalog" if self._mock else "openai",
+            attempts=attempts,
+            usage=usage,
         )
 
     def _question_generation_payload(

@@ -7,6 +7,7 @@ import logging
 import re
 import secrets
 import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo
@@ -39,6 +40,7 @@ from app.models.api import (
     MockSessionResponse,
     MockSessionRewardRequest,
     MockSessionStage,
+    OPIcLevel,
     OperationResponse,
     PracticeEvaluation,
     PracticeRefreshRequest,
@@ -56,12 +58,19 @@ from app.models.api import (
     TargetLevelRequest,
     TargetLevelResponse,
     UsageResponse,
+    VocabularyEntry,
+    VocabularyGeneratedSet,
+    VocabularyGenerationRequest,
+    VocabularyItemType,
+    VocabularyTopic,
 )
 from app.services.admob import SSVVerificationError
 from app.services.ai import (
     AIQuestionGenerationError,
+    AIVocabularyGenerationError,
     AIServiceError,
     QuestionGenerationResult,
+    VocabularyGenerationResult,
 )
 from app.services.audio import AudioValidationError
 from app.services.auth import CurrentUser, current_user
@@ -72,7 +81,7 @@ from app.services.difficulty import (
     initial_level_from_target,
 )
 from app.services.questions import prompt_hash, question_set_hash
-from app.services import plans
+from app.services import plans, vocabulary
 from app.services.plans import Plan
 from app.services.revenuecat import RevenueCatAPIError
 from app.services.state import (
@@ -1069,6 +1078,135 @@ async def refresh_practice_set(
             operation_id=operation_id,
             retryable=True,
         )
+        raise
+
+
+def _vocabulary_set_response(
+    *,
+    set_id: str,
+    topic: VocabularyTopic,
+    target_level: OPIcLevel,
+    generation: VocabularyGenerationResult,
+) -> VocabularyGeneratedSet:
+    """초안에 서버가 소유하는 값(id · 주제 · 권장 등급 · 출처)을 붙여 완성한다.
+
+    항목 id는 `ai-` 접두사를 붙여 번들 시드 id와 절대 겹치지 않게 한다.
+    구성(30개 = 10/10/10)은 여기서 마지막으로 한 번 더 확인한다 — 형식이 깨진
+    제공자 출력을 저장하느니 실패로 처리한다.
+    """
+    entries = [
+        VocabularyEntry(
+            id=f"ai-{set_id}-{index:02d}",
+            term=draft.term.strip(),
+            type=draft.type,
+            meaningKo=draft.meaning_ko.strip(),
+            exampleEn=draft.example_en.strip(),
+            exampleKo=draft.example_ko.strip(),
+            collocations=[item.strip() for item in draft.collocations if item.strip()],
+            topics=[topic],
+            usageRoles=draft.usage_roles,
+            recommendedLevels=[target_level],
+            source="ai",
+        )
+        for index, draft in enumerate(generation.drafts)
+    ]
+    counts = Counter(entry.type for entry in entries)
+    unique_terms = {entry.term.strip().lower() for entry in entries}
+    if (
+        len(entries) != vocabulary.SET_SIZE
+        or len(unique_terms) != vocabulary.SET_SIZE
+        or any(counts[item] != vocabulary.PER_TYPE for item in VocabularyItemType)
+    ):
+        raise AIVocabularyGenerationError(
+            f"generated set failed composition validation: {dict(counts)}"
+        )
+    return VocabularyGeneratedSet(
+        setId=set_id,
+        topic=topic,
+        targetLevel=target_level,
+        createdAt=datetime.now(UTC),
+        entries=entries,
+        source="ai",
+    )
+
+
+@router.post("/v1/vocabulary/generate", response_model=VocabularyGeneratedSet)
+async def generate_vocabulary_set(
+    payload: VocabularyGenerationRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> VocabularyGeneratedSet:
+    """AI 맞춤 단어장 1세트(30개 = 단어 10 / 표현 10 / 패턴 10).
+
+    토큰 모델(P13 그대로): 사용자 조작 1회 = 데일리 토큰 1개. 새 지갑도, 단어장
+    전용 화폐도 만들지 않는다 — 세트 생성 · AI 분석과 같은 `reserve_practice`다.
+
+    과금 단위는 HTTP 요청이 아니라 Idempotency-Key가 가리키는 "조작 1회"다.
+      - 같은 키 재전송(앱 재시도 · 응답 유실) → 저장된 결과를 그대로 돌려주고 추가 차감 없음
+      - 제공자 실패로 쓸 만한 결과가 없음 → fail_request가 정확히 한 번 환불
+      - 사용자가 새 세트를 또 만들면 앱이 새 키를 보내고 그때 새로 1개 나간다
+    개수 · 구성 · 모델 · 내부 보충 횟수는 서버가 정한다(요청으로 못 바꾼다).
+    """
+    request_id = _request_id(idempotency_key)
+    token_request_id = hashlib.sha256(
+        f"{user.uid}:vocabulary_generation:{request_id}".encode()
+    ).hexdigest()
+    plan = await _current_plan(request, user.uid)
+    limits = plans.limits_for(plan)
+    date_key = _date_key()
+    # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
+    try:
+        reservation = await request.app.state.state_store.reserve_practice(
+            user.uid, date_key, token_request_id, limits.practice_daily
+        )
+    except UsageLimitExceeded as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
+        ) from error
+    except RequestAlreadyProcessing as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "request_processing", "retryable": True},
+            headers={"Retry-After": "2"},
+        ) from error
+
+    if reservation.status == "cached" and reservation.result:
+        # 같은 조작의 재생. 제공자를 다시 부르지도, 토큰을 다시 받지도 않는다.
+        return VocabularyGeneratedSet.model_validate(reservation.result)
+
+    try:
+        generation = await request.app.state.ai_service.generate_vocabulary(
+            topic=payload.topic,
+            target_level=payload.target_level,
+            exclude_terms=payload.exclude_terms,
+        )
+        response = _vocabulary_set_response(
+            set_id=hashlib.sha256(
+                f"vocabulary-set:{user.uid}:{request_id}".encode()
+            ).hexdigest()[:24],
+            topic=payload.topic,
+            target_level=payload.target_level,
+            generation=generation,
+        )
+        await request.app.state.state_store.finalize_request(
+            token_request_id,
+            response.model_dump(by_alias=True, mode="json"),
+            request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except AIServiceError as error:
+        await request.app.state.state_store.fail_request(token_request_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_unavailable",
+                "message": "AI 단어 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            },
+        ) from error
+    except Exception:
+        await request.app.state.state_store.fail_request(token_request_id)
         raise
 
 
