@@ -792,3 +792,82 @@ class VocabularyGeneratedSet(BaseModel):
     created_at: datetime = Field(alias="createdAt")
     entries: list[VocabularyEntry]
     source: str = "ai"
+
+
+# --- 단어장 AI 말하기 코치(P14.3) ----------------------------------------------
+# 단어를 배우고 그 표현으로 직접 말한 뒤, **사용자가 명시적으로 요청할 때만**
+# 데일리 토큰 1개로 코칭을 받는다. 녹음 · 전사 · 저장된 결과 재열람은 0개다.
+#
+# 여기 없는 것: 예상 OPIc 등급 · 숫자 점수 · 5개 영역 루브릭 · 합불 · 발음 점수.
+# 그건 데일리 분석(`PracticeEvaluation`)의 몫이고 코치가 흉내 내면 두 제품이 서로
+# 다른 등급을 말하게 된다.
+
+# 요청 상한. 짧은 표현 연습이므로 수천 단어짜리 전사를 받지 않는다 —
+# 넘치는 입력을 조용히 잘라 과금하는 대신 제공자 호출 **전에** 거절한다.
+VOCABULARY_TERM_MAX_CHARS = 80
+VOCABULARY_TRANSCRIPT_MAX_CHARS = 600
+VOCABULARY_ENTRY_ID_MAX_CHARS = 120
+
+
+class VocabularyUsageAssessment(StrEnum):
+    """대상 표현을 실제로 어떻게 썼는가. 점수가 아니라 세 갈래 판정이다.
+
+    문자열이 전사에 들어 있다는 이유만으로 `appropriate`가 되지 않는다 —
+    맥락이 어긋나면 `needs_polish`다(프롬프트가 그렇게 지시한다).
+    """
+
+    APPROPRIATE = "appropriate"
+    NEEDS_POLISH = "needsPolish"
+    NOT_USED = "notUsed"
+
+
+class VocabularySpeakingCoachRequest(BaseModel):
+    """코칭 1회 요청.
+
+    모델 · 시스템 프롬프트 · 출력 스키마 · 토큰 비용(1)은 **서버가 소유한다.**
+    앱이 보내는 것은 무엇을 연습했는지와 무엇을 말했는지뿐이다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_id: str = Field(
+        alias="entryId", min_length=1, max_length=VOCABULARY_ENTRY_ID_MAX_CHARS
+    )
+    term: str = Field(min_length=1, max_length=VOCABULARY_TERM_MAX_CHARS)
+    type: VocabularyItemType
+    transcript: str = Field(min_length=1, max_length=VOCABULARY_TRANSCRIPT_MAX_CHARS)
+    # 있으면 코칭 품질이 올라가는 값들. 시드 · AI 생성 항목 모두 갖고 있지만
+    # 필수로 만들지 않는다 — 구버전 앱이 보내지 않아도 코칭은 성립한다.
+    meaning_ko: str | None = Field(default=None, alias="meaningKo", max_length=120)
+    topic: VocabularyTopic | None = None
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
+
+    @field_validator("entry_id", "term", "transcript")
+    @classmethod
+    def require_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class VocabularySpeakingCoachResult(BaseModel):
+    """코칭 1회 결과(iOS `VocabularySpeakingCoachResult`와 동일 필드).
+
+    앱은 이 결과를 기기에 저장해 두고 다시 열 때 **무료로** 보여준다.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    result_id: str = Field(alias="resultId")
+    entry_id: str = Field(alias="entryId")
+    target_term: str = Field(alias="targetTerm")
+    transcript: str
+    usage_assessment: VocabularyUsageAssessment = Field(alias="usageAssessment")
+    usage_feedback_ko: str = Field(alias="usageFeedbackKo")
+    natural_correction_en: str = Field(alias="naturalCorrectionEn")
+    natural_correction_ko: str = Field(alias="naturalCorrectionKo")
+    expanded_answer_en: str = Field(alias="expandedAnswerEn")
+    expanded_answer_ko: str = Field(alias="expandedAnswerKo")
+    related_expressions: list[str] = Field(alias="relatedExpressions")
+    created_at: datetime = Field(alias="createdAt")

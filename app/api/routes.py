@@ -62,11 +62,14 @@ from app.models.api import (
     VocabularyGeneratedSet,
     VocabularyGenerationRequest,
     VocabularyItemType,
+    VocabularySpeakingCoachRequest,
+    VocabularySpeakingCoachResult,
     VocabularyTopic,
 )
 from app.services.admob import SSVVerificationError
 from app.services.ai import (
     AIQuestionGenerationError,
+    AIVocabularyCoachError,
     AIVocabularyGenerationError,
     AIServiceError,
     QuestionGenerationResult,
@@ -1203,6 +1206,102 @@ async def generate_vocabulary_set(
             detail={
                 "code": "ai_unavailable",
                 "message": "AI 단어 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+            },
+        ) from error
+    except Exception:
+        await request.app.state.state_store.fail_request(token_request_id)
+        raise
+
+
+@router.post("/v1/vocabulary/coach", response_model=VocabularySpeakingCoachResult)
+async def coach_vocabulary_speaking(
+    payload: VocabularySpeakingCoachRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> VocabularySpeakingCoachResult:
+    """단어장 AI 말하기 코치 1회(P14.3).
+
+    무료: 단어 학습 · 녹음 · 다시 녹음 · 기기 전사(STT) · 이미 받은 코칭 다시 보기.
+    과금: **새 코칭 분석 1회 = 데일리 토큰 1개.** 새 지갑도, 단어장 전용 화폐도,
+    두 번째 쿼터 체계도 만들지 않는다 — 세트 생성 · 데일리 분석과 같은
+    `reserve_practice`다.
+
+    과금 단위는 HTTP 요청이 아니라 Idempotency-Key가 가리키는 "조작 1회"다.
+      - 같은 키 재전송(응답 유실 · 앱 재시도) → 저장된 결과를 그대로 돌려주고 추가 차감 없음
+      - 잔액 0 → 제공자를 부르기 **전에** 402
+      - 쓸 만한 결과가 없음 → fail_request가 정확히 한 번 환불
+      - 사용자가 "다시 분석"을 누르면 앱이 새 키를 보내고 그때 새로 1개 나간다
+    모델 · 프롬프트 · 출력 스키마 · 내부 재시도 상한 · 비용(1)은 서버가 정한다.
+    """
+    request_id = _request_id(idempotency_key)
+    token_request_id = hashlib.sha256(
+        f"{user.uid}:vocabulary_coach:{request_id}".encode()
+    ).hexdigest()
+    plan = await _current_plan(request, user.uid)
+    limits = plans.limits_for(plan)
+    date_key = _date_key()
+    # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
+    try:
+        reservation = await request.app.state.state_store.reserve_practice(
+            user.uid, date_key, token_request_id, limits.practice_daily
+        )
+    except UsageLimitExceeded as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={"code": "practice_quota_exhausted", "message": str(error)},
+        ) from error
+    except RequestAlreadyProcessing as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "request_processing", "retryable": True},
+            headers={"Retry-After": "2"},
+        ) from error
+
+    if reservation.status == "cached" and reservation.result:
+        # 같은 조작의 재생. 제공자를 다시 부르지도, 토큰을 다시 받지도 않는다.
+        return VocabularySpeakingCoachResult.model_validate(reservation.result)
+
+    try:
+        coaching = await request.app.state.ai_service.coach_vocabulary(
+            term=payload.term,
+            item_type=payload.type,
+            meaning_ko=payload.meaning_ko,
+            topic=payload.topic,
+            # 목표 등급을 안 보내는 클라이언트(구버전)도 코칭은 성립해야 한다.
+            target_level=payload.target_level or OPIcLevel.IM2,
+            transcript=payload.transcript,
+        )
+        draft = coaching.draft
+        response = VocabularySpeakingCoachResult(
+            resultId=hashlib.sha256(
+                f"vocabulary-coach:{user.uid}:{request_id}".encode()
+            ).hexdigest()[:24],
+            entryId=payload.entry_id,
+            targetTerm=payload.term,
+            transcript=payload.transcript,
+            usageAssessment=draft.usage_assessment,
+            usageFeedbackKo=draft.usage_feedback_ko,
+            naturalCorrectionEn=draft.natural_correction_en,
+            naturalCorrectionKo=draft.natural_correction_ko,
+            expandedAnswerEn=draft.expanded_answer_en,
+            expandedAnswerKo=draft.expanded_answer_ko,
+            relatedExpressions=draft.related_expressions,
+            createdAt=datetime.now(UTC),
+        )
+        await request.app.state.state_store.finalize_request(
+            token_request_id,
+            response.model_dump(by_alias=True, mode="json"),
+            request.app.state.request_result_ttl_hours,
+        )
+        return response
+    except AIServiceError as error:
+        await request.app.state.state_store.fail_request(token_request_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "ai_unavailable",
+                "message": "AI 코칭에 실패했습니다. 잠시 후 다시 시도해 주세요.",
             },
         ) from error
     except Exception:

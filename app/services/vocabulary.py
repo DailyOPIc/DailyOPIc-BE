@@ -13,12 +13,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.api import (
     OPIcLevel,
     VocabularyItemType,
     VocabularyTopic,
+    VocabularyUsageAssessment,
     VocabularyUsageRole,
 )
 
@@ -256,3 +257,167 @@ def mock_drafts(
                 )
             )
     return drafts
+
+
+# --- AI 말하기 코치(P14.3) ----------------------------------------------------
+# 단어를 배운 뒤 그 표현으로 직접 말한 답변을 코칭한다. 녹음 · 전사 · 저장된 결과
+# 재열람은 공짜고, **새 코칭 분석 1회 = 데일리 토큰 1개**다(라우트가 잡는다).
+#
+# 데일리 분석과 달리 등급 · 점수 · 루브릭을 내지 않는다. 이 엔드포인트가 답하는
+# 질문은 하나다: "내가 이 표현을 실제 OPIc 답변에서 제대로 쓴 걸까?"
+
+# 제공자 호출 상한(최초 1회 + 형식 불량 재시도 1회). 내부 재시도가 몇 번이든
+# 사용자 조작 1회는 여전히 토큰 1개다.
+COACH_MAX_PROVIDER_ATTEMPTS = 2
+# 함께 써볼 표현 개수. 여기서 30개짜리 단어장을 또 만들지 않는다.
+COACH_MIN_RELATED = 2
+COACH_MAX_RELATED = 4
+
+
+class VocabularyCoachDraft(BaseModel):
+    """제공자가 채우는 코칭 결과. id · 대상 표현 · 전사 · 시각은 서버가 붙인다.
+
+    빈칸·공백만 있는 값을 통과시키지 않는다 — 형식이 깨진 출력을 사용자에게
+    보여주느니 실패로 처리하고(라우트가) 환불한다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    usage_assessment: VocabularyUsageAssessment = Field(alias="usageAssessment")
+    usage_feedback_ko: str = Field(alias="usageFeedbackKo", min_length=2, max_length=200)
+    natural_correction_en: str = Field(
+        alias="naturalCorrectionEn", min_length=4, max_length=300
+    )
+    natural_correction_ko: str = Field(
+        alias="naturalCorrectionKo", min_length=1, max_length=300
+    )
+    expanded_answer_en: str = Field(alias="expandedAnswerEn", min_length=8, max_length=500)
+    expanded_answer_ko: str = Field(alias="expandedAnswerKo", min_length=1, max_length=500)
+    related_expressions: list[str] = Field(
+        alias="relatedExpressions",
+        min_length=COACH_MIN_RELATED,
+        max_length=COACH_MAX_RELATED,
+    )
+
+    @field_validator(
+        "usage_feedback_ko",
+        "natural_correction_en",
+        "natural_correction_ko",
+        "expanded_answer_en",
+        "expanded_answer_ko",
+    )
+    @classmethod
+    def require_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+    @field_validator("related_expressions")
+    @classmethod
+    def clean_related(cls, value: list[str]) -> list[str]:
+        """공백·중복을 걷어낸 뒤에도 2개 이상 남아야 한다. 한 항목의 길이도 제한한다."""
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            text = _WHITESPACE.sub(" ", item).strip()
+            key = text.lower()
+            if not text or len(text) > 60 or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+        if len(cleaned) < COACH_MIN_RELATED:
+            raise ValueError(
+                f"needs at least {COACH_MIN_RELATED} usable related expressions"
+            )
+        return cleaned[:COACH_MAX_RELATED]
+
+
+def coach_instructions(target_level: OPIcLevel) -> str:
+    return (
+        "You are an OPIc speaking coach for Korean learners. The learner just "
+        "practised ONE target expression out loud and you are given the transcript "
+        "of what they actually said. Coach that one expression — nothing else.\n"
+        f"Aim the suggested English at around the {target_level.value} level: "
+        "natural everyday spoken English, not literary or academic writing.\n"
+        "Judge usageAssessment by MEANING AND CONTEXT, not string matching:\n"
+        "- appropriate: the target expression is used, and it fits the context.\n"
+        "- needsPolish: the target expression appears but the wording, position or "
+        "context is awkward or unnatural.\n"
+        "- notUsed: the learner did not actually use the target expression.\n"
+        "Never say the expression was used well just because the characters appear "
+        "in the transcript. If the learner copied an example sentence into a context "
+        "where it does not fit, that is needsPolish, not appropriate.\n"
+        "usageFeedbackKo: one or two short Korean sentences about how the learner "
+        "used the target expression. Encouraging and concrete. No grammar lectures, "
+        "no linguistic terminology, no scores, no OPIc grade, no pass/fail.\n"
+        "naturalCorrectionEn: the learner's own idea rewritten as one or two natural "
+        "spoken sentences that use the target expression well. Keep their content — "
+        "do not invent a different story. If the expression was not used, show a "
+        "natural way to say their idea WITH it. naturalCorrectionKo is its Korean "
+        "translation.\n"
+        "expandedAnswerEn: how they could keep going in an OPIc answer — the "
+        "corrected sentence plus one more natural sentence (a reason, a detail or a "
+        "feeling). expandedAnswerKo is its Korean translation.\n"
+        f"relatedExpressions: {COACH_MIN_RELATED}-{COACH_MAX_RELATED} short English "
+        "chunks that go naturally with this topic and expression (e.g. get crowded, "
+        "especially on weekends, cozy atmosphere). Short chunks only, not full "
+        "sentences and not a vocabulary list.\n"
+        "Do not return a grade, a score, a rubric, a pronunciation or fluency "
+        "judgement, or any comment about the learner's personality."
+    )
+
+
+def coach_input_text(
+    *,
+    term: str,
+    item_type: VocabularyItemType,
+    meaning_ko: str | None,
+    topic: VocabularyTopic | None,
+    transcript: str,
+) -> str:
+    lines = [
+        f"Target expression ({item_type.value}): {term}",
+    ]
+    if meaning_ko:
+        lines.append(f"Korean meaning of the target expression: {meaning_ko}")
+    if topic is not None:
+        lines.append(f"Topic being practised: {topic.value} ({topic.label})")
+    lines.append(f"What the learner said: {transcript}")
+    return "\n".join(lines)
+
+
+def mock_coach_draft(
+    *,
+    term: str,
+    item_type: VocabularyItemType,
+    transcript: str,
+) -> VocabularyCoachDraft:
+    """MOCK_AI 전용 결정적 결과. 운영에서는 쓰이지 않는다(MOCK_AI=false 강제).
+
+    표현이 전사에 들어 있는지만 본다 — 맥락 판단은 실제 모델의 몫이고, 여기서
+    중요한 것은 "형식이 항상 유효하다"이다.
+    """
+    used = normalize_term(term) in normalize_term(transcript)
+    assessment = (
+        VocabularyUsageAssessment.APPROPRIATE if used else VocabularyUsageAssessment.NOT_USED
+    )
+    feedback = (
+        f"{term}을(를) 문맥에 맞게 잘 사용했어요."
+        if used
+        else f"이번 답변에는 {term}이(가) 쓰이지 않았어요. 아래 문장처럼 넣어 보세요."
+    )
+    return VocabularyCoachDraft(
+        usageAssessment=assessment,
+        usageFeedbackKo=feedback,
+        naturalCorrectionEn=f"My favorite place really {term} on weekends.",
+        naturalCorrectionKo=f"주말에는 그곳이 정말 {term} 해요.",
+        expandedAnswerEn=(
+            f"My favorite place really {term} on weekends, "
+            "but I still go there because it has a cozy atmosphere."
+        ),
+        expandedAnswerKo=(
+            f"주말에는 그곳이 정말 {term} 하지만, 분위기가 아늑해서 그래도 자주 가요."
+        ),
+        relatedExpressions=["especially on weekends", "cozy atmosphere", "hang out with"],
+    )

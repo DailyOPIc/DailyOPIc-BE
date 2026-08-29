@@ -219,6 +219,14 @@ class AIVocabularyGenerationError(AIServiceError):
     """
 
 
+class AIVocabularyCoachError(AIServiceError):
+    """말하기 코치(P14.3)가 상한 안에서 쓸 만한 결과를 만들지 못한 경우.
+
+    형식이 깨진 코칭을 사용자에게 보여주지 않는다 — 실패로 처리하고 라우트가
+    예약한 토큰을 정확히 한 번 환불한다.
+    """
+
+
 class GeneratedQuestionsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     questions: list[GeneratedQuestion]
@@ -273,6 +281,16 @@ class VocabularyGenerationResult:
     """단어장 1세트. attempts는 내부 제공자 호출 횟수이지 과금 횟수가 아니다."""
 
     drafts: list[vocabulary.VocabularyDraft]
+    provider: str
+    attempts: int
+    usage: AIUsage | None = None
+
+
+@dataclass(slots=True)
+class VocabularyCoachResult:
+    """말하기 코칭 1건. attempts는 내부 제공자 호출 횟수이지 과금 횟수가 아니다."""
+
+    draft: vocabulary.VocabularyCoachDraft
     provider: str
     attempts: int
     usage: AIUsage | None = None
@@ -805,6 +823,83 @@ class AIService:
             provider="catalog" if self._mock else "openai",
             attempts=attempts,
             usage=usage,
+        )
+
+    async def coach_vocabulary(
+        self,
+        *,
+        term: str,
+        item_type: VocabularyItemType,
+        meaning_ko: str | None,
+        topic: VocabularyTopic | None,
+        target_level: OPIcLevel,
+        transcript: str,
+    ) -> VocabularyCoachResult:
+        """단어장 표현 하나에 대한 말하기 코칭 1건(P14.3).
+
+        형식이 깨진 출력은 상한 안에서 **딱 한 번** 더 받아 본다. 이 내부 재시도는
+        과금 단위가 아니다 — 사용자 조작 1회는 라우트가 잡은 데일리 토큰 1개뿐이고,
+        여기서 몇 번을 부르든 그 값은 변하지 않는다.
+
+        상한 안에서도 쓸 만한 코칭이 없으면 예외를 던진다(라우트가 환불한다).
+        반쯤 채워진 결과를 사용자에게 보여주지 않는다.
+        """
+        last_error: AIServiceError | None = None
+        for attempt in range(1, vocabulary.COACH_MAX_PROVIDER_ATTEMPTS + 1):
+            try:
+                if self._mock:
+                    draft = vocabulary.mock_coach_draft(
+                        term=term,
+                        item_type=item_type,
+                        transcript=transcript,
+                    )
+                    usage = None
+                else:
+                    result = await self._structured(
+                        instructions=vocabulary.coach_instructions(target_level),
+                        input_text=vocabulary.coach_input_text(
+                            term=term,
+                            item_type=item_type,
+                            meaning_ko=meaning_ko,
+                            topic=topic,
+                            transcript=transcript,
+                        ),
+                        schema=vocabulary.VocabularyCoachDraft,
+                    )
+                    payload = result.payload
+                    assert isinstance(payload, vocabulary.VocabularyCoachDraft)
+                    draft = payload
+                    usage = result.usage
+            except AIServiceUnavailable as error:
+                # 형식 불량·일시 장애만 다시 시도한다. 설정 오류(키 없음 등)는
+                # 다시 불러도 같은 결과라 그대로 올려 보낸다.
+                last_error = error
+                logger.warning(
+                    "vocabulary coach attempt failed. type=%s attempt=%s error=%s",
+                    item_type.value,
+                    attempt,
+                    error,
+                )
+                continue
+            logger.info(
+                "vocabulary coach succeeded. type=%s targetLevel=%s provider=%s "
+                "model=%s attempts=%s assessment=%s",
+                item_type.value,
+                target_level.value,
+                "catalog" if self._mock else "openai",
+                self.model,
+                attempt,
+                draft.usage_assessment.value,
+            )
+            return VocabularyCoachResult(
+                draft=draft,
+                provider="catalog" if self._mock else "openai",
+                attempts=attempt,
+                usage=usage,
+            )
+        raise AIVocabularyCoachError(
+            "vocabulary coaching produced no usable result after "
+            f"{vocabulary.COACH_MAX_PROVIDER_ATTEMPTS} attempts: {last_error}"
         )
 
     def _question_generation_payload(
