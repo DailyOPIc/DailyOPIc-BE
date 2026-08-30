@@ -35,6 +35,7 @@ from app.models.api import (
     RubricAssessment,
     RubricBand,
     RubricDimension,
+    VocabularyGenerationPurpose,
     VocabularyItemType,
     VocabularyTopic,
 )
@@ -749,17 +750,19 @@ class AIService:
         topic: VocabularyTopic,
         target_level: OPIcLevel,
         exclude_terms: list[str],
+        purpose: VocabularyGenerationPurpose = VocabularyGenerationPurpose.CUSTOM_SET,
     ) -> VocabularyGenerationResult:
-        """AI 맞춤 단어장 한 세트(단어 10 / 표현 10 / 패턴 10 = 30개).
+        """AI 단어 한 세트. 개수 · 구성은 쓰임새가 정한다(`vocabulary.COMPOSITIONS`).
 
         여유분을 한 번에 더 받아 중복을 걸러내고, 그래도 모자라면 **딱 한 번** 더
         보충한다. 이 내부 호출은 과금 단위가 아니다 — 사용자 조작 1회는 라우트가
         잡은 데일리 토큰 1개뿐이고, 여기서 몇 번을 부르든 그 값은 변하지 않는다.
 
-        상한 안에서 30개를 채우지 못하면 쓸 만한 결과가 없는 것이므로 예외를
+        상한 안에서 정원을 채우지 못하면 쓸 만한 결과가 없는 것이므로 예외를
         던진다(라우트가 환불한다). 부분 결과를 저장하지 않는다.
         """
-        selection = vocabulary.VocabularySelection.create(exclude_terms)
+        limits = vocabulary.composition(purpose)
+        selection = vocabulary.VocabularySelection.create(exclude_terms, limits)
         attempts = 0
         usage: AIUsage | None = None
         for _ in range(vocabulary.MAX_PROVIDER_ATTEMPTS):
@@ -778,6 +781,7 @@ class AIService:
                         needed=needed,
                         # 이미 고른 표현이 가장 중요한 제외 대상이다 — 앞에 둔다.
                         exclude_terms=selection.picked_terms() + exclude_terms,
+                        limits=limits,
                     ),
                     schema=vocabulary.VocabularyDraftPayload,
                 )

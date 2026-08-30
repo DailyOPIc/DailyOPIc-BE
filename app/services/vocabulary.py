@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.api import (
     OPIcLevel,
+    VocabularyGenerationPurpose,
     VocabularyItemType,
     VocabularyTopic,
     VocabularyUsageAssessment,
@@ -26,6 +27,33 @@ from app.models.api import (
 
 SET_SIZE = 30
 PER_TYPE = 10
+# 쓰임새별 구성. 개수는 여기서만 정해진다 — 요청이 개수를 직접 정하지 못한다.
+#   custom_set : 예전 계약 그대로 30개(10/10/10). 필드 없는 요청이 여기로 온다.
+#   today_extra: 오늘의 단어 20개와 같은 크기의 20개(7/7/6). 시드 카탈로그의
+#                실제 구성(단어 48 · 표현 45 · 패턴 35 = 128)을 20개로 줄인 비율이라
+#                기본 20개와 추가 20개가 같은 종류로 느껴진다.
+COMPOSITIONS: dict[VocabularyGenerationPurpose, dict[VocabularyItemType, int]] = {
+    VocabularyGenerationPurpose.CUSTOM_SET: {
+        VocabularyItemType.WORD: PER_TYPE,
+        VocabularyItemType.PHRASE: PER_TYPE,
+        VocabularyItemType.PATTERN: PER_TYPE,
+    },
+    VocabularyGenerationPurpose.TODAY_EXTRA: {
+        VocabularyItemType.WORD: 7,
+        VocabularyItemType.PHRASE: 7,
+        VocabularyItemType.PATTERN: 6,
+    },
+}
+
+
+def composition(
+    purpose: VocabularyGenerationPurpose,
+) -> dict[VocabularyItemType, int]:
+    return COMPOSITIONS[purpose]
+
+
+def set_size(purpose: VocabularyGenerationPurpose) -> int:
+    return sum(COMPOSITIONS[purpose].values())
 # 종류별 여유분. 중복·정규화 충돌을 걸러내고도 10개가 남게 한 번에 더 받는다.
 SURPLUS_PER_TYPE = 4
 # 제공자 호출 상한(최초 1회 + 보충 1회). 무한 재시도 루프를 만들지 않는다.
@@ -72,16 +100,25 @@ class VocabularyDraftPayload(BaseModel):
 
 @dataclass(slots=True)
 class VocabularySelection:
-    """종류별로 10개가 찰 때까지 모으는 그릇. 중복은 여기서 걷어낸다."""
+    """종류별 정원이 찰 때까지 모으는 그릇. 중복은 여기서 걷어낸다."""
 
     excluded: set[str]
+    #: 종류별 정원. 쓰임새가 정한 구성이 그대로 들어온다.
+    limits: dict[VocabularyItemType, int]
     picked: dict[VocabularyItemType, list[VocabularyDraft]] = field(
         default_factory=lambda: {item: [] for item in VocabularyItemType}
     )
 
     @classmethod
-    def create(cls, exclude_terms: list[str]) -> "VocabularySelection":
-        return cls(excluded={normalize_term(term) for term in exclude_terms} - {""})
+    def create(
+        cls,
+        exclude_terms: list[str],
+        limits: dict[VocabularyItemType, int] | None = None,
+    ) -> "VocabularySelection":
+        return cls(
+            excluded={normalize_term(term) for term in exclude_terms} - {""},
+            limits=dict(limits or COMPOSITIONS[VocabularyGenerationPurpose.CUSTOM_SET]),
+        )
 
     def add(self, drafts: list[VocabularyDraft]) -> int:
         """쓸 만한 것만 담고 실제로 담긴 개수를 돌려준다."""
@@ -93,7 +130,7 @@ class VocabularySelection:
             if not draft.meaning_ko.strip() or not draft.example_en.strip():
                 continue
             bucket = self.picked[draft.type]
-            if len(bucket) >= PER_TYPE:
+            if len(bucket) >= self.limits[draft.type]:
                 continue
             self.excluded.add(key)
             bucket.append(draft)
@@ -102,9 +139,9 @@ class VocabularySelection:
 
     def needed(self) -> dict[VocabularyItemType, int]:
         return {
-            item: PER_TYPE - len(bucket)
+            item: self.limits[item] - len(bucket)
             for item, bucket in self.picked.items()
-            if len(bucket) < PER_TYPE
+            if len(bucket) < self.limits[item]
         }
 
     @property
@@ -112,7 +149,7 @@ class VocabularySelection:
         return not self.needed()
 
     def drafts(self) -> list[VocabularyDraft]:
-        """단어 10 → 표현 10 → 패턴 10 순서로 평탄화."""
+        """단어 → 표현 → 패턴 순서로 평탄화."""
         return [draft for item in VocabularyItemType for draft in self.picked[item]]
 
     def picked_terms(self) -> list[str]:
@@ -147,9 +184,11 @@ def input_text(
     target_level: OPIcLevel,
     needed: dict[VocabularyItemType, int],
     exclude_terms: list[str],
+    limits: dict[VocabularyItemType, int] | None = None,
 ) -> str:
+    caps = limits or COMPOSITIONS[VocabularyGenerationPurpose.CUSTOM_SET]
     requested = {
-        item.value: min(count + SURPLUS_PER_TYPE, PER_TYPE + SURPLUS_PER_TYPE)
+        item.value: min(count + SURPLUS_PER_TYPE, caps[item] + SURPLUS_PER_TYPE)
         for item, count in needed.items()
     }
     lines = [

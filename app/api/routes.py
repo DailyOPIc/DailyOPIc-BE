@@ -60,6 +60,7 @@ from app.models.api import (
     UsageResponse,
     VocabularyEntry,
     VocabularyGeneratedSet,
+    VocabularyGenerationPurpose,
     VocabularyGenerationRequest,
     VocabularyItemType,
     VocabularySpeakingCoachRequest,
@@ -1089,13 +1090,15 @@ def _vocabulary_set_response(
     set_id: str,
     topic: VocabularyTopic,
     target_level: OPIcLevel,
+    purpose: VocabularyGenerationPurpose,
     generation: VocabularyGenerationResult,
 ) -> VocabularyGeneratedSet:
     """초안에 서버가 소유하는 값(id · 주제 · 권장 등급 · 출처)을 붙여 완성한다.
 
     항목 id는 `ai-` 접두사를 붙여 번들 시드 id와 절대 겹치지 않게 한다.
-    구성(30개 = 10/10/10)은 여기서 마지막으로 한 번 더 확인한다 — 형식이 깨진
-    제공자 출력을 저장하느니 실패로 처리한다.
+    구성(쓰임새가 정한 개수)은 여기서 마지막으로 한 번 더 확인한다 — 형식이 깨진
+    제공자 출력을 저장하느니 실패로 처리한다. 남는 것을 잘라내 개수를 맞추지
+    않는다: 계약이 20이면 제공자 단계에서 이미 20이어야 한다.
     """
     entries = [
         VocabularyEntry(
@@ -1115,10 +1118,12 @@ def _vocabulary_set_response(
     ]
     counts = Counter(entry.type for entry in entries)
     unique_terms = {entry.term.strip().lower() for entry in entries}
+    expected = vocabulary.composition(purpose)
+    size = vocabulary.set_size(purpose)
     if (
-        len(entries) != vocabulary.SET_SIZE
-        or len(unique_terms) != vocabulary.SET_SIZE
-        or any(counts[item] != vocabulary.PER_TYPE for item in VocabularyItemType)
+        len(entries) != size
+        or len(unique_terms) != size
+        or any(counts[item] != expected[item] for item in VocabularyItemType)
     ):
         raise AIVocabularyGenerationError(
             f"generated set failed composition validation: {dict(counts)}"
@@ -1140,7 +1145,8 @@ async def generate_vocabulary_set(
     user: Annotated[CurrentUser, Depends(current_user)],
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> VocabularyGeneratedSet:
-    """AI 맞춤 단어장 1세트(30개 = 단어 10 / 표현 10 / 패턴 10).
+    """AI 단어 1세트. 개수 · 구성은 요청의 쓰임새(`purpose`)로 서버가 고른다:
+    없거나 `custom_set`이면 예전 그대로 30개(10/10/10), `today_extra`면 20개(7/7/6).
 
     토큰 모델(P13 그대로): 사용자 조작 1회 = 데일리 토큰 1개. 새 지갑도, 단어장
     전용 화폐도 만들지 않는다 — 세트 생성 · AI 분석과 같은 `reserve_practice`다.
@@ -1149,7 +1155,8 @@ async def generate_vocabulary_set(
       - 같은 키 재전송(앱 재시도 · 응답 유실) → 저장된 결과를 그대로 돌려주고 추가 차감 없음
       - 제공자 실패로 쓸 만한 결과가 없음 → fail_request가 정확히 한 번 환불
       - 사용자가 새 세트를 또 만들면 앱이 새 키를 보내고 그때 새로 1개 나간다
-    개수 · 구성 · 모델 · 내부 보충 횟수는 서버가 정한다(요청으로 못 바꾼다).
+    개수 · 구성 · 모델 · 내부 보충 횟수는 서버가 정한다. 어느 쓰임새든 값은
+    데일리 토큰 1개로 같다 — 개수가 다르다고 과금이 달라지지 않는다.
     """
     request_id = _request_id(idempotency_key)
     token_request_id = hashlib.sha256(
@@ -1184,6 +1191,7 @@ async def generate_vocabulary_set(
             topic=payload.topic,
             target_level=payload.target_level,
             exclude_terms=payload.exclude_terms,
+            purpose=payload.purpose,
         )
         response = _vocabulary_set_response(
             set_id=hashlib.sha256(
@@ -1191,6 +1199,7 @@ async def generate_vocabulary_set(
             ).hexdigest()[:24],
             topic=payload.topic,
             target_level=payload.target_level,
+            purpose=payload.purpose,
             generation=generation,
         )
         await request.app.state.state_store.finalize_request(
