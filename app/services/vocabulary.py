@@ -1,9 +1,7 @@
 """AI 단어 생성 — 스키마 · 프롬프트 · 중복 제거 · 구성 검증.
 
-구성은 **쓰임새별로 상수 하나씩**이고, 둘은 서로를 모른다:
-  - `DEFAULT_COMPOSITION` : AI 맞춤 단어장(P14.2) 30개(단어 10 / 표현 10 / 패턴 10)
-  - `TODAY_COMPOSITION`   : 오늘의 단어 만들기(P14.6) 20개(7 / 7 / 6)
-어느 쪽이든 사용자 조작 1회 = 데일리 토큰 1개다. 개수 · 구성 · 모델 · 재시도
+구성은 상수 하나뿐이다 — `TODAY_COMPOSITION`(오늘의 단어 만들기 20개 = 7 / 7 / 6).
+사용자 조작 1회 = 데일리 토큰 1개다. 개수 · 구성 · 모델 · 재시도
 상한은 **서버가 소유한다**. 클라이언트가 요청으로 바꿀 수 있는 것은 주제 ·
 목표 등급 · 제외 후보뿐이다 — 요청에 개수를 고르는 필드는 없다.
 
@@ -27,19 +25,8 @@ from app.models.api import (
 )
 
 
-SET_SIZE = 30
-PER_TYPE = 10
-#: 예전 계약(P14.2 AI 맞춤 단어장). 값을 넘기지 않는 모든 경로가 이것을 쓴다.
-DEFAULT_COMPOSITION: dict[VocabularyItemType, int] = {
-    VocabularyItemType.WORD: PER_TYPE,
-    VocabularyItemType.PHRASE: PER_TYPE,
-    VocabularyItemType.PATTERN: PER_TYPE,
-}
-
 # 오늘의 단어 만들기(P14.6) 전용. 시드 카탈로그의 실제 구성(단어 48 · 표현 45 ·
 # 패턴 35 = 128)을 20개로 줄인 비율이라 기본 20개와 만든 20개가 같은 종류로 읽힌다.
-# 예전 30개 경로는 이 상수를 **참조하지 않는다** — 아래 두 값은 오직 오늘 전용
-# 서비스 함수와 오늘 전용 라우트에서만 쓰인다.
 TODAY_SET_SIZE = 20
 TODAY_COMPOSITION: dict[VocabularyItemType, int] = {
     VocabularyItemType.WORD: 7,
@@ -47,7 +34,7 @@ TODAY_COMPOSITION: dict[VocabularyItemType, int] = {
     VocabularyItemType.PATTERN: 6,
 }
 
-# 종류별 여유분. 중복·정규화 충돌을 걸러내고도 10개가 남게 한 번에 더 받는다.
+# 종류별 여유분. 중복·정규화 충돌을 걸러내고도 정원이 남게 한 번에 더 받는다.
 SURPLUS_PER_TYPE = 4
 # 제공자 호출 상한(최초 1회 + 보충 1회). 무한 재시도 루프를 만들지 않는다.
 MAX_PROVIDER_ATTEMPTS = 2
@@ -106,11 +93,11 @@ class VocabularySelection:
     def create(
         cls,
         exclude_terms: list[str],
-        limits: dict[VocabularyItemType, int] | None = None,
+        limits: dict[VocabularyItemType, int],
     ) -> "VocabularySelection":
         return cls(
             excluded={normalize_term(term) for term in exclude_terms} - {""},
-            limits=dict(limits or DEFAULT_COMPOSITION),
+            limits=dict(limits),
         )
 
     def add(self, drafts: list[VocabularyDraft]) -> int:
@@ -177,11 +164,10 @@ def input_text(
     target_level: OPIcLevel,
     needed: dict[VocabularyItemType, int],
     exclude_terms: list[str],
-    limits: dict[VocabularyItemType, int] | None = None,
+    limits: dict[VocabularyItemType, int],
 ) -> str:
-    caps = limits or DEFAULT_COMPOSITION
     requested = {
-        item.value: min(count + SURPLUS_PER_TYPE, caps[item] + SURPLUS_PER_TYPE)
+        item.value: min(count + SURPLUS_PER_TYPE, limits[item] + SURPLUS_PER_TYPE)
         for item, count in needed.items()
     }
     lines = [

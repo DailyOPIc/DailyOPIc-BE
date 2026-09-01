@@ -1,6 +1,6 @@
-"""AI 맞춤 단어장 생성(P14.2) — 과금 · 구성 · 재생 · 환불.
+"""단어 만들기 생성(P14.6) — 과금 · 구성 · 재생 · 환불.
 
-핵심 규약은 하나다: **사용자 조작 1회 = 데일리 토큰 1개 = 30개(10/10/10)**.
+핵심 규약은 하나다: **사용자 조작 1회 = 데일리 토큰 1개 = 20개(7/7/6)**.
 내부에서 제공자를 몇 번 부르든, 클라이언트가 같은 키로 몇 번 재전송하든
 차감은 1개를 넘지 않는다. 쓸 만한 결과가 없으면 정확히 한 번 환불된다.
 
@@ -18,18 +18,18 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.models.api import OPIcLevel, VocabularyItemType, VocabularyTopic
 from app.services import vocabulary
-from app.services.ai import AIService, AIServiceUnavailable
+from app.services.ai import AIService, AIServiceUnavailable, VocabularyGenerationResult
 from app.services.questions import QuestionPatternRepository
 from tests.test_api import _headers
 
 
-PATH = "/v1/vocabulary/generate"
+PATH = "/v1/vocabulary/today/generate"
 
 
 class FailingVocabularyAIService:
     model = "test-model"
 
-    async def generate_vocabulary(self, *args: object, **kwargs: object) -> object:
+    async def generate_today_vocabulary(self, *args: object, **kwargs: object) -> object:
         raise AIServiceUnavailable("forced vocabulary failure")
 
 
@@ -41,9 +41,26 @@ class CountingVocabularyAIService:
         self.calls = 0
         self.model = getattr(inner, "model", "test-model")
 
-    async def generate_vocabulary(self, **kwargs: object) -> object:
+    async def generate_today_vocabulary(self, **kwargs: object) -> object:
         self.calls += 1
-        return await self._inner.generate_vocabulary(**kwargs)
+        return await self._inner.generate_today_vocabulary(**kwargs)
+
+
+class ShortVocabularyAIService:
+    """정원보다 하나 모자란 결과를 내는 제공자. 부분 결과를 저장하면 안 된다."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.model = getattr(inner, "model", "test-model")
+
+    async def generate_today_vocabulary(self, **kwargs: object) -> object:
+        result = await self._inner.generate_today_vocabulary(**kwargs)
+        return VocabularyGenerationResult(
+            drafts=result.drafts[:-1],
+            provider=result.provider,
+            attempts=result.attempts,
+            usage=result.usage,
+        )
 
 
 @pytest.fixture
@@ -82,7 +99,7 @@ def _composition(payload: dict) -> dict[str, int]:
 
 
 def test_generation_debits_exactly_one_daily_token(client: TestClient) -> None:
-    """성공 1회 = 토큰 정확히 1개. 30개를 만들었다고 30개를 받지 않는다."""
+    """성공 1회 = 토큰 정확히 1개. 20개를 만들었다고 20개를 받지 않는다."""
     uid = str(uuid.uuid4())
     before = _tokens(client, uid)
 
@@ -108,28 +125,24 @@ def test_zero_token_rejects_before_calling_provider(client: TestClient) -> None:
     assert counting.calls == spent_calls
 
 
-def test_generated_set_has_thirty_entries(client: TestClient) -> None:
+def test_generated_set_has_twenty_entries(client: TestClient) -> None:
     uid = str(uuid.uuid4())
     payload = _generate(client, uid=uid, request_id=str(uuid.uuid4())).json()
 
-    assert len(payload["entries"]) == vocabulary.SET_SIZE
+    assert len(payload["entries"]) == vocabulary.TODAY_SET_SIZE
     assert payload["source"] == "ai"
     assert payload["topic"] == "cafes"
     assert payload["targetLevel"] == "IH"
 
 
-def test_generated_set_composition_is_ten_each(client: TestClient) -> None:
-    """10 단어 / 10 표현 / 10 패턴. 고립된 단어 30개짜리 목록이 아니다."""
+def test_generated_set_composition_is_seven_seven_six(client: TestClient) -> None:
+    """7 단어 / 7 표현 / 6 패턴. 고립된 단어 20개짜리 목록이 아니다."""
     uid = str(uuid.uuid4())
     payload = _generate(client, uid=uid, request_id=str(uuid.uuid4())).json()
 
-    assert _composition(payload) == {
-        "word": vocabulary.PER_TYPE,
-        "phrase": vocabulary.PER_TYPE,
-        "pattern": vocabulary.PER_TYPE,
-    }
+    assert _composition(payload) == {"word": 7, "phrase": 7, "pattern": 6}
     ids = [entry["id"] for entry in payload["entries"]]
-    assert len(set(ids)) == vocabulary.SET_SIZE
+    assert len(set(ids)) == vocabulary.TODAY_SET_SIZE
     # 시드 항목과 절대 겹치지 않는 접두사.
     assert all(entry_id.startswith("ai-") for entry_id in ids)
 
@@ -147,12 +160,12 @@ def test_excluded_terms_are_filtered_out(client: TestClient) -> None:
 
     terms = {entry["term"].lower() for entry in payload["entries"]}
     assert not terms & {"crowded", "cozy", "get crowded"}
-    assert len(payload["entries"]) == vocabulary.SET_SIZE
+    assert len(payload["entries"]) == vocabulary.TODAY_SET_SIZE
 
 
 def test_duplicate_candidates_are_deduplicated() -> None:
     """같은 표현의 표기 변형은 한 번만 담긴다."""
-    selection = vocabulary.VocabularySelection.create([])
+    selection = vocabulary.VocabularySelection.create([], vocabulary.TODAY_COMPOSITION)
     draft = vocabulary.VocabularyDraft(
         term="cozy",
         type=VocabularyItemType.WORD,
@@ -164,12 +177,15 @@ def test_duplicate_candidates_are_deduplicated() -> None:
     variant = draft.model_copy(update={"term": " Cozy. "})
 
     assert selection.add([draft, variant]) == 1
-    assert selection.needed()[VocabularyItemType.WORD] == vocabulary.PER_TYPE - 1
+    assert (
+        selection.needed()[VocabularyItemType.WORD]
+        == vocabulary.TODAY_COMPOSITION[VocabularyItemType.WORD] - 1
+    )
 
 
 def test_malformed_provider_entries_are_rejected() -> None:
     """뜻·예문이 빈 항목은 담지 않는다. 쓰레기를 저장하느니 부족분으로 남긴다."""
-    selection = vocabulary.VocabularySelection.create([])
+    selection = vocabulary.VocabularySelection.create([], vocabulary.TODAY_COMPOSITION)
     blank_meaning = vocabulary.VocabularyDraft(
         term="lively",
         type=VocabularyItemType.WORD,
@@ -216,15 +232,19 @@ async def test_bounded_fill_completes_missing_category(
         return drafts
 
     monkeypatch.setattr(vocabulary, "mock_drafts", flaky)
-    result = await service.generate_vocabulary(
+    result = await service.generate_today_vocabulary(
         topic=VocabularyTopic.CAFES,
         target_level=OPIcLevel.IH,
         exclude_terms=[],
     )
 
-    assert len(result.drafts) == vocabulary.SET_SIZE
+    assert len(result.drafts) == vocabulary.TODAY_SET_SIZE
     assert result.attempts == 2
-    assert calls[1] == {VocabularyItemType.PATTERN: vocabulary.PER_TYPE}
+    assert calls[1] == {
+        VocabularyItemType.PATTERN: vocabulary.TODAY_COMPOSITION[
+            VocabularyItemType.PATTERN
+        ]
+    }
     assert len(calls) <= vocabulary.MAX_PROVIDER_ATTEMPTS
 
 
@@ -362,14 +382,14 @@ def test_missing_idempotency_key_is_rejected_before_debit(client: TestClient) ->
     assert _tokens(client, uid) == before
 
 
-# --- P14.6 이전 계약으로의 복귀 회귀 --------------------------------------------
+# --- 계약 회귀 ------------------------------------------------------------------
 #
-# P14.6에서 이 라우트에 `purpose` 분기를 넣어 20개 세트를 태웠다가 되돌렸다.
-# 아래 세 개는 "이미 배포된 앱이 보내는 그대로가 여전히 맞다"를 못 박는다.
+# 개수 · 구성 · 응답 키는 서버가 소유한다. 앱이 보내는 JSON은 세 필드뿐이고,
+# 아래 세 개가 그 계약을 못 박는다.
 
 
-def test_the_shipped_request_body_is_still_accepted_verbatim(client: TestClient) -> None:
-    """App Store 버전이 보내는 JSON 그대로. 새 필드를 요구하지 않는다."""
+def test_the_shipped_request_body_is_accepted_verbatim(client: TestClient) -> None:
+    """앱이 보내는 JSON 그대로. 새 필드를 요구하지 않는다."""
     uid = str(uuid.uuid4())
     before = _tokens(client, uid)
 
@@ -381,23 +401,25 @@ def test_the_shipped_request_body_is_still_accepted_verbatim(client: TestClient)
 
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert len(payload["entries"]) == 30
-    assert _composition(payload) == {"word": 10, "phrase": 10, "pattern": 10}
+    assert len(payload["entries"]) == 20
+    assert _composition(payload) == {"word": 7, "phrase": 7, "pattern": 6}
     assert _tokens(client, uid) == before - 1
 
 
-def test_purpose_is_not_part_of_this_request(client: TestClient) -> None:
-    """쓰임새는 요청 필드가 아니라 endpoint가 정한다. 보내면 거절이고 차감도 없다."""
+def test_the_request_cannot_choose_its_own_count_or_purpose(client: TestClient) -> None:
+    """개수도 쓰임새도 요청이 정하지 못한다(extra=forbid). 거절이고 차감도 없다."""
     uid = str(uuid.uuid4())
     before = _tokens(client, uid)
 
-    response = client.post(
-        PATH,
-        headers=_headers(str(uuid.uuid4()), uid=uid),
-        json={"topic": "cafes", "targetLevel": "IH", "purpose": "today_extra"},
-    )
+    for body in (
+        {"topic": "cafes", "targetLevel": "IH", "count": 50},
+        {"topic": "cafes", "targetLevel": "IH", "purpose": "today_extra"},
+    ):
+        response = client.post(
+            PATH, headers=_headers(str(uuid.uuid4()), uid=uid), json=body
+        )
+        assert response.status_code == 422, response.text
 
-    assert response.status_code == 422, response.text
     assert _tokens(client, uid) == before
 
 
@@ -420,3 +442,16 @@ def test_response_fields_are_unchanged(client: TestClient) -> None:
         "recommendedLevels",
         "source",
     }
+
+
+def test_incomplete_set_is_a_failure_not_a_short_set(client: TestClient) -> None:
+    """19개는 성공이 아니다. 모자란 결과를 저장하지 않고 정확히 한 번 환불한다."""
+    uid = str(uuid.uuid4())
+    before = _tokens(client, uid)
+    client.app.state.ai_service = ShortVocabularyAIService(client.app.state.ai_service)
+
+    response = _generate(client, uid=uid, request_id=str(uuid.uuid4()))
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "ai_unavailable"
+    assert _tokens(client, uid) == before
