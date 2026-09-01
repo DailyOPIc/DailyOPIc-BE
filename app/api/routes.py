@@ -60,7 +60,6 @@ from app.models.api import (
     UsageResponse,
     VocabularyEntry,
     VocabularyGeneratedSet,
-    VocabularyGenerationRequest,
     VocabularyItemType,
     TodayVocabularyGenerationRequest,
     VocabularySpeakingCoachRequest,
@@ -1091,8 +1090,6 @@ def _vocabulary_set_response(
     topic: VocabularyTopic,
     target_level: OPIcLevel,
     generation: VocabularyGenerationResult,
-    size: int = vocabulary.SET_SIZE,
-    expected: dict[VocabularyItemType, int] = vocabulary.DEFAULT_COMPOSITION,
 ) -> VocabularyGeneratedSet:
     """초안에 서버가 소유하는 값(id · 주제 · 권장 등급 · 출처)을 붙여 완성한다.
 
@@ -1100,11 +1097,9 @@ def _vocabulary_set_response(
     구성은 여기서 마지막으로 한 번 더 확인한다 — 형식이 깨진 제공자 출력을
     저장하느니 실패로 처리한다. 남는 것을 잘라내 개수를 맞추지 않는다:
     계약이 20이면 제공자 단계에서 이미 20이어야 한다.
-
-    **기본값이 예전 계약(30 = 10/10/10)이다.** 값을 넘기지 않는 호출은 P14.2
-    그대로 동작하고, 다른 개수를 원하는 쪽이 자기 상수를 들고 온다 — 그래서
-    예전 라우트는 오늘 전용 상수를 이름조차 부르지 않는다.
     """
+    size = vocabulary.TODAY_SET_SIZE
+    expected = vocabulary.TODAY_COMPOSITION
     entries = [
         VocabularyEntry(
             id=f"ai-{set_id}-{index:02d}",
@@ -1141,89 +1136,6 @@ def _vocabulary_set_response(
     )
 
 
-@router.post("/v1/vocabulary/generate", response_model=VocabularyGeneratedSet)
-async def generate_vocabulary_set(
-    payload: VocabularyGenerationRequest,
-    request: Request,
-    user: Annotated[CurrentUser, Depends(current_user)],
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> VocabularyGeneratedSet:
-    """AI 맞춤 단어장 1세트(30개 = 단어 10 / 표현 10 / 패턴 10).
-
-    **이미 배포된 계약이다(P14.2). 의미를 바꾸지 않는다.** 오늘의 단어 20개는
-    이 라우트를 타지 않는다 — `POST /v1/vocabulary/today/generate`가 따로 있다.
-
-    토큰 모델(P13 그대로): 사용자 조작 1회 = 데일리 토큰 1개. 새 지갑도, 단어장
-    전용 화폐도 만들지 않는다 — 세트 생성 · AI 분석과 같은 `reserve_practice`다.
-
-    과금 단위는 HTTP 요청이 아니라 Idempotency-Key가 가리키는 "조작 1회"다.
-      - 같은 키 재전송(앱 재시도 · 응답 유실) → 저장된 결과를 그대로 돌려주고 추가 차감 없음
-      - 제공자 실패로 쓸 만한 결과가 없음 → fail_request가 정확히 한 번 환불
-      - 사용자가 새 세트를 또 만들면 앱이 새 키를 보내고 그때 새로 1개 나간다
-    개수 · 구성 · 모델 · 내부 보충 횟수는 서버가 정한다(요청으로 못 바꾼다).
-    """
-    request_id = _request_id(idempotency_key)
-    token_request_id = hashlib.sha256(
-        f"{user.uid}:vocabulary_generation:{request_id}".encode()
-    ).hexdigest()
-    plan = await _current_plan(request, user.uid)
-    limits = plans.limits_for(plan)
-    date_key = _date_key()
-    # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
-    try:
-        reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
-        )
-    except UsageLimitExceeded as error:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"code": "practice_quota_exhausted", "message": str(error)},
-        ) from error
-    except RequestAlreadyProcessing as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "request_processing", "retryable": True},
-            headers={"Retry-After": "2"},
-        ) from error
-
-    if reservation.status == "cached" and reservation.result:
-        # 같은 조작의 재생. 제공자를 다시 부르지도, 토큰을 다시 받지도 않는다.
-        return VocabularyGeneratedSet.model_validate(reservation.result)
-
-    try:
-        generation = await request.app.state.ai_service.generate_vocabulary(
-            topic=payload.topic,
-            target_level=payload.target_level,
-            exclude_terms=payload.exclude_terms,
-        )
-        response = _vocabulary_set_response(
-            set_id=hashlib.sha256(
-                f"vocabulary-set:{user.uid}:{request_id}".encode()
-            ).hexdigest()[:24],
-            topic=payload.topic,
-            target_level=payload.target_level,
-            generation=generation,
-        )
-        await request.app.state.state_store.finalize_request(
-            token_request_id,
-            response.model_dump(by_alias=True, mode="json"),
-            request.app.state.request_result_ttl_hours,
-        )
-        return response
-    except AIServiceError as error:
-        await request.app.state.state_store.fail_request(token_request_id)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "ai_unavailable",
-                "message": "AI 단어 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
-            },
-        ) from error
-    except Exception:
-        await request.app.state.state_store.fail_request(token_request_id)
-        raise
-
-
 @router.post("/v1/vocabulary/today/generate", response_model=VocabularyGeneratedSet)
 async def generate_today_vocabulary_set(
     payload: TodayVocabularyGenerationRequest,
@@ -1233,19 +1145,18 @@ async def generate_today_vocabulary_set(
 ) -> VocabularyGeneratedSet:
     """오늘의 단어 만들기 1세트(20개 = 단어 7 / 표현 7 / 패턴 6).
 
-    P14.2의 `/v1/vocabulary/generate`와 **완전히 분리된 경로**다. 요청 모델도,
-    서비스 함수도, 구성 상수도, 토큰 조작 이름공간도 따로다 — 이 라우트에서
-    무엇이 실패하든 예전 30개 계약의 결과를 바꾸지 못한다.
+    앱에서 단어를 만드는 **유일한** 경로다. P14.2의 30개짜리
+    `POST /v1/vocabulary/generate`는 P14.6.2에서 제거했다 — 그 계약을 부르는
+    클라이언트가 어디에도 없었고, 운영 로그에도 성공한 호출이 하나도 없었다.
 
-    토큰 모델은 P13 그대로 같다: 사용자 조작 1회 = 데일리 토큰 1개. 개수가
-    30에서 20으로 줄었다고 값이 달라지지 않는다. 과금 단위는 HTTP 요청이 아니라
-    Idempotency-Key가 가리키는 "조작 1회"다:
+    토큰 모델은 P13 그대로다: 사용자 조작 1회 = 데일리 토큰 1개. 과금 단위는
+    HTTP 요청이 아니라 Idempotency-Key가 가리키는 "조작 1회"다:
       - 같은 키 재전송 → 저장된 결과를 그대로 돌려주고 추가 차감 없음
       - 제공자 실패 → fail_request가 정확히 한 번 환불
       - 사용자가 또 만들면 앱이 새 키를 보내고 그때 새로 1개 나간다
     """
     request_id = _request_id(idempotency_key)
-    # 이름공간이 예전 라우트와 다르다. 같은 키가 두 계약을 오갈 수 없다.
+    # 이름공간은 배포된 그대로 둔다 — 진행 중인 조작의 멱등 기록이 살아 있다.
     token_request_id = hashlib.sha256(
         f"{user.uid}:vocabulary_today_generation:{request_id}".encode()
     ).hexdigest()
@@ -1286,8 +1197,6 @@ async def generate_today_vocabulary_set(
             topic=payload.topic,
             target_level=payload.target_level,
             generation=generation,
-            size=vocabulary.TODAY_SET_SIZE,
-            expected=vocabulary.TODAY_COMPOSITION,
         )
         await request.app.state.state_store.finalize_request(
             token_request_id,
