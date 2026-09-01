@@ -668,3 +668,233 @@ class RevenueCatWebhook(BaseModel):
 
     event: RevenueCatEvent
     api_version: str | None = None
+
+
+# --- 단어장 AI 생성(P14.2) ----------------------------------------------------
+# 원시값은 iOS `Models/Vocabulary.swift`의 enum과 **글자 그대로** 같다. 두 곳이
+# 어긋나면 앱이 서버 응답을 디코딩하지 못하므로 값을 바꿀 때는 함께 바꾼다.
+
+
+class VocabularyItemType(StrEnum):
+    WORD = "word"
+    PHRASE = "phrase"
+    PATTERN = "pattern"
+
+
+class VocabularyTopic(StrEnum):
+    HOME_NEIGHBORHOOD = "home_neighborhood"
+    SCHOOL = "school"
+    WORK = "work"
+    CAFES = "cafes"
+    FOOD = "food"
+    MOVIES = "movies"
+    MUSIC = "music"
+    EXERCISE = "exercise"
+    PARK = "park"
+    SHOPPING = "shopping"
+    TRAVEL = "travel"
+    TRANSPORTATION = "transportation"
+    WEATHER = "weather"
+    VACATION = "vacation"
+    FAMILY_FRIENDS = "family_friends"
+    DAILY_LIFE = "daily_life"
+
+    @property
+    def label(self) -> str:
+        return _VOCABULARY_TOPIC_LABELS[self]
+
+
+_VOCABULARY_TOPIC_LABELS: dict[str, str] = {
+    "home_neighborhood": "집과 동네",
+    "school": "학교",
+    "work": "직장",
+    "cafes": "카페",
+    "food": "음식점과 음식",
+    "movies": "영화",
+    "music": "음악",
+    "exercise": "운동",
+    "park": "공원",
+    "shopping": "쇼핑",
+    "travel": "여행",
+    "transportation": "교통",
+    "weather": "날씨",
+    "vacation": "휴가",
+    "family_friends": "친구와 가족",
+    "daily_life": "일상",
+}
+
+
+class VocabularyUsageRole(StrEnum):
+    DESCRIPTION = "description"
+    ROUTINE = "routine"
+    FREQUENCY = "frequency"
+    PREFERENCE = "preference"
+    REASON = "reason"
+    EMOTION = "emotion"
+    PAST_EXPERIENCE = "pastExperience"
+    COMPARISON = "comparison"
+    CHANGE = "change"
+    PROBLEM_SOLUTION = "problemSolution"
+    TRANSITION = "transition"
+
+
+class VocabularyEntry(BaseModel):
+    """앱의 단어장 항목 계약(iOS `VocabularyEntry`와 동일 필드).
+
+    발음기호(IPA)·AI 신뢰도 점수·가짜 OPIc 점수는 담지 않는다.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    term: str
+    type: VocabularyItemType
+    meaning_ko: str = Field(alias="meaningKo")
+    example_en: str = Field(alias="exampleEn")
+    example_ko: str = Field(alias="exampleKo")
+    collocations: list[str] = Field(default_factory=list)
+    topics: list[VocabularyTopic]
+    usage_roles: list[VocabularyUsageRole] = Field(alias="usageRoles")
+    recommended_levels: list[OPIcLevel] = Field(alias="recommendedLevels")
+    source: str
+
+
+class VocabularyGenerationRequest(BaseModel):
+    """AI 맞춤 단어장 1회 생성 요청(P14.2). **이미 배포된 계약이라 건드리지 않는다.**
+
+    개수(30) · 구성(10/10/10) · 모델 · 토큰 비용(1)은 **서버가 소유한다**.
+    클라이언트가 정할 수 있는 것은 주제 · 목표 등급 · 제외 후보뿐이다.
+
+    오늘의 단어 20개는 이 모델을 쓰지 않는다 — `TodayVocabularyGenerationRequest`가
+    따로 있다. 여기에 쓰임새·개수를 고르는 필드를 **추가하지 않는다**: 그 순간
+    예전 클라이언트가 보내는 요청의 의미가 서버 사정으로 흔들린다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic: VocabularyTopic
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    # 중복 방지용 힌트. 시드 카탈로그 전체를 프롬프트에 넣지 않기 위해 개수와
+    # 길이를 모두 서버가 제한한다.
+    exclude_terms: list[str] = Field(
+        default_factory=list, alias="excludeTerms", max_length=200
+    )
+
+    @field_validator("exclude_terms")
+    @classmethod
+    def clean_exclude_terms(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        return [item for item in cleaned if 0 < len(item) <= 60]
+
+
+class TodayVocabularyGenerationRequest(BaseModel):
+    """오늘의 단어 만들기 1회 생성 요청(P14.6). 예전 요청 모델과 **별개 타입**이다.
+
+    보내는 값은 같은 셋(주제 · 목표 등급 · 제외 후보)이지만 의미가 다르다 —
+    이 요청은 언제나 20개(7/7/6)다. 개수도 쓰임새도 요청에 없다: endpoint가
+    곧 쓰임새다. 그래서 discriminator 필드가 필요 없고, 예전 모델에 손댈 일도 없다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic: VocabularyTopic
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    exclude_terms: list[str] = Field(
+        default_factory=list, alias="excludeTerms", max_length=200
+    )
+
+    @field_validator("exclude_terms")
+    @classmethod
+    def clean_exclude_terms(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        return [item for item in cleaned if 0 < len(item) <= 60]
+
+
+class VocabularyGeneratedSet(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    set_id: str = Field(alias="setId")
+    topic: VocabularyTopic
+    target_level: OPIcLevel = Field(alias="targetLevel")
+    created_at: datetime = Field(alias="createdAt")
+    entries: list[VocabularyEntry]
+    source: str = "ai"
+
+
+# --- 단어장 AI 말하기 코치(P14.3) ----------------------------------------------
+# 단어를 배우고 그 표현으로 직접 말한 뒤, **사용자가 명시적으로 요청할 때만**
+# 데일리 토큰 1개로 코칭을 받는다. 녹음 · 전사 · 저장된 결과 재열람은 0개다.
+#
+# 여기 없는 것: 예상 OPIc 등급 · 숫자 점수 · 5개 영역 루브릭 · 합불 · 발음 점수.
+# 그건 데일리 분석(`PracticeEvaluation`)의 몫이고 코치가 흉내 내면 두 제품이 서로
+# 다른 등급을 말하게 된다.
+
+# 요청 상한. 짧은 표현 연습이므로 수천 단어짜리 전사를 받지 않는다 —
+# 넘치는 입력을 조용히 잘라 과금하는 대신 제공자 호출 **전에** 거절한다.
+VOCABULARY_TERM_MAX_CHARS = 80
+VOCABULARY_TRANSCRIPT_MAX_CHARS = 600
+VOCABULARY_ENTRY_ID_MAX_CHARS = 120
+
+
+class VocabularyUsageAssessment(StrEnum):
+    """대상 표현을 실제로 어떻게 썼는가. 점수가 아니라 세 갈래 판정이다.
+
+    문자열이 전사에 들어 있다는 이유만으로 `appropriate`가 되지 않는다 —
+    맥락이 어긋나면 `needs_polish`다(프롬프트가 그렇게 지시한다).
+    """
+
+    APPROPRIATE = "appropriate"
+    NEEDS_POLISH = "needsPolish"
+    NOT_USED = "notUsed"
+
+
+class VocabularySpeakingCoachRequest(BaseModel):
+    """코칭 1회 요청.
+
+    모델 · 시스템 프롬프트 · 출력 스키마 · 토큰 비용(1)은 **서버가 소유한다.**
+    앱이 보내는 것은 무엇을 연습했는지와 무엇을 말했는지뿐이다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_id: str = Field(
+        alias="entryId", min_length=1, max_length=VOCABULARY_ENTRY_ID_MAX_CHARS
+    )
+    term: str = Field(min_length=1, max_length=VOCABULARY_TERM_MAX_CHARS)
+    type: VocabularyItemType
+    transcript: str = Field(min_length=1, max_length=VOCABULARY_TRANSCRIPT_MAX_CHARS)
+    # 있으면 코칭 품질이 올라가는 값들. 시드 · AI 생성 항목 모두 갖고 있지만
+    # 필수로 만들지 않는다 — 구버전 앱이 보내지 않아도 코칭은 성립한다.
+    meaning_ko: str | None = Field(default=None, alias="meaningKo", max_length=120)
+    topic: VocabularyTopic | None = None
+    target_level: OPIcLevel | None = Field(default=None, alias="targetLevel")
+
+    @field_validator("entry_id", "term", "transcript")
+    @classmethod
+    def require_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class VocabularySpeakingCoachResult(BaseModel):
+    """코칭 1회 결과(iOS `VocabularySpeakingCoachResult`와 동일 필드).
+
+    앱은 이 결과를 기기에 저장해 두고 다시 열 때 **무료로** 보여준다.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    result_id: str = Field(alias="resultId")
+    entry_id: str = Field(alias="entryId")
+    target_term: str = Field(alias="targetTerm")
+    transcript: str
+    usage_assessment: VocabularyUsageAssessment = Field(alias="usageAssessment")
+    usage_feedback_ko: str = Field(alias="usageFeedbackKo")
+    natural_correction_en: str = Field(alias="naturalCorrectionEn")
+    natural_correction_ko: str = Field(alias="naturalCorrectionKo")
+    expanded_answer_en: str = Field(alias="expandedAnswerEn")
+    expanded_answer_ko: str = Field(alias="expandedAnswerKo")
+    related_expressions: list[str] = Field(alias="relatedExpressions")
+    created_at: datetime = Field(alias="createdAt")

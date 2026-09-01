@@ -333,6 +333,8 @@ PROVIDER_METHODS = {
     "generate_mock",
     "evaluate_practice",
     "evaluate_mock",
+    "generate_vocabulary",
+    "coach_vocabulary",
 }
 
 # routes.py 안에서 AI 제공자를 부르는 함수 → 그 호출을 계량하는 수단.
@@ -344,6 +346,8 @@ AI_CALL_SITES = {
     "evaluate_practice": "reserve_practice (분석 1회 = 토큰 1개)",
     "evaluate_mock_session": "mock 쿼터(reserve_mock)",
     "evaluate_mock": "mock 쿼터(reserve_mock)",
+    "generate_vocabulary_set": "reserve_practice (맞춤 단어장 1세트 = 토큰 1개)",
+    "coach_vocabulary_speaking": "reserve_practice (말하기 코칭 1회 = 토큰 1개)",
 }
 
 # 위 헬퍼를 호출하는 라우트는 반드시 자기 안에서 데일리/모의 쿼터를 잡아야 한다.
@@ -352,6 +356,8 @@ HELPER_CALLERS_REQUIRING_A_METER = {
     "create_review_set": "reserve_practice",
     "refresh_practice_set": "reserve_practice",
     "start_mock_session": "reserve_mock",
+    "generate_vocabulary_set": "reserve_practice",
+    "coach_vocabulary_speaking": "reserve_practice",
 }
 
 
