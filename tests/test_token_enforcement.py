@@ -333,7 +333,7 @@ PROVIDER_METHODS = {
     "generate_mock",
     "evaluate_practice",
     "evaluate_mock",
-    "generate_vocabulary",
+    "generate_today_vocabulary",
     "coach_vocabulary",
 }
 
@@ -346,7 +346,7 @@ AI_CALL_SITES = {
     "evaluate_practice": "reserve_practice (분석 1회 = 토큰 1개)",
     "evaluate_mock_session": "mock 쿼터(reserve_mock)",
     "evaluate_mock": "mock 쿼터(reserve_mock)",
-    "generate_vocabulary_set": "reserve_practice (맞춤 단어장 1세트 = 토큰 1개)",
+    "generate_today_vocabulary_set": "reserve_practice (단어 20개 1세트 = 토큰 1개)",
     "coach_vocabulary_speaking": "reserve_practice (말하기 코칭 1회 = 토큰 1개)",
 }
 
@@ -356,7 +356,7 @@ HELPER_CALLERS_REQUIRING_A_METER = {
     "create_review_set": "reserve_practice",
     "refresh_practice_set": "reserve_practice",
     "start_mock_session": "reserve_mock",
-    "generate_vocabulary_set": "reserve_practice",
+    "generate_today_vocabulary_set": "reserve_practice",
     "coach_vocabulary_speaking": "reserve_practice",
 }
 
