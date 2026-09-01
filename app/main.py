@@ -125,7 +125,7 @@ async def endpoint_rate_limit(request, call_next):
     is_mutation = request.method in {"POST", "PUT", "PATCH", "DELETE"}
     is_ai = is_mutation and any(
         segment in request.url.path
-        for segment in ("question-sets", "mock-exams", "evaluations")
+        for segment in ("question-sets", "mock-exams", "evaluations", "vocabulary")
     )
     limit = (
         settings.ai_rate_limit_per_minute

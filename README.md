@@ -323,7 +323,18 @@ POST /v1/mock-exams
 POST /v1/question-sets/{setId}/adjustment
   body: {"adjustment":"easier|same|harder"}
   -> Mock Q8~Q15 append
+
+POST /v1/vocabulary/generate
+  body: {"topic":"cafes", "targetLevel":"IH", "excludeTerms":[...]}
+  -> AI 맞춤 단어장 1세트 = 30개(단어 10 / 표현 10 / 패턴 10). 데일리 토큰 1개 소모
 ```
+
+단어장 생성은 개수 · 구성(10/10/10) · 모델 · 내부 보충 횟수를 **서버가 정합니다.**
+`excludeTerms`는 이미 가진 표현을 걸러 달라는 힌트일 뿐이고 개수 상한이 있습니다.
+부족분을 채우려고 제공자를 두 번 부르더라도 그것은 내부 사정이며, 사용자 차감은
+`Idempotency-Key`가 가리키는 조작 1회당 토큰 1개로 고정입니다. 같은 키로 다시
+보내면 저장된 세트를 그대로 돌려주고(추가 차감 없음), 쓸 만한 결과를 못 만들면
+정확히 한 번 환불합니다.
 
 Daily는 자기소개 Q1을 포함하지 않습니다. 첫 Daily 풀도 데일리 토큰 1개를 쓰며, 같은 날 같은 조건으로 다시 요청하면 이미 만든 풀을 그대로 반환합니다(추가 차감 없음). Mock은 Q1을 항상 `Introduce yourself.`로 고정하고, Q7 이후 adjustment를 적용해 15문항으로 완성합니다. 같은 `setId`에 같은 adjustment를 다시 보내면 완성된 세트를 그대로 반환하고, 다른 adjustment를 다시 보내면 `409 adjustment_already_applied`를 반환합니다.
 
@@ -338,7 +349,9 @@ Daily는 자기소개 Q1을 포함하지 않습니다. 첫 Daily 풀도 데일�
 | 새 Daily 문제 세트(첫 생성 · refresh · 복습 세트) | 데일리 토큰 1개 |
 | AI 분석 1회 | 데일리 토큰 1개 |
 | 사용자가 의도적으로 다시 분석 | 데일리 토큰 1개 더 |
+| AI 맞춤 단어장 1세트(30개 = 단어 10 · 표현 10 · 패턴 10) | 데일리 토큰 1개 |
 | 이미 받은 결과 다시 보기 · 이미 받은 문항 다시 열기 | 0 |
+| 이미 만든 단어장 보기 · 학습 · 복습, 시드 단어장 전체 | 0 |
 | 녹음 · 다시 녹음 · 기기 TTS/STT | 0 |
 | 플래너 · 하루 시트 · 학습 기록 · 시험 가이드 | 0 |
 | 모의고사 | 데일리 토큰과 별개(플랜별 `mock_daily` 횟수) |
