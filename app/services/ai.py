@@ -35,7 +35,6 @@ from app.models.api import (
     RubricAssessment,
     RubricBand,
     RubricDimension,
-    VocabularyGenerationPurpose,
     VocabularyItemType,
     VocabularyTopic,
 )
@@ -750,18 +749,57 @@ class AIService:
         topic: VocabularyTopic,
         target_level: OPIcLevel,
         exclude_terms: list[str],
-        purpose: VocabularyGenerationPurpose = VocabularyGenerationPurpose.CUSTOM_SET,
     ) -> VocabularyGenerationResult:
-        """AI 단어 한 세트. 개수 · 구성은 쓰임새가 정한다(`vocabulary.COMPOSITIONS`).
+        """AI 맞춤 단어장 한 세트(단어 10 / 표현 10 / 패턴 10 = 30개).
 
-        여유분을 한 번에 더 받아 중복을 걸러내고, 그래도 모자라면 **딱 한 번** 더
-        보충한다. 이 내부 호출은 과금 단위가 아니다 — 사용자 조작 1회는 라우트가
-        잡은 데일리 토큰 1개뿐이고, 여기서 몇 번을 부르든 그 값은 변하지 않는다.
+        P14.2 계약 전용이다. 개수를 고르는 인자가 **없다** — 이 함수를 부르면
+        언제나 30개다. 오늘의 단어 20개는 이 함수를 타지 않는다
+        (`generate_today_vocabulary`가 따로 있다).
+        """
+        return await self._generate_vocabulary_set(
+            topic=topic,
+            target_level=target_level,
+            exclude_terms=exclude_terms,
+            limits=vocabulary.DEFAULT_COMPOSITION,
+        )
+
+    async def generate_today_vocabulary(
+        self,
+        *,
+        topic: VocabularyTopic,
+        target_level: OPIcLevel,
+        exclude_terms: list[str],
+    ) -> VocabularyGenerationResult:
+        """오늘의 단어 만들기 한 세트(단어 7 / 표현 7 / 패턴 6 = 20개, P14.6).
+
+        예전 30개 계약과 **개수를 공유하지 않는다**. 여기서 무엇이 실패하든
+        `generate_vocabulary`의 결과에는 닿지 못한다 — 상수도 호출부도 다르다.
+        """
+        return await self._generate_vocabulary_set(
+            topic=topic,
+            target_level=target_level,
+            exclude_terms=exclude_terms,
+            limits=vocabulary.TODAY_COMPOSITION,
+        )
+
+    async def _generate_vocabulary_set(
+        self,
+        *,
+        topic: VocabularyTopic,
+        target_level: OPIcLevel,
+        exclude_terms: list[str],
+        limits: dict[VocabularyItemType, int],
+    ) -> VocabularyGenerationResult:
+        """제공자를 부르고 중복을 걸러내는 공통 운반 계층.
+
+        개수를 **정하지 않는다** — 정원(`limits`)은 부르는 쪽이 갖고 온다. 여유분을
+        한 번에 더 받아 중복을 걸러내고, 그래도 모자라면 **딱 한 번** 더 보충한다.
+        이 내부 호출은 과금 단위가 아니다 — 사용자 조작 1회는 라우트가 잡은 데일리
+        토큰 1개뿐이고, 여기서 몇 번을 부르든 그 값은 변하지 않는다.
 
         상한 안에서 정원을 채우지 못하면 쓸 만한 결과가 없는 것이므로 예외를
         던진다(라우트가 환불한다). 부분 결과를 저장하지 않는다.
         """
-        limits = vocabulary.composition(purpose)
         selection = vocabulary.VocabularySelection.create(exclude_terms, limits)
         attempts = 0
         usage: AIUsage | None = None

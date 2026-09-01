@@ -681,17 +681,6 @@ class VocabularyItemType(StrEnum):
     PATTERN = "pattern"
 
 
-class VocabularyGenerationPurpose(StrEnum):
-    """세트 하나의 쓰임새. 개수 · 구성은 여기서 갈린다(값은 서버가 소유한다).
-
-    필드가 없는 요청 = 예전 클라이언트 = `CUSTOM_SET` = 30개(10/10/10) 그대로다.
-    """
-
-    CUSTOM_SET = "custom_set"
-    #: 오늘의 단어 20개를 끝낸 뒤 더 받는 20개(P14.6).
-    TODAY_EXTRA = "today_extra"
-
-
 class VocabularyTopic(StrEnum):
     HOME_NEIGHBORHOOD = "home_neighborhood"
     SCHOOL = "school"
@@ -771,21 +760,45 @@ class VocabularyEntry(BaseModel):
 
 
 class VocabularyGenerationRequest(BaseModel):
-    """AI 맞춤 단어장 1회 생성 요청.
+    """AI 맞춤 단어장 1회 생성 요청(P14.2). **이미 배포된 계약이라 건드리지 않는다.**
 
-    개수 · 구성 · 모델 · 토큰 비용(1)은 **서버가 소유한다**. 클라이언트가 정할 수
-    있는 것은 주제 · 목표 등급 · 제외 후보, 그리고 쓰임새(`purpose`)뿐이다 —
-    쓰임새는 서버가 정해 둔 구성 중 하나를 고를 뿐 개수를 직접 정하지 못한다.
+    개수(30) · 구성(10/10/10) · 모델 · 토큰 비용(1)은 **서버가 소유한다**.
+    클라이언트가 정할 수 있는 것은 주제 · 목표 등급 · 제외 후보뿐이다.
+
+    오늘의 단어 20개는 이 모델을 쓰지 않는다 — `TodayVocabularyGenerationRequest`가
+    따로 있다. 여기에 쓰임새·개수를 고르는 필드를 **추가하지 않는다**: 그 순간
+    예전 클라이언트가 보내는 요청의 의미가 서버 사정으로 흔들린다.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     topic: VocabularyTopic
     target_level: OPIcLevel = Field(alias="targetLevel")
-    # 없으면 예전 계약(30개). 앱이 이 값을 보낼 때만 다른 구성이 된다.
-    purpose: VocabularyGenerationPurpose = VocabularyGenerationPurpose.CUSTOM_SET
     # 중복 방지용 힌트. 시드 카탈로그 전체를 프롬프트에 넣지 않기 위해 개수와
     # 길이를 모두 서버가 제한한다.
+    exclude_terms: list[str] = Field(
+        default_factory=list, alias="excludeTerms", max_length=200
+    )
+
+    @field_validator("exclude_terms")
+    @classmethod
+    def clean_exclude_terms(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        return [item for item in cleaned if 0 < len(item) <= 60]
+
+
+class TodayVocabularyGenerationRequest(BaseModel):
+    """오늘의 단어 만들기 1회 생성 요청(P14.6). 예전 요청 모델과 **별개 타입**이다.
+
+    보내는 값은 같은 셋(주제 · 목표 등급 · 제외 후보)이지만 의미가 다르다 —
+    이 요청은 언제나 20개(7/7/6)다. 개수도 쓰임새도 요청에 없다: endpoint가
+    곧 쓰임새다. 그래서 discriminator 필드가 필요 없고, 예전 모델에 손댈 일도 없다.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    topic: VocabularyTopic
+    target_level: OPIcLevel = Field(alias="targetLevel")
     exclude_terms: list[str] = Field(
         default_factory=list, alias="excludeTerms", max_length=200
     )

@@ -360,3 +360,63 @@ def test_missing_idempotency_key_is_rejected_before_debit(client: TestClient) ->
 
     assert response.status_code == 400, response.text
     assert _tokens(client, uid) == before
+
+
+# --- P14.6 이전 계약으로의 복귀 회귀 --------------------------------------------
+#
+# P14.6에서 이 라우트에 `purpose` 분기를 넣어 20개 세트를 태웠다가 되돌렸다.
+# 아래 세 개는 "이미 배포된 앱이 보내는 그대로가 여전히 맞다"를 못 박는다.
+
+
+def test_the_shipped_request_body_is_still_accepted_verbatim(client: TestClient) -> None:
+    """App Store 버전이 보내는 JSON 그대로. 새 필드를 요구하지 않는다."""
+    uid = str(uuid.uuid4())
+    before = _tokens(client, uid)
+
+    response = client.post(
+        PATH,
+        headers=_headers(str(uuid.uuid4()), uid=uid),
+        json={"topic": "cafes", "targetLevel": "IH", "excludeTerms": ["cozy"]},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert len(payload["entries"]) == 30
+    assert _composition(payload) == {"word": 10, "phrase": 10, "pattern": 10}
+    assert _tokens(client, uid) == before - 1
+
+
+def test_purpose_is_not_part_of_this_request(client: TestClient) -> None:
+    """쓰임새는 요청 필드가 아니라 endpoint가 정한다. 보내면 거절이고 차감도 없다."""
+    uid = str(uuid.uuid4())
+    before = _tokens(client, uid)
+
+    response = client.post(
+        PATH,
+        headers=_headers(str(uuid.uuid4()), uid=uid),
+        json={"topic": "cafes", "targetLevel": "IH", "purpose": "today_extra"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert _tokens(client, uid) == before
+
+
+def test_response_fields_are_unchanged(client: TestClient) -> None:
+    """세트 · 항목의 키가 P14.2 그대로다. 앱의 해석 코드가 그대로 돈다."""
+    uid = str(uuid.uuid4())
+    payload = _generate(client, uid=uid, request_id=str(uuid.uuid4())).json()
+
+    assert set(payload) == {"setId", "topic", "targetLevel", "createdAt", "entries", "source"}
+    assert set(payload["entries"][0]) == {
+        "id",
+        "term",
+        "type",
+        "meaningKo",
+        "exampleEn",
+        "exampleKo",
+        "collocations",
+        "topics",
+        "usageRoles",
+        "recommendedLevels",
+        "source",
+    }
