@@ -95,7 +95,7 @@ async def request_telemetry(request, call_next):
         response = await call_next(request)
     except Exception:
         route = request.scope.get("route")
-        path_template = route.path if route else path
+        path_template = route.path if route else "unmatched"
         metrics.http_requests_total.labels(
             method=request.method, path_template=path_template, status="500",
         ).inc()
@@ -111,7 +111,7 @@ async def request_telemetry(request, call_next):
         )
         raise
     route = request.scope.get("route")
-    path_template = route.path if route else path
+    path_template = route.path if route else "unmatched"
     metrics.http_requests_total.labels(
         method=request.method, path_template=path_template, status=str(response.status_code),
     ).inc()
