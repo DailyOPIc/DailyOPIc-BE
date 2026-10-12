@@ -63,6 +63,16 @@ def test_metrics_endpoint_not_self_instrumented(isolated_app):
     assert 'path_template="/metrics"' not in resp.text
 
 
+def test_dynamic_route_uses_path_template(isolated_app):
+    """동적 경로 파라미터가 라벨에 누출되지 않는지 확인."""
+    client, _registry = isolated_app
+    # operation_id에 고유 값을 넣어도 path_template은 템플릿이어야 함
+    resp = client.get("/v1/operations/unique-id-12345")
+    metrics_resp = client.get("/metrics")
+    text = metrics_resp.text
+    assert "unique-id-12345" not in text or 'path_template="/v1/operations/{operation_id}"' in text
+
+
 def test_ai_api_duration_recorded_on_structured_call():
     """_structured() 호출 시 ai_api_duration histogram에 값이 기록되는지 확인."""
     import asyncio
@@ -136,5 +146,40 @@ def test_ai_token_counter_incremented():
         output = generate_latest(registry).decode()
         assert 'type="input"' in output
         assert 'type="output"' in output
+    finally:
+        metrics_mod.metrics = old
+
+
+def test_ai_api_error_records_duration_and_error():
+    """_structured()에서 예외 발생 시 duration과 error 모두 기록되는지 확인."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.services import metrics as metrics_mod
+    from app.services.ai import AIService, AIServiceUnavailable
+
+    registry = CollectorRegistry()
+    old = metrics_mod.metrics
+    metrics_mod.metrics = metrics_mod.create_metrics(registry)
+    try:
+        svc = AIService(api_key="test-key", model="gpt-4o", mock=False, repository=MagicMock())
+        svc._client = AsyncMock()
+        svc._client.responses.create = AsyncMock(side_effect=TimeoutError("timeout"))
+
+        from pydantic import BaseModel
+
+        class DummySchema(BaseModel):
+            value: str
+
+        with pytest.raises(AIServiceUnavailable):
+            asyncio.get_event_loop().run_until_complete(
+                svc._structured(instructions="test", input_text="test", schema=DummySchema)
+            )
+
+        from prometheus_client import generate_latest
+
+        output = generate_latest(registry).decode()
+        assert "dailyopic_ai_api_duration_seconds_count{" in output
+        assert 'error_type="TimeoutError"' in output
     finally:
         metrics_mod.metrics = old

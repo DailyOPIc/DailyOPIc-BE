@@ -516,6 +516,9 @@ class AIService:
         except AIServiceError:
             raise
         except Exception as error:
+            metrics.ai_api_duration.labels(model=self.model, function=function).observe(
+                perf_counter() - t0,
+            )
             metrics.ai_api_errors.labels(
                 model=self.model, function=function, error_type=type(error).__name__,
             ).inc()

@@ -87,15 +87,15 @@ app = FastAPI(
 @app.middleware("http")
 async def request_telemetry(request, call_next):
     path = request.url.path
-    if path.startswith("/metrics"):
+    if path == "/metrics" or path.startswith("/metrics/"):
         return await call_next(request)
     timer = RequestTimer()
     request_id = request.headers.get("Idempotency-Key")
-    route = request.scope.get("route")
-    path_template = route.path if route else path
     try:
         response = await call_next(request)
     except Exception:
+        route = request.scope.get("route")
+        path_template = route.path if route else path
         metrics.http_requests_total.labels(
             method=request.method, path_template=path_template, status="500",
         ).inc()
@@ -110,6 +110,8 @@ async def request_telemetry(request, call_next):
             latencyMs=timer.latency_ms,
         )
         raise
+    route = request.scope.get("route")
+    path_template = route.path if route else path
     metrics.http_requests_total.labels(
         method=request.method, path_template=path_template, status=str(response.status_code),
     ).inc()
