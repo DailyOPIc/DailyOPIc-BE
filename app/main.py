@@ -131,12 +131,8 @@ async def request_telemetry(request, call_next):
 
 @app.middleware("http")
 async def endpoint_rate_limit(request, call_next):
-    if request.url.path in {
-        "/health",
-        "/metrics",
-        "/v1/admob/ssv",
-        "/v1/iap/revenuecat-webhook",
-    }:
+    path = request.url.path
+    if path in {"/health", "/v1/admob/ssv", "/v1/iap/revenuecat-webhook"} or path.rstrip("/") == "/metrics":
         return await call_next(request)
     settings = get_settings()
     identity = request_identity(
