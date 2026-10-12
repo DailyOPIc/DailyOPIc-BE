@@ -1,0 +1,49 @@
+services:
+  firestore:
+    image: google/cloud-sdk:slim
+    command: >
+      gcloud emulators firestore start
+      --host-port=0.0.0.0:8081
+      --project=dailyopic-local
+    ports:
+      - "8081:8081"
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      MOCK_AI: "true"
+      FIREBASE_PROJECT_ID: "dailyopic-local"
+      ADMOB_REWARDED_AD_UNIT_ID: "ca-app-pub-3940256099942544/5224354917"
+      FIRESTORE_EMULATOR_HOST: "firestore:8081"
+    depends_on:
+      - firestore
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      start_period: 15s
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./monitoring/grafana-dashboard.yml:/etc/grafana/provisioning/dashboards/dash.yml:ro
+      - ./monitoring/dashboard.json:/var/lib/grafana/dashboards/dailyopic.json:ro
+    depends_on:
+      - prometheus
