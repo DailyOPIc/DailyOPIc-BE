@@ -73,6 +73,18 @@ def test_dynamic_route_uses_path_template(isolated_app):
     assert "unique-id-12345" not in text or 'path_template="/v1/operations/{operation_id}"' in text
 
 
+def test_unmatched_route_uses_unmatched_label(isolated_app):
+    """등록되지 않은 경로는 raw path 대신 'unmatched'로 통합."""
+    client, _registry = isolated_app
+    client.get("/random-bot-scan-1234")
+    client.get("/wp-admin/login.php")
+    metrics_resp = client.get("/metrics")
+    text = metrics_resp.text
+    assert "random-bot-scan" not in text
+    assert "wp-admin" not in text
+    assert 'path_template="unmatched"' in text
+
+
 def test_ai_api_duration_recorded_on_structured_call():
     """_structured() 호출 시 ai_api_duration histogram에 값이 기록되는지 확인."""
     import asyncio
