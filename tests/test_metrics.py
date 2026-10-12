@@ -61,3 +61,80 @@ def test_metrics_endpoint_not_self_instrumented(isolated_app):
     client.get("/metrics")
     resp = client.get("/metrics")
     assert 'path_template="/metrics"' not in resp.text
+
+
+def test_ai_api_duration_recorded_on_structured_call():
+    """_structured() 호출 시 ai_api_duration histogram에 값이 기록되는지 확인."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.services import metrics as metrics_mod
+    from app.services.ai import AIService
+
+    registry = CollectorRegistry()
+    old = metrics_mod.metrics
+    metrics_mod.metrics = metrics_mod.create_metrics(registry)
+    try:
+        svc = AIService(api_key="test-key", model="gpt-4o", mock=False, repository=MagicMock())
+
+        mock_response = MagicMock()
+        mock_response.output_text = '{"predicted_level": "IL"}'
+        mock_response.output = []
+        mock_response.id = "resp_test"
+        mock_response.usage = None
+
+        svc._client = AsyncMock()
+        svc._client.responses.create = AsyncMock(return_value=mock_response)
+
+        from pydantic import BaseModel
+
+        class DummySchema(BaseModel):
+            predicted_level: str
+
+        result = asyncio.get_event_loop().run_until_complete(
+            svc._structured(instructions="test", input_text="test", schema=DummySchema)
+        )
+        assert result.payload.predicted_level == "IL"
+
+        # ai_api_duration histogram에 실제 observation이 기록되었는지 확인
+        from prometheus_client import generate_latest
+
+        output = generate_latest(registry).decode()
+        assert "dailyopic_ai_api_duration_seconds_count{" in output
+    finally:
+        metrics_mod.metrics = old
+
+
+def test_ai_token_counter_incremented():
+    """_log_usage()에서 토큰 Counter가 증가하는지 확인."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from app.services import metrics as metrics_mod
+    from app.services.ai import AIService
+
+    registry = CollectorRegistry()
+    old = metrics_mod.metrics
+    metrics_mod.metrics = metrics_mod.create_metrics(registry)
+    try:
+        svc = AIService(api_key="test-key", model="gpt-4o", mock=False, repository=MagicMock())
+
+        # SimpleNamespace: _usage_metric()의 model_dump hasattr 체크를 우회
+        mock_usage = SimpleNamespace(
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+            input_tokens_details=None,
+            output_tokens_details=None,
+        )
+        mock_response = SimpleNamespace(usage=mock_usage, id="resp_test")
+
+        svc._log_usage(mock_response, "DummySchema")
+
+        from prometheus_client import generate_latest
+
+        output = generate_latest(registry).decode()
+        assert 'type="input"' in output
+        assert 'type="output"' in output
+    finally:
+        metrics_mod.metrics = old

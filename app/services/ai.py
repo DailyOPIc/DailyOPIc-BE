@@ -6,6 +6,7 @@ import asyncio
 import random
 import re
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Annotated, Any
 
 from openai import AsyncOpenAI
@@ -431,6 +432,19 @@ class AIService:
             )
         return messages[:8]
 
+    @staticmethod
+    def _schema_to_function(schema_name: str) -> str:
+        name = schema_name.lower()
+        if "question" in name:
+            return "question_gen"
+        if "practiceevaluation" in name:
+            return "practice_eval"
+        if "mockevaluation" in name:
+            return "mock_eval"
+        if "vocabulary" in name:
+            return "vocabulary"
+        return name
+
     async def _structured(
         self,
         *,
@@ -439,9 +453,12 @@ class AIService:
         schema: type[BaseModel],
         max_attempts: int = 1,
     ) -> StructuredAIResult:
+        from app.services.metrics import metrics
+
         if not self._client:
             raise AIServiceConfigurationError("OpenAI client is not configured")
         validation_errors: list[str] = []
+        function = self._schema_to_function(schema.__name__)
         try:
             for attempt in range(1, max_attempts + 1):
                 attempt_instructions = instructions
@@ -452,6 +469,7 @@ class AIService:
                         "Return a complete replacement JSON object only, and fix these errors: "
                         f"{'; '.join(validation_errors)}"
                     )
+                t0 = perf_counter()
                 response = await self._client.responses.create(
                     model=self.model,
                     store=False,
@@ -467,7 +485,10 @@ class AIService:
                         }
                     },
                 )
-                usage = self._log_usage(response, schema.__name__)
+                metrics.ai_api_duration.labels(model=self.model, function=function).observe(
+                    perf_counter() - t0,
+                )
+                usage = self._log_usage(response, schema.__name__, function=function)
                 if not response.output_text:
                     refusal = self._response_refusal(response)
                     if refusal:
@@ -495,6 +516,9 @@ class AIService:
         except AIServiceError:
             raise
         except Exception as error:
+            metrics.ai_api_errors.labels(
+                model=self.model, function=function, error_type=type(error).__name__,
+            ).inc()
             logger.exception(
                 "OpenAI structured request failed. model=%s schema=%s",
                 self.model,
@@ -528,7 +552,11 @@ class AIService:
                     return str(refusal)
         return None
 
-    def _log_usage(self, response: Any, schema_name: str) -> AIUsage:
+    def _log_usage(
+        self, response: Any, schema_name: str, *, function: str | None = None,
+    ) -> AIUsage:
+        from app.services.metrics import metrics
+
         usage = getattr(response, "usage", None)
         if usage is None:
             return AIUsage()
@@ -542,6 +570,11 @@ class AIService:
             usage, "output_tokens_details", "reasoning_tokens"
         )
         response_id = getattr(response, "id", None)
+        fn = function or self._schema_to_function(schema_name)
+        if input_tokens:
+            metrics.ai_tokens.labels(model=self.model, function=fn, type="input").inc(input_tokens)
+        if output_tokens:
+            metrics.ai_tokens.labels(model=self.model, function=fn, type="output").inc(output_tokens)
         logger.info(
             "OpenAI usage recorded. model=%s schema=%s openaiResponseId=%s inputTokens=%s "
             "cachedInputTokens=%s outputTokens=%s reasoningTokens=%s totalTokens=%s",
@@ -1122,6 +1155,9 @@ class AIService:
                 # 어떤 (레벨, 필드) 조합이 자주 걸리는지 봐야 지시문을 고칠 수 있다.
                 # 마지막 시도 실패는 폴백으로 처리되므로 실제 재시도가 일어날 때만 발행.
                 if attempt < max_attempts:
+                    from app.services.metrics import metrics as prom_metrics
+
+                    prom_metrics.question_gen_retries.labels(mode=mode, stage=stage).inc()
                     telemetry.emit(
                         "question_generation_retry",
                         mode=mode,
@@ -1202,6 +1238,9 @@ class AIService:
         # 폴백 전환률을 수치로 봐야 한다. 초급에 롤플레이·의견이 배정되면서 문장 수 제약을
         # 지키기 어려운 조합이 늘었는지, 아니면 프로바이더 장애가 원인인지 구분하려면
         # reason 과 슬롯 수가 함께 필요하다.
+        from app.services.metrics import metrics as prom_metrics
+
+        prom_metrics.question_gen_fallbacks.labels(mode=mode, stage=stage).inc()
         telemetry.emit(
             "question_generation_fallback",
             mode=mode,
