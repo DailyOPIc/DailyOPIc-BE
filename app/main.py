@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import prometheus_client
 from fastapi import FastAPI
 from pydantic import TypeAdapter
 
@@ -18,6 +19,7 @@ from app.services.auth import AuthService
 from app.services.questions import QuestionPatternRepository
 from app.services.revenuecat import RevenueCatClient
 from app.services.state import FirestoreStateStore
+from app.services.metrics import metrics
 from app.services.telemetry import RequestTimer, emit, stable_hash
 from app.services.rate_limit import (
     RateLimitExceeded,
@@ -84,23 +86,40 @@ app = FastAPI(
 
 @app.middleware("http")
 async def request_telemetry(request, call_next):
+    path = request.url.path
+    if path.startswith("/metrics"):
+        return await call_next(request)
     timer = RequestTimer()
     request_id = request.headers.get("Idempotency-Key")
+    route = request.scope.get("route")
+    path_template = route.path if route else path
     try:
         response = await call_next(request)
     except Exception:
+        metrics.http_requests_total.labels(
+            method=request.method, path_template=path_template, status="500",
+        ).inc()
+        metrics.http_request_duration.labels(
+            method=request.method, path_template=path_template,
+        ).observe(timer.latency_ms / 1000)
         emit(
             "request_failed",
             method=request.method,
-            path=request.url.path,
+            path=path,
             operationIdHash=stable_hash(request_id),
             latencyMs=timer.latency_ms,
         )
         raise
+    metrics.http_requests_total.labels(
+        method=request.method, path_template=path_template, status=str(response.status_code),
+    ).inc()
+    metrics.http_request_duration.labels(
+        method=request.method, path_template=path_template,
+    ).observe(timer.latency_ms / 1000)
     emit(
         "request_completed",
         method=request.method,
-        path=request.url.path,
+        path=path,
         status=response.status_code,
         operationIdHash=stable_hash(request_id),
         latencyMs=timer.latency_ms,
@@ -112,6 +131,7 @@ async def request_telemetry(request, call_next):
 async def endpoint_rate_limit(request, call_next):
     if request.url.path in {
         "/health",
+        "/metrics",
         "/v1/admob/ssv",
         "/v1/iap/revenuecat-webhook",
     }:
@@ -158,3 +178,4 @@ async def endpoint_rate_limit(request, call_next):
 
 
 app.include_router(router)
+app.mount("/metrics", prometheus_client.make_asgi_app())
