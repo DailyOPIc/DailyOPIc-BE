@@ -188,7 +188,7 @@ WEB_ORIGINS = [
     origin.strip()
     for origin in os.environ.get(
         "CORS_ALLOW_ORIGINS",
-        "https://dailyopic.vercel.app,http://localhost:5173",
+        "https://www.dailyopic.link,https://dailyopic.link,https://dailyopic.vercel.app,http://localhost:5173",
     ).split(",")
     if origin.strip()
 ]
