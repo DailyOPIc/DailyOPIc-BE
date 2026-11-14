@@ -1,6 +1,7 @@
 """P13 — 사용자가 시작한 AI 작업은 절대 무료가 아니다.
 
-계약: 새 데일리 세트 1개 = 데일리 토큰 1개, AI 분석 1회 = 데일리 토큰 1개(추가).
+계약: 오늘의 기본 세트(앱 진입 시 자동)는 무료. 새로고침 세트 1개 = 데일리 토큰 1개,
+AI 분석 1회 = 데일리 토큰 1개.
 이 파일은 그 계약을 서버가 강제한다는 것을 증명한다 — 원자적 차감, 멱등,
 동시성, 실패 환불, 그리고 "계량되지 않은 AI 경로가 하나도 없음".
 """
@@ -117,16 +118,13 @@ def test_generation_and_each_analysis_each_cost_one_token(plus_plan: None) -> No
         start = _remaining(client)
 
         question_set = _create_set(client)
-        assert _remaining(client) == start - 1, "새 세트 = 토큰 1개"
+        assert _remaining(client) == start, "오늘의 기본 세트 = 무료"
 
         assert _evaluate(client, question_set).status_code == 200
-        assert _remaining(client) == start - 2, "분석 1회 = 토큰 1개 추가"
+        assert _remaining(client) == start - 1, "분석 1회 = 토큰 1개"
 
         assert _evaluate(client, question_set, index=1).status_code == 200
-        assert _remaining(client) == start - 3, "분석 2회 = 토큰 2개"
-
-        # 세트 생성 + 분석 1회 = 정상 데일리 1사이클 = 토큰 2개.
-        assert (start - 1) - (start - 3) == 2
+        assert _remaining(client) == start - 2, "분석 2회 = 토큰 2개"
 
 
 def test_user_reanalysis_costs_another_token(plus_plan: None) -> None:
@@ -142,7 +140,8 @@ def test_user_reanalysis_costs_another_token(plus_plan: None) -> None:
 
 def test_no_token_rejects_analysis_before_calling_the_provider() -> None:
     with TestClient(app) as client:
-        question_set = _create_set(client)  # 무료 토큰 1개를 세트가 소진
+        question_set = _create_set(client)  # 기본 세트는 무료
+        assert _evaluate(client, question_set, index=1).status_code == 200  # 토큰 소진
         assert _remaining(client) == 0
 
         spy = CountingAIService(client.app.state.ai_service)
@@ -211,13 +210,7 @@ def test_missing_idempotency_key_is_rejected_without_charge(plus_plan: None) -> 
 
 def test_two_racing_operations_split_the_last_token() -> None:
     with TestClient(app) as client:
-        question_set = _create_set(client)  # 무료 토큰 소진
-        reward = client.post(
-            "/v1/ad-rewards/intents",
-            headers=_headers(),
-            json={"purpose": "practice_credits"},
-        ).json()
-        _verify_reward(client, reward["nonce"])
+        question_set = _create_set(client)  # 기본 세트는 무료
         assert _remaining(client) == 1  # 남은 토큰 정확히 1개
 
         spy = CountingAIService(client.app.state.ai_service, delay=0.2)
@@ -352,7 +345,6 @@ AI_CALL_SITES = {
 
 # 위 헬퍼를 호출하는 라우트는 반드시 자기 안에서 데일리/모의 쿼터를 잡아야 한다.
 HELPER_CALLERS_REQUIRING_A_METER = {
-    "create_practice_set": "reserve_practice",
     "create_review_set": "reserve_practice",
     "refresh_practice_set": "reserve_practice",
     "start_mock_session": "reserve_mock",
