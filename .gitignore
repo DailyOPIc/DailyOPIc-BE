@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 firestore-debug.log
+
+# graphify 로컬 지식 그래프(자동 생성물, 커밋하지 않음)
+graphify-out/

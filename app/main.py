@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import prometheus_client
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import TypeAdapter
 
 from app.api.routes import router
@@ -177,3 +179,23 @@ async def endpoint_rate_limit(request, call_next):
 
 app.include_router(router)
 app.mount("/metrics", prometheus_client.make_asgi_app())
+
+
+# 웹앱(브라우저) 요청 허용. 가장 마지막에 추가해야 가장 바깥에서 실행되어
+# 프리플라이트(OPTIONS)가 레이트 리밋 · 인증에 걸리지 않고, 에러 응답에도 CORS 헤더가 붙는다.
+# 운영 도메인이 바뀌면 CORS_ALLOW_ORIGINS(쉼표 구분) 환경변수로 덮어쓴다.
+WEB_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "CORS_ALLOW_ORIGINS",
+        "https://dailyopic.vercel.app,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=WEB_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Firebase-AppCheck"],
+    max_age=600,
+)
