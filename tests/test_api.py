@@ -127,7 +127,7 @@ def test_practice_quota_and_reward_flow() -> None:
         assert health.status_code == 200
         assert health.json()["status"] == "ok"
 
-        # 토큰 모델: 초기 데일리 세트 생성 = 토큰 1개(무료는 하루 1세트).
+        # 오늘의 기본 세트는 앱 진입 시 자동 호출이라 토큰을 쓰지 않는다.
         question_set = client.post(
             "/v1/question-sets/practice",
             headers=_headers(),
@@ -136,7 +136,7 @@ def test_practice_quota_and_reward_flow() -> None:
         assert "setToken" not in question_set
         assert [item["number"] for item in question_set["questions"]] == list(range(2, 16))
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 0  # 세트 1개 소진
+        assert usage["freeRemaining"] == 1  # 기본 세트는 무료
 
         form = {
             "setId": question_set["setId"],
@@ -144,8 +144,14 @@ def test_practice_quota_and_reward_flow() -> None:
             "transcript": "I read several news sources every morning because I want balanced information.",
             "targetLevel": "IH",
         }
-        # P13: 분석도 사용자가 시작한 AI 작업이다 → 토큰 1개.
-        # 세트가 하루치 무료 토큰을 이미 썼으므로 분석은 402로 막힌다.
+        # P13: 분석은 사용자가 시작한 AI 작업이다 → 토큰 1개.
+        analysis = client.post(
+            "/v1/evaluations/practice",
+            headers=_headers(str(uuid.uuid4())),
+            data=form,
+        )
+        assert analysis.status_code == 200, analysis.text
+        # 하루치 무료 토큰을 분석이 썼으므로 다음 분석은 402로 막힌다.
         blocked_analysis = client.post(
             "/v1/evaluations/practice",
             headers=_headers(str(uuid.uuid4())),
@@ -213,9 +219,9 @@ def test_daily_pool_is_archived_and_refresh_consumes_a_token() -> None:
         assert [item["number"] for item in first_set["questions"]] == list(range(2, 16))
         assert all(item["examSection"] != "introduction" for item in first_set["questions"])
 
-        # 초기 세트가 토큰 1개 소진(무료 1세트).
+        # 기본 세트는 무료. 무료 토큰 1개는 리프레시로 쓴다.
         usage = client.get("/v1/usage", headers=_headers()).json()
-        assert usage["freeRemaining"] == 0
+        assert usage["freeRemaining"] == 1
 
         # 재요청은 같은 세트를 캐시 반환(토큰 미소모).
         archived = client.post(
@@ -225,6 +231,13 @@ def test_daily_pool_is_archived_and_refresh_consumes_a_token() -> None:
         )
         assert archived.status_code == 200, archived.text
         assert archived.json()["setId"] == first_set["setId"]
+
+        free_refresh = client.post(
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "daily-refresh-free"},
+            json={**payload, "adjustment": "same"},
+        )
+        assert free_refresh.status_code == 200, free_refresh.text
 
         # 리프레시는 토큰 필요 → 무료 소진 상태라 402.
         blocked = client.post(

@@ -675,8 +675,18 @@ def test_basic_plan_gets_three_daily_tokens() -> None:
     }
     with TestClient(app) as client:
         _post_webhook(client, _purchase_event("basic", event_id="b-quota"))
-        # 초기 데일리 세트 = 토큰 1개.
+        # 오늘의 기본 세트는 무료.
         form = _make_practice_form(client)
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["freeRemaining"] == 3
+
+        # 리프레시 1회 = 토큰 1개.
+        refreshed = client.post(
+            "/v1/question-sets/practice/refresh",
+            headers={**_headers(), "Idempotency-Key": "basic-refresh-first"},
+            json=refresh_payload,
+        )
+        assert refreshed.status_code == 200, refreshed.text
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["freeRemaining"] == 2
 

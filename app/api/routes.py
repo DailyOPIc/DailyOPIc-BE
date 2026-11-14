@@ -841,33 +841,9 @@ async def create_practice_set(
     )
     if reservation.status == "cached" and reservation.result:
         return QuestionSetResponse.model_validate(reservation.result)
-    # 토큰 모델: 하루 첫 데일리 세트 생성 시 토큰 1개 소모(세트당 소모).
-    plan = await _current_plan(request, user.uid)
-    limits = plans.limits_for(plan)
-    token_request_id = hashlib.sha256(
-        f"{user.uid}:daily_token:{date_key}".encode()
-    ).hexdigest()
-    try:
-        await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
-        )
-    except UsageLimitExceeded as error:
-        await request.app.state.state_store.fail_operation(
-            uid=user.uid,
-            operation=operation,
-            operation_id=operation_id,
-            retryable=False,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"code": "practice_quota_exhausted", "message": str(error)},
-        ) from error
-    except RequestAlreadyProcessing as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "request_processing", "operationId": operation_id},
-            headers={"Retry-After": "2"},
-        ) from error
+    # 핫픽스: 앱 진입 시 자동으로 불리는 오늘의 기본 세트는 토큰을 쓰지 않는다.
+    # 무료 플랜 토큰이 하루 1개라, 앱을 여는 것만으로 그날 토큰이 사라졌다.
+    # 토큰은 사용자가 시작한 작업(새로고침·AI 분석·단어 생성·코칭)에만 쓴다.
     try:
         response = await _create_daily_pool(
             request,
@@ -878,11 +854,6 @@ async def create_practice_set(
             date_key=date_key,
             set_id=free_set_id,
         )
-        await request.app.state.state_store.finalize_request(
-            token_request_id,
-            {"setId": response.set_id, "setHash": response.set_hash},
-            request.app.state.request_result_ttl_hours,
-        )
         await request.app.state.state_store.complete_operation(
             uid=user.uid,
             operation=operation,
@@ -892,7 +863,6 @@ async def create_practice_set(
         )
         return response
     except Exception:
-        await request.app.state.state_store.fail_request(token_request_id)
         await request.app.state.state_store.fail_operation(
             uid=user.uid,
             operation=operation,
