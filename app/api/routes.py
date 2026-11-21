@@ -122,6 +122,11 @@ def _spends_purchased_tokens(user: CurrentUser) -> bool:
     return user.platform == "web"
 
 
+def _ad_free_client(user: CurrentUser) -> bool:
+    """광고를 띄울 수 없는 화면(웹, iOS 앱 안의 웹 화면): 광고 게이트를 자동 통과시킨다."""
+    return user.platform == "web" or user.client == "ios-app"
+
+
 async def _current_plan(request: Request, uid: str) -> Plan:
     """현재 유효 플랜: 앱 구독(RevenueCat)과 웹 이용권(토스) 중 높은 쪽(만료/미존재 → free)."""
     store = request.app.state.state_store
@@ -427,7 +432,7 @@ async def _ensure_initial_level(
         return
     if int(profile["beforeAdjust"]) == initial_level:
         return
-    if user.platform != "web":
+    if not _ad_free_client(user):
         _target_level_change_required(
             "Self Assessment 단계를 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
         )
@@ -2291,7 +2296,7 @@ async def create_reward_intent(
     # 웹에는 리워드 광고가 없으므로 모의고사 게이트는 웹 요청이면 플랜과 상관없이 통과한다.
     # (무료의 평생 1회 체험 한도는 회차 생성에서 따로 강제된다.)
     auto_verify = plans.reward_auto_verify(plan, payload.purpose) or (
-        user.platform == "web" and payload.purpose in _MOCK_REWARD_PURPOSES
+        _ad_free_client(user) and payload.purpose in _MOCK_REWARD_PURPOSES
     )
     max_daily_reward_count = plans.reward_max_for(plan, payload.purpose)
     if max_daily_reward_count <= 0:

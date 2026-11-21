@@ -258,3 +258,43 @@ def test_web_level_mismatch_updates_level_instead_of_blocking(monkeypatch: pytes
             json={"targetLevel": "AL", "background": {"interests": ["news"]}},
         )
         assert r.status_code == code, r.text
+
+
+@pytest.mark.parametrize(("client_header", "status"), [("ios-app", "verified"), (None, "pending")])
+def test_ios_app_web_screen_skips_ad_gates(monkeypatch: pytest.MonkeyPatch, client_header, status) -> None:
+    # iOS 앱 안의 웹 화면에는 광고가 없으므로 모의고사 게이트를 자동 통과한다.
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": "1:1:ios:x"})
+    headers = {**_headers(), **({"X-DailyOPIc-Client": client_header} if client_header else {})}
+    with TestClient(app) as client:
+        intent = client.post("/v1/ad-rewards/intents", json={"purpose": "mock_start", "sessionHash": "h" * 64}, headers=headers)
+        assert intent.status_code == 200, intent.text
+        assert intent.json()["status"] == status
+
+
+def test_ios_app_web_screen_cannot_spend_web_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 앱 안 웹 화면도 iOS 앱이다: 웹에서 산 보유 토큰은 보이지도 쓰이지도 않는다(App Store 3.1.3).
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": "1:1:ios:x"})
+    with TestClient(app) as client:
+        import asyncio
+
+        store = client.app.state.state_store
+        asyncio.run(store.create_web_order(
+            {"orderId": "web_shell", "uid": USER_ID, "productId": "tokens_10", "amount": 2900,
+             "grant": {"type": "tokens", "amount": 5}, "status": "pending"}
+        ))
+        asyncio.run(store.complete_web_order("web_shell", payment_key="pk"))
+        usage = client.get("/v1/usage", headers={**_headers(), "X-DailyOPIc-Client": "ios-app"}).json()
+        assert usage["purchasedTokens"] == 0
+
+
+def test_cors_allows_delete_and_client_header() -> None:
+    with TestClient(app) as client:
+        r = client.options(
+            "/v1/users/me",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "DELETE",
+                "Access-Control-Request-Headers": "authorization,x-firebase-appcheck,x-dailyopic-client",
+            },
+        )
+        assert r.status_code == 200, r.text
