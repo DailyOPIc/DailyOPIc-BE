@@ -661,6 +661,9 @@ class RevenueCatEvent(BaseModel):
     expiration_at_ms: int | None = None
     purchased_at_ms: int | None = None
     store: str | None = None
+    # TRANSFER 이벤트(구매 복원으로 구독이 다른 사용자로 이동)에는 app_user_id가 없다.
+    transferred_from: list[str] | None = None
+    transferred_to: list[str] | None = None
 
 
 class RevenueCatWebhook(BaseModel):

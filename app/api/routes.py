@@ -23,7 +23,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import TypeAdapter, ValidationError
 
 from app.models.api import (
@@ -806,6 +806,19 @@ async def update_study_plan(
         },
     )
     return StudyPlanResponse(configured=True, studyPlan=_study_plan_settings(stored))
+
+
+@router.delete("/v1/users/me", status_code=204)
+async def delete_account(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> Response:
+    """앱 내 계정 삭제(App Store 5.1.1(v)). 데이터를 먼저 지우고 Firebase 사용자를 지운다.
+    중간에 실패해도 다시 호출하면 남은 것만 지운다."""
+    removed = await request.app.state.state_store.delete_user_data(user.uid)
+    await request.app.state.auth_service.delete_firebase_user(user.uid)
+    logger.info("account deleted uidHash=%s documents=%d", _uid_hash(user.uid), removed)
+    return Response(status_code=204)
 
 
 @router.post("/v1/question-sets/practice", response_model=QuestionSetResponse)
@@ -2160,17 +2173,35 @@ async def revenuecat_webhook(
         )
 
     event = payload.event
+    event_type = event.type.upper()
+    event_id = event.id or _payload_hash(payload.model_dump(mode="json"))
+    if event_type == "TRANSFER":
+        # 구매 복원으로 구독이 다른 uid로 옮겨졌다(예: 익명 계정 → 웹에서 먼저 만든 계정).
+        # app_user_id가 없으므로 받는 쪽·주는 쪽을 각각 RevenueCat 기준으로 다시 맞춘다.
+        uids = list(dict.fromkeys(
+            u.strip() for u in [*(event.transferred_to or []), *(event.transferred_from or [])] if u and u.strip()
+        ))
+        if not uids:
+            raise HTTPException(status_code=422, detail={"code": "missing_app_user_id"})
+        for transfer_uid in uids:
+            await _sync_revenuecat_user(request, transfer_uid, f"{event_id}:{transfer_uid}", event_type)
+        return {"status": "ok", "transferred": str(len(uids))}
+
     uid = (event.app_user_id or event.original_app_user_id or "").strip()
     if not uid:
         raise HTTPException(
             status_code=422, detail={"code": "missing_app_user_id"}
         )
+    return await _sync_revenuecat_user(request, uid, event_id, event_type)
 
-    event_id = event.id or _payload_hash(payload.model_dump(mode="json"))
+
+async def _sync_revenuecat_user(
+    request: Request, uid: str, event_id: str, event_type: str
+) -> dict[str, str]:
+    """RevenueCat 최신 CustomerInfo로 이 uid의 엔타이틀먼트를 맞춘다(이벤트 단위 멱등)."""
     if await request.app.state.state_store.is_iap_event_completed(event_id):
         return {"status": "duplicate"}
 
-    event_type = event.type.upper()
     try:
         customer_info = await request.app.state.revenuecat.get_customer_info(uid)
     except RevenueCatAPIError as error:

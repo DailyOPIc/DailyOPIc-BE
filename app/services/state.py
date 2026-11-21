@@ -277,6 +277,12 @@ class StateStore(ABC):
     ) -> dict[str, Any]: ...
 
     @abstractmethod
+    async def delete_user_data(self, uid: str) -> int:
+        """계정 삭제: 이 uid의 학습·사용량·프로필 데이터를 지우고 지운 문서 수를 돌려준다.
+
+        결제 감사 기록(iapEvents)은 환불·분쟁 대응을 위해 남긴다."""
+
+    @abstractmethod
     async def apply_question_set_adjustment(
         self,
         *,
@@ -998,6 +1004,25 @@ class InMemoryStateStore(StateStore):
                 previous=previous,
                 reward_consumed=reward_consumed,
             )
+
+    async def delete_user_data(self, uid: str) -> int:
+        async with self._lock:
+            removed = 0
+            stores = (
+                self._usage, self._requests, self._rewards, self._question_sets,
+                self._question_histories, self._profiles, self._operations,
+                self._mock_sessions, self._entitlements, self._study_plans,
+            )
+            for store in stores:
+                for key in list(store):
+                    value = store[key]
+                    owned = key == uid or key.startswith(f"{uid}:") or (
+                        isinstance(value, dict) and value.get("uid") == uid
+                    )
+                    if owned:
+                        del store[key]
+                        removed += 1
+            return removed
 
     async def get_study_plan(self, uid: str) -> dict[str, Any] | None:
         async with self._lock:
@@ -1741,6 +1766,32 @@ class FirestoreStateStore(StateStore):
             )
 
         await asyncio.to_thread(write)
+
+    # uid 필드로 찾아 지우는 컬렉션. userProfiles는 문서 id가 uid라 따로 지운다.
+    _USER_OWNED_COLLECTIONS = (
+        "dailyUsage", "aiRequests", "adRewardIntents", "questionSets",
+        "questionHistories", "mockSessions", "operationRequests",
+    )
+
+    async def delete_user_data(self, uid: str) -> int:
+        def run() -> int:
+            removed = 0
+            batch = self._client.batch()
+            pending = 0
+            for name in self._USER_OWNED_COLLECTIONS:
+                for snapshot in self._client.collection(name).where("uid", "==", uid).stream():
+                    batch.delete(snapshot.reference)
+                    pending += 1
+                    removed += 1
+                    if pending == 400:  # Firestore 배치 한도(500) 아래에서 끊어 커밋
+                        batch.commit()
+                        batch = self._client.batch()
+                        pending = 0
+            batch.delete(self._client.collection("userProfiles").document(uid))
+            batch.commit()
+            return removed + 1
+
+        return await asyncio.to_thread(run)
 
     async def get_study_plan(self, uid: str) -> dict[str, Any] | None:
         def read() -> dict[str, Any] | None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import logging
 import uuid
@@ -25,6 +26,13 @@ class AuthService:
         self._settings = settings
         if not firebase_admin._apps:
             firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id})
+
+    async def delete_firebase_user(self, uid: str) -> None:
+        """계정 삭제의 마지막 단계. 이미 없는 사용자는 성공으로 본다(재시도 안전)."""
+        try:
+            await asyncio.to_thread(auth.delete_user, uid)
+        except auth.UserNotFoundError:
+            logger.info("Firebase user already deleted")
 
     async def authenticate(
         self,
