@@ -23,11 +23,13 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import TypeAdapter, ValidationError
 import httpx
 
 from app.models.api import (
+    ActivityRewardRequest,
+    ActivityRewardResponse,
     WalletResponse,
     WebConfirmRequest,
     WebOrderRequest,
@@ -114,6 +116,17 @@ MOCK_AUDIO_AGGREGATE_MAX_BYTES = 30 * 1024 * 1024
 # 학습 계획 설정 스키마 버전. 서버가 매긴다 — 클라이언트가 보내면 자기 문서의
 # 해석 방식을 스스로 정하게 된다.
 STUDY_PLAN_SCHEMA_VERSION = 1
+
+
+def _spends_purchased_tokens(user: CurrentUser) -> bool:
+    """웹에서 산 보유 토큰은 웹 요청에서만 쓴다. App Store 규정상 앱 밖에서 산 소모성 상품을
+    앱에서 쓰게 하려면 같은 상품을 인앱결제로도 팔아야 해서, iOS 앱은 하루 토큰 · 구독만 쓴다."""
+    return user.platform == "web"
+
+
+def _ad_free_client(user: CurrentUser) -> bool:
+    """광고를 띄울 수 없는 화면(웹, iOS 앱 안의 웹 화면): 광고 게이트를 자동 통과시킨다."""
+    return user.platform == "web" or user.client == "ios-app"
 
 
 async def _current_plan(request: Request, uid: str) -> Plan:
@@ -402,6 +415,9 @@ def _question_set_response_from_record(
     )
 
 
+_WEB_LEVEL_CHANGES_PER_DAY = 20
+
+
 async def _ensure_initial_level(
     request: Request, user: CurrentUser, initial_level: int
 ) -> None:
@@ -416,10 +432,36 @@ async def _ensure_initial_level(
         except RewardNotVerified as error:
             _target_level_change_required(str(error))
         return
-    if int(profile["beforeAdjust"]) != initial_level:
+    if int(profile["beforeAdjust"]) == initial_level:
+        return
+    if not _ad_free_client(user):
         _target_level_change_required(
             "Self Assessment 단계를 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
         )
+    # 웹에는 리워드 광고가 없다. 웹 설정(브라우저에 저장된 단계)과 서버 단계가 다르면
+    # 문제 생성을 막지 않고 웹 설정으로 바로 맞춘다(자동 검증된 리워드로 기존 경로를 탄다).
+    nonce = secrets.token_urlsafe(32)
+    try:
+        await request.app.state.state_store.create_reward_intent(
+            nonce=nonce,
+            uid=user.uid,
+            purpose=RewardPurpose.TARGET_LEVEL_CHANGE,
+            session_hash=None,
+            date_key=_date_key(),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            auto_verify=True,
+            practice_credit_amount=0,
+            # ponytail: 웹 단계 변경 하루 상한을 넉넉히 둔다(설정 화면에서만 바뀜)
+            max_daily_reward_count=_WEB_LEVEL_CHANGES_PER_DAY,
+        )
+    except UsageLimitExceeded:
+        _target_level_change_required("오늘은 단계를 더 바꿀 수 없어요. 내일 다시 바꿔 주세요.")
+    try:
+        await request.app.state.state_store.set_initial_level(
+            uid=user.uid, initial_level=initial_level, reward_nonce=nonce
+        )
+    except RewardNotVerified as error:
+        _target_level_change_required(str(error))
 
 
 def _daily_record_matches(
@@ -817,6 +859,19 @@ async def update_study_plan(
     return StudyPlanResponse(configured=True, studyPlan=_study_plan_settings(stored))
 
 
+@router.delete("/v1/users/me", status_code=204)
+async def delete_account(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> Response:
+    """앱 내 계정 삭제(App Store 5.1.1(v)). 데이터를 먼저 지우고 Firebase 사용자를 지운다.
+    중간에 실패해도 다시 호출하면 남은 것만 지운다."""
+    removed = await request.app.state.state_store.delete_user_data(user.uid)
+    await request.app.state.auth_service.delete_firebase_user(user.uid)
+    logger.info("account deleted uidHash=%s documents=%d", _uid_hash(user.uid), removed)
+    return Response(status_code=204)
+
+
 # --- 웹 결제(토스페이먼츠 일반결제) -----------------------------------------------
 
 
@@ -1059,7 +1114,7 @@ async def create_review_set(
     ).hexdigest()
     try:
         await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
+            user.uid, date_key, token_request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         await request.app.state.state_store.fail_operation(
@@ -1140,7 +1195,7 @@ async def refresh_practice_set(
     limits = plans.limits_for(plan)
     try:
         await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, request_id, limits.practice_daily
+            user.uid, date_key, request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         await request.app.state.state_store.fail_operation(
@@ -1274,7 +1329,7 @@ async def generate_today_vocabulary_set(
     # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
+            user.uid, date_key, token_request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         raise HTTPException(
@@ -1357,7 +1412,7 @@ async def coach_vocabulary_speaking(
     # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
+            user.uid, date_key, token_request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         raise HTTPException(
@@ -2202,8 +2257,10 @@ async def usage(
         mockAvailable=mock_available,
         mockRemaining=mock_remaining,
         mockSessionStage=(str(active_mock["stage"]) if active_mock else None),
-        purchasedTokens=int(
-            (await request.app.state.state_store.get_wallet(user.uid)).get("purchasedTokens") or 0
+        purchasedTokens=(
+            int((await request.app.state.state_store.get_wallet(user.uid)).get("purchasedTokens") or 0)
+            if _spends_purchased_tokens(user)
+            else 0
         ),
     )
 
@@ -2222,6 +2279,60 @@ _REWARD_QUOTA_MESSAGES: dict[RewardPurpose, str] = {
 _REWARD_QUOTA_DEFAULT_MESSAGE = "오늘 받을 수 있는 보상을 모두 사용했어요. 내일 다시 시도해 주세요."
 
 
+_MOCK_REWARD_PURPOSES = {
+    RewardPurpose.MOCK_START,
+    RewardPurpose.MOCK_ADJUSTMENT,
+    RewardPurpose.MOCK_RESULT,
+}
+
+
+# 오픽게임 하루 세트: 그날 첫 요청이 만들고(AI, 세트 5개 동시), 이후엔 저장본을 준다.
+# ponytail: 인스턴스 안에서만 잠근다 — 여러 인스턴스가 동시에 첫 요청을 받으면 한두 번 더 만들 수 있다(마지막 저장본이 남음).
+_game_pool_locks: dict[str, asyncio.Lock] = {}
+
+
+@router.get("/v1/games/daily-sets")
+async def daily_game_sets(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> dict[str, object]:
+    date_key = _date_key()
+    store = request.app.state.state_store
+    sets = await store.get_game_pool(date_key)
+    if sets is None:
+        lock = _game_pool_locks.setdefault(date_key, asyncio.Lock())
+        async with lock:
+            sets = await store.get_game_pool(date_key)
+            if sets is None:
+                try:
+                    generated = await request.app.state.ai_service.generate_game_sets()
+                except AIServiceError as error:
+                    raise HTTPException(
+                        status_code=503, detail={"code": "game_sets_unavailable", "message": str(error)}
+                    ) from error
+                sets = [s.model_dump(mode="json", exclude_none=True) for s in generated]
+                await store.save_game_pool(date_key, sets)
+    return {"dateKey": date_key, "sets": sets}
+
+
+# 활동 보상 하루 한도(종류별 보너스 토큰 수). 화면이 "했다"고 알리는 것을 믿는 구조라
+# 한도가 곧 악용 상한이다: 하루 최대 +4개.
+# ponytail: 서버가 활동을 직접 확인하지 않는다 — 악용이 보이면 상자는 분석 기록 수, 게임은 서버 기록으로 확인한다.
+ACTIVITY_REWARD_LIMITS = {"chest": 2, "game": 1, "goal": 1}
+
+
+@router.post("/v1/activity-rewards", response_model=ActivityRewardResponse)
+async def claim_activity_reward(
+    payload: ActivityRewardRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> ActivityRewardResponse:
+    result = await request.app.state.state_store.grant_activity_bonus(
+        user.uid, _date_key(), payload.kind, ACTIVITY_REWARD_LIMITS[payload.kind]
+    )
+    return ActivityRewardResponse(granted=result["granted"], bonusRemaining=result["bonusRemaining"])
+
+
 @router.post("/v1/ad-rewards/intents", response_model=RewardIntentResponse)
 async def create_reward_intent(
     payload: RewardIntentRequest,
@@ -2231,7 +2342,11 @@ async def create_reward_intent(
     settings = request.app.state.settings
     plan = await _current_plan(request, user.uid)
     # 유료 플랜은 모의고사 광고 게이트를 광고 없이 즉시 충족(auto-verify).
-    auto_verify = plans.reward_auto_verify(plan, payload.purpose)
+    # 웹에는 리워드 광고가 없으므로 모의고사 게이트는 웹 요청이면 플랜과 상관없이 통과한다.
+    # (무료의 평생 1회 체험 한도는 회차 생성에서 따로 강제된다.)
+    auto_verify = plans.reward_auto_verify(plan, payload.purpose) or (
+        _ad_free_client(user) and payload.purpose in _MOCK_REWARD_PURPOSES
+    )
     max_daily_reward_count = plans.reward_max_for(plan, payload.purpose)
     if max_daily_reward_count <= 0:
         # 유료 플랜은 데일리/리프레시 광고 보너스를 사용하지 않음 → 결제 유도.
@@ -2301,17 +2416,35 @@ async def revenuecat_webhook(
         )
 
     event = payload.event
+    event_type = event.type.upper()
+    event_id = event.id or _payload_hash(payload.model_dump(mode="json"))
+    if event_type == "TRANSFER":
+        # 구매 복원으로 구독이 다른 uid로 옮겨졌다(예: 익명 계정 → 웹에서 먼저 만든 계정).
+        # app_user_id가 없으므로 받는 쪽·주는 쪽을 각각 RevenueCat 기준으로 다시 맞춘다.
+        uids = list(dict.fromkeys(
+            u.strip() for u in [*(event.transferred_to or []), *(event.transferred_from or [])] if u and u.strip()
+        ))
+        if not uids:
+            raise HTTPException(status_code=422, detail={"code": "missing_app_user_id"})
+        for transfer_uid in uids:
+            await _sync_revenuecat_user(request, transfer_uid, f"{event_id}:{transfer_uid}", event_type)
+        return {"status": "ok", "transferred": str(len(uids))}
+
     uid = (event.app_user_id or event.original_app_user_id or "").strip()
     if not uid:
         raise HTTPException(
             status_code=422, detail={"code": "missing_app_user_id"}
         )
+    return await _sync_revenuecat_user(request, uid, event_id, event_type)
 
-    event_id = event.id or _payload_hash(payload.model_dump(mode="json"))
+
+async def _sync_revenuecat_user(
+    request: Request, uid: str, event_id: str, event_type: str
+) -> dict[str, str]:
+    """RevenueCat 최신 CustomerInfo로 이 uid의 엔타이틀먼트를 맞춘다(이벤트 단위 멱등)."""
     if await request.app.state.state_store.is_iap_event_completed(event_id):
         return {"status": "duplicate"}
 
-    event_type = event.type.upper()
     try:
         customer_info = await request.app.state.revenuecat.get_customer_info(uid)
     except RevenueCatAPIError as error:
@@ -2506,7 +2639,7 @@ async def evaluate_practice(
     date_key = _date_key()
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, request_id, limits.practice_daily
+            user.uid, date_key, request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         raise HTTPException(

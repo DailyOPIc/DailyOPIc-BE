@@ -192,3 +192,144 @@ def test_allowlist_limits_orders_to_listed_verified_emails(monkeypatch: pytest.M
         assert order("token-unverified").status_code == 403
         # 익명·레거시 사용자(이메일 없음)도 막힌다
         assert client.post("/v1/web-payments/orders", json={"productId": "pass_basic_30d"}, headers=_headers()).status_code == 403
+
+
+# --- 보유 토큰은 웹 요청에서만 쓴다 ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_purchased_tokens_are_not_spent_when_not_allowed() -> None:
+    store = InMemoryStateStore()
+    await store.create_web_order(
+        {"orderId": "web_t2", "uid": USER_ID, "productId": "tokens_10", "amount": 2900,
+         "grant": {"type": "tokens", "amount": 3}, "status": "pending"}
+    )
+    await store.complete_web_order("web_t2", payment_key="pk")
+    with pytest.raises(UsageLimitExceeded):
+        await store.reserve_practice(USER_ID, "2026-11-21", "req-ios", free_limit=0, allow_purchased=False)
+    assert (await store.get_wallet(USER_ID))["purchasedTokens"] == 3
+    web = await store.reserve_practice(USER_ID, "2026-11-21", "req-web", free_limit=0, allow_purchased=True)
+    assert web.source == "purchased"
+
+
+@pytest.mark.parametrize(
+    ("app_id", "visible"),
+    [("1:992368032252:web:abc", 5), ("1:992368032252:ios:abc", 0), (None, 0)],
+)
+def test_usage_shows_purchased_tokens_only_to_web(monkeypatch: pytest.MonkeyPatch, app_id, visible) -> None:
+    monkeypatch.setattr(
+        "app.services.auth.app_check.verify_token", lambda token: {"app_id": app_id} if app_id else None
+    )
+    with TestClient(app) as client:
+        store = client.app.state.state_store
+        import asyncio
+
+        asyncio.run(store.create_web_order(
+            {"orderId": "web_vis", "uid": USER_ID, "productId": "tokens_10", "amount": 2900,
+             "grant": {"type": "tokens", "amount": 5}, "status": "pending"}
+        ))
+        asyncio.run(store.complete_web_order("web_vis", payment_key="pk"))
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["purchasedTokens"] == visible
+
+
+@pytest.mark.parametrize(("app_id", "status"), [("1:1:web:x", "verified"), ("1:1:ios:x", "pending")])
+def test_mock_gates_pass_without_ads_only_on_web_for_free_users(monkeypatch: pytest.MonkeyPatch, app_id, status) -> None:
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": app_id})
+    with TestClient(app) as client:
+        intent = client.post(
+            "/v1/ad-rewards/intents",
+            json={"purpose": "mock_start", "sessionHash": "h" * 64},
+            headers=_headers(),
+        )
+        assert intent.status_code == 200, intent.text
+        assert intent.json()["status"] == status
+
+
+@pytest.mark.parametrize(("app_id", "code"), [("1:1:web:x", 200), ("1:1:ios:x", 402)])
+def test_web_level_mismatch_updates_level_instead_of_blocking(monkeypatch: pytest.MonkeyPatch, app_id, code) -> None:
+    # 웹에는 광고가 없으므로 단계가 서버와 달라도 문제 생성이 막히면 안 된다(iOS는 기존대로 광고 필요).
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": app_id})
+    with TestClient(app) as client:
+        assert client.put("/v1/users/me/target-level", headers=_headers(), json={"targetLevel": "IH"}).status_code == 200
+        r = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"targetLevel": "AL", "background": {"interests": ["news"]}},
+        )
+        assert r.status_code == code, r.text
+
+
+@pytest.mark.parametrize(("client_header", "status"), [("ios-app", "verified"), (None, "pending")])
+def test_ios_app_web_screen_skips_ad_gates(monkeypatch: pytest.MonkeyPatch, client_header, status) -> None:
+    # iOS 앱 안의 웹 화면에는 광고가 없으므로 모의고사 게이트를 자동 통과한다.
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": "1:1:ios:x"})
+    headers = {**_headers(), **({"X-DailyOPIc-Client": client_header} if client_header else {})}
+    with TestClient(app) as client:
+        intent = client.post("/v1/ad-rewards/intents", json={"purpose": "mock_start", "sessionHash": "h" * 64}, headers=headers)
+        assert intent.status_code == 200, intent.text
+        assert intent.json()["status"] == status
+
+
+def test_ios_app_web_screen_cannot_spend_web_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 앱 안 웹 화면도 iOS 앱이다: 웹에서 산 보유 토큰은 보이지도 쓰이지도 않는다(App Store 3.1.3).
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": "1:1:ios:x"})
+    with TestClient(app) as client:
+        import asyncio
+
+        store = client.app.state.state_store
+        asyncio.run(store.create_web_order(
+            {"orderId": "web_shell", "uid": USER_ID, "productId": "tokens_10", "amount": 2900,
+             "grant": {"type": "tokens", "amount": 5}, "status": "pending"}
+        ))
+        asyncio.run(store.complete_web_order("web_shell", payment_key="pk"))
+        usage = client.get("/v1/usage", headers={**_headers(), "X-DailyOPIc-Client": "ios-app"}).json()
+        assert usage["purchasedTokens"] == 0
+
+
+def test_cors_allows_delete_and_client_header() -> None:
+    with TestClient(app) as client:
+        r = client.options(
+            "/v1/users/me",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "DELETE",
+                "Access-Control-Request-Headers": "authorization,x-firebase-appcheck,x-dailyopic-client",
+            },
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_activity_rewards_grant_bonus_tokens_up_to_daily_limit() -> None:
+    # 보물상자는 하루 2번, 게임 · 목표는 1번씩 보너스 토큰을 준다. 한도를 넘으면 granted=false.
+    with TestClient(app) as client:
+        chest = [client.post("/v1/activity-rewards", json={"kind": "chest"}, headers=_headers()).json() for _ in range(3)]
+        assert [c["granted"] for c in chest] == [True, True, False]
+        game = [client.post("/v1/activity-rewards", json={"kind": "game"}, headers=_headers()).json() for _ in range(2)]
+        assert [g["granted"] for g in game] == [True, False]
+        assert game[-1]["bonusRemaining"] == 3
+        assert client.get("/v1/usage", headers=_headers()).json()["bonusRemaining"] == 3
+        bad = client.post("/v1/activity-rewards", json={"kind": "free_money"}, headers=_headers())
+        assert bad.status_code == 422
+
+
+def test_daily_game_sets_are_generated_once_and_shared() -> None:
+    # 오픽게임 하루 세트: 첫 요청이 5세트를 만들고, 다음 요청은 같은 세트를 받는다(사용자 공용).
+    with TestClient(app) as client:
+        first = client.get("/v1/games/daily-sets", headers=_headers())
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert len(body["sets"]) == 5
+        assert len(body["sets"][0]["expressions"]) == 12 and len(body["sets"][0]["sentences"]) == 8
+        assert body["sets"][0]["sentences"][0]["blank"] in body["sets"][0]["sentences"][0]["en"]
+        again = client.get("/v1/games/daily-sets", headers=_headers()).json()
+        assert again == body
+
+
+def test_game_sentence_blank_must_be_in_sentence() -> None:
+    from pydantic import ValidationError
+
+    from app.services.games import GameSentence
+
+    with pytest.raises(ValidationError):
+        GameSentence(en="I like coffee a lot.", ko="커피 좋아요.", blank="because", options=["so", "but", "and"])

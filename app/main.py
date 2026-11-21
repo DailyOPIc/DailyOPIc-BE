@@ -197,7 +197,7 @@ WEB_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=WEB_ORIGINS,
-    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Firebase-AppCheck"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Firebase-AppCheck", "X-DailyOPIc-Client"],
     max_age=600,
 )

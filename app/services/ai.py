@@ -41,7 +41,7 @@ from app.models.api import (
 )
 from app.services import answer_quality
 from app.services import telemetry
-from app.services import vocabulary
+from app.services import games, vocabulary
 from app.services.plans import AnalysisDepth
 from app.services.questions import (
     FallbackQuestionGenerator,
@@ -864,6 +864,33 @@ class AIService:
             attempts=attempts,
             usage=usage,
         )
+
+    async def generate_game_sets(self) -> list[games.GameSet]:
+        """오픽게임 하루 세트(SETS_PER_DAY개)를 동시에 만든다. 세트마다 다른 장면(SET_THEMES)을 준다.
+        일부가 실패해도 성공한 세트만 돌려주고, 하나도 없으면 예외(웹은 기본 문제로 돈다)."""
+        if self._mock:
+            return [games.mock_set(n) for n in range(games.SETS_PER_DAY)]
+
+        async def one(theme: str) -> games.GameSet:
+            result = await self._structured(
+                instructions=games.INSTRUCTIONS,
+                input_text=games.input_text(theme, []),
+                schema=games.GameSet,
+                max_attempts=2,
+            )
+            assert isinstance(result.payload, games.GameSet)
+            return result.payload
+
+        outcomes = await asyncio.gather(
+            *(one(theme) for theme in games.SET_THEMES[: games.SETS_PER_DAY]), return_exceptions=True
+        )
+        sets = [o for o in outcomes if isinstance(o, games.GameSet)]
+        failed = len(outcomes) - len(sets)
+        if failed:
+            logger.warning("game set generation partially failed. failed=%s ok=%s", failed, len(sets))
+        if not sets:
+            raise AIServiceUnavailable("game set generation failed")
+        return sets
 
     async def coach_vocabulary(
         self,

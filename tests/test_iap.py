@@ -847,3 +847,44 @@ def test_review_set_available_for_pro() -> None:
         assert response.status_code == 200, response.text
         body = response.json()
         assert [item["number"] for item in body["questions"]] == list(range(2, 16))
+
+
+# --- 구매 복원으로 구독 이동(TRANSFER) ----------------------------------------
+
+
+class _PerUserRevenueCat(_FakeRevenueCatClient):
+    def __init__(self, by_uid: dict[str, RevenueCatCustomerInfo]) -> None:
+        super().__init__()
+        self.by_uid = by_uid
+
+    async def get_customer_info(self, app_user_id: str) -> RevenueCatCustomerInfo:
+        self.calls.append(app_user_id)
+        return self.by_uid[app_user_id]
+
+
+def test_transfer_moves_plan_from_anonymous_to_existing_account() -> None:
+    old_uid, new_uid = USER_ID, "33333333-3333-4333-8333-333333333333"
+    with TestClient(app) as client:
+        assert _post_webhook(client, _purchase_event("pro", event_id="buy-1")).status_code == 200
+
+        revenuecat = _PerUserRevenueCat({new_uid: _customer_info(["pro"]), old_uid: _customer_info([])})
+        transfer = {"type": "TRANSFER", "id": "transfer-1", "transferred_from": [old_uid], "transferred_to": [new_uid]}
+        response = _post_webhook(client, transfer, revenuecat=revenuecat)
+        assert response.status_code == 200, response.text
+        assert revenuecat.calls == [new_uid, old_uid]
+
+        new_caps = client.get("/v1/capabilities", headers={**_headers(), "X-DailyOPIc-User-ID": new_uid}).json()
+        old_caps = client.get("/v1/capabilities", headers=_headers()).json()
+        assert new_caps["plan"] == "pro"
+        assert old_caps["plan"] == "free"
+
+        # 같은 이벤트 재전송은 멱등
+        again = _post_webhook(client, transfer, revenuecat=revenuecat)
+        assert again.status_code == 200
+        assert revenuecat.calls == [new_uid, old_uid]
+
+
+def test_transfer_without_users_is_rejected() -> None:
+    with TestClient(app) as client:
+        response = _post_webhook(client, {"type": "TRANSFER", "id": "transfer-2"}, revenuecat=_PerUserRevenueCat({}))
+        assert response.status_code == 422
