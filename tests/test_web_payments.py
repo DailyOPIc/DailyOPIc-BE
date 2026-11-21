@@ -231,3 +231,16 @@ def test_usage_shows_purchased_tokens_only_to_web(monkeypatch: pytest.MonkeyPatc
         asyncio.run(store.complete_web_order("web_vis", payment_key="pk"))
         usage = client.get("/v1/usage", headers=_headers()).json()
         assert usage["purchasedTokens"] == visible
+
+
+@pytest.mark.parametrize(("app_id", "status"), [("1:1:web:x", "verified"), ("1:1:ios:x", "pending")])
+def test_mock_gates_pass_without_ads_only_on_web_for_free_users(monkeypatch: pytest.MonkeyPatch, app_id, status) -> None:
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": app_id})
+    with TestClient(app) as client:
+        intent = client.post(
+            "/v1/ad-rewards/intents",
+            json={"purpose": "mock_start", "sessionHash": "h" * 64},
+            headers=_headers(),
+        )
+        assert intent.status_code == 200, intent.text
+        assert intent.json()["status"] == status

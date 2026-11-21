@@ -2243,6 +2243,13 @@ _REWARD_QUOTA_MESSAGES: dict[RewardPurpose, str] = {
 _REWARD_QUOTA_DEFAULT_MESSAGE = "오늘 받을 수 있는 보상을 모두 사용했어요. 내일 다시 시도해 주세요."
 
 
+_MOCK_REWARD_PURPOSES = {
+    RewardPurpose.MOCK_START,
+    RewardPurpose.MOCK_ADJUSTMENT,
+    RewardPurpose.MOCK_RESULT,
+}
+
+
 @router.post("/v1/ad-rewards/intents", response_model=RewardIntentResponse)
 async def create_reward_intent(
     payload: RewardIntentRequest,
@@ -2252,7 +2259,11 @@ async def create_reward_intent(
     settings = request.app.state.settings
     plan = await _current_plan(request, user.uid)
     # 유료 플랜은 모의고사 광고 게이트를 광고 없이 즉시 충족(auto-verify).
-    auto_verify = plans.reward_auto_verify(plan, payload.purpose)
+    # 웹에는 리워드 광고가 없으므로 모의고사 게이트는 웹 요청이면 플랜과 상관없이 통과한다.
+    # (무료의 평생 1회 체험 한도는 회차 생성에서 따로 강제된다.)
+    auto_verify = plans.reward_auto_verify(plan, payload.purpose) or (
+        user.platform == "web" and payload.purpose in _MOCK_REWARD_PURPOSES
+    )
     max_daily_reward_count = plans.reward_max_for(plan, payload.purpose)
     if max_daily_reward_count <= 0:
         # 유료 플랜은 데일리/리프레시 광고 보너스를 사용하지 않음 → 결제 유도.
