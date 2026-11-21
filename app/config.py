@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     revenuecat_webhook_auth: str | None = None
     # RevenueCat REST API 조회용 Secret API Key. 서버 환경변수로만 주입한다.
     revenuecat_secret_api_key: SecretStr | None = None
+    # 토스페이먼츠 시크릿 키(test_sk_… / live_sk_…). 없으면 웹 결제 API가 503을 돌려준다.
+    toss_secret_key: SecretStr | None = None
+    # 웹 결제를 허용할 이메일(쉼표 구분). 비어 있으면 모두에게 열린다.
+    # 통신판매업 신고 전에는 토스 심사용 계정만 넣어 둔다.
+    web_payments_allowlist: str | None = None
+    # 토큰 팩 판매 스위치. 퀵오픈 심사가 확정되기 전까지는 끈다.
+    web_token_packs_enabled: bool = False
     minimum_supported_app_version: str = "1.0.0"
     guide_schema_version: int = 2
     question_generation_v2_enabled: bool = True
@@ -40,6 +47,9 @@ class Settings(BaseSettings):
     def validate_required_settings(self) -> "Settings":
         self.openai_api_key = self._clean(self.openai_api_key)
         self.revenuecat_webhook_auth = self._clean(self.revenuecat_webhook_auth)
+        if self.toss_secret_key is not None:
+            toss = self.toss_secret_key.get_secret_value().strip()
+            self.toss_secret_key = SecretStr(toss) if toss else None
         if self.revenuecat_secret_api_key is not None:
             secret = self.revenuecat_secret_api_key.get_secret_value().strip()
             self.revenuecat_secret_api_key = SecretStr(secret) if secret else None

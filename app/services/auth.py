@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 class CurrentUser:
     uid: str
     legacy_install_id: str | None = None
+    # Google 로그인 등으로 확인된 이메일(웹 결제 허용 계정 확인용). 익명·레거시 사용자는 없다.
+    email: str | None = None
 
 
 class AuthService:
@@ -70,9 +72,15 @@ class AuthService:
                 firebase_uid = str(decoded.get("uid") or decoded.get("sub") or "").strip()
                 if not firebase_uid:
                     raise ValueError("Firebase token does not contain a UID")
+                verified_email = (
+                    str(decoded.get("email")).strip().lower()
+                    if decoded.get("email") and decoded.get("email_verified")
+                    else None
+                )
                 return CurrentUser(
                     uid=firebase_uid,
                     legacy_install_id=legacy_install_id,
+                    email=verified_email,
                 )
             except auth.InsufficientPermissionError as error:
                 logger.exception(
