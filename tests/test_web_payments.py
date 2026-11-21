@@ -192,3 +192,42 @@ def test_allowlist_limits_orders_to_listed_verified_emails(monkeypatch: pytest.M
         assert order("token-unverified").status_code == 403
         # 익명·레거시 사용자(이메일 없음)도 막힌다
         assert client.post("/v1/web-payments/orders", json={"productId": "pass_basic_30d"}, headers=_headers()).status_code == 403
+
+
+# --- 보유 토큰은 웹 요청에서만 쓴다 ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_purchased_tokens_are_not_spent_when_not_allowed() -> None:
+    store = InMemoryStateStore()
+    await store.create_web_order(
+        {"orderId": "web_t2", "uid": USER_ID, "productId": "tokens_10", "amount": 2900,
+         "grant": {"type": "tokens", "amount": 3}, "status": "pending"}
+    )
+    await store.complete_web_order("web_t2", payment_key="pk")
+    with pytest.raises(UsageLimitExceeded):
+        await store.reserve_practice(USER_ID, "2026-11-21", "req-ios", free_limit=0, allow_purchased=False)
+    assert (await store.get_wallet(USER_ID))["purchasedTokens"] == 3
+    web = await store.reserve_practice(USER_ID, "2026-11-21", "req-web", free_limit=0, allow_purchased=True)
+    assert web.source == "purchased"
+
+
+@pytest.mark.parametrize(
+    ("app_id", "visible"),
+    [("1:992368032252:web:abc", 5), ("1:992368032252:ios:abc", 0), (None, 0)],
+)
+def test_usage_shows_purchased_tokens_only_to_web(monkeypatch: pytest.MonkeyPatch, app_id, visible) -> None:
+    monkeypatch.setattr(
+        "app.services.auth.app_check.verify_token", lambda token: {"app_id": app_id} if app_id else None
+    )
+    with TestClient(app) as client:
+        store = client.app.state.state_store
+        import asyncio
+
+        asyncio.run(store.create_web_order(
+            {"orderId": "web_vis", "uid": USER_ID, "productId": "tokens_10", "amount": 2900,
+             "grant": {"type": "tokens", "amount": 5}, "status": "pending"}
+        ))
+        asyncio.run(store.complete_web_order("web_vis", payment_key="pk"))
+        usage = client.get("/v1/usage", headers=_headers()).json()
+        assert usage["purchasedTokens"] == visible

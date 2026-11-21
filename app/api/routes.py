@@ -116,6 +116,12 @@ MOCK_AUDIO_AGGREGATE_MAX_BYTES = 30 * 1024 * 1024
 STUDY_PLAN_SCHEMA_VERSION = 1
 
 
+def _spends_purchased_tokens(user: CurrentUser) -> bool:
+    """웹에서 산 보유 토큰은 웹 요청에서만 쓴다. App Store 규정상 앱 밖에서 산 소모성 상품을
+    앱에서 쓰게 하려면 같은 상품을 인앱결제로도 팔아야 해서, iOS 앱은 하루 토큰 · 구독만 쓴다."""
+    return user.platform == "web"
+
+
 async def _current_plan(request: Request, uid: str) -> Plan:
     """현재 유효 플랜: 앱 구독(RevenueCat)과 웹 이용권(토스) 중 높은 쪽(만료/미존재 → free)."""
     store = request.app.state.state_store
@@ -1072,7 +1078,7 @@ async def create_review_set(
     ).hexdigest()
     try:
         await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
+            user.uid, date_key, token_request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         await request.app.state.state_store.fail_operation(
@@ -1153,7 +1159,7 @@ async def refresh_practice_set(
     limits = plans.limits_for(plan)
     try:
         await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, request_id, limits.practice_daily
+            user.uid, date_key, request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         await request.app.state.state_store.fail_operation(
@@ -1287,7 +1293,7 @@ async def generate_today_vocabulary_set(
     # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
+            user.uid, date_key, token_request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         raise HTTPException(
@@ -1370,7 +1376,7 @@ async def coach_vocabulary_speaking(
     # 토큰 확보가 제공자 호출보다 **먼저**다. 잔액이 0이면 AI를 부르지 않는다.
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, token_request_id, limits.practice_daily
+            user.uid, date_key, token_request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         raise HTTPException(
@@ -2215,8 +2221,10 @@ async def usage(
         mockAvailable=mock_available,
         mockRemaining=mock_remaining,
         mockSessionStage=(str(active_mock["stage"]) if active_mock else None),
-        purchasedTokens=int(
-            (await request.app.state.state_store.get_wallet(user.uid)).get("purchasedTokens") or 0
+        purchasedTokens=(
+            int((await request.app.state.state_store.get_wallet(user.uid)).get("purchasedTokens") or 0)
+            if _spends_purchased_tokens(user)
+            else 0
         ),
     )
 
@@ -2537,7 +2545,7 @@ async def evaluate_practice(
     date_key = _date_key()
     try:
         reservation = await request.app.state.state_store.reserve_practice(
-            user.uid, date_key, request_id, limits.practice_daily
+            user.uid, date_key, request_id, limits.practice_daily, allow_purchased=_spends_purchased_tokens(user)
         )
     except UsageLimitExceeded as error:
         raise HTTPException(

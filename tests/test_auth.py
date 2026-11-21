@@ -174,3 +174,11 @@ async def test_expired_id_token_returns_refreshable_code(monkeypatch: pytest.Mon
 
     assert error.value.status_code == 401
     assert error.value.detail["code"] == "expired_id_token"
+
+
+def test_platform_is_read_from_app_check_app_id() -> None:
+    from app.services.auth import _platform_from_app_id
+
+    assert _platform_from_app_id("1:992368032252:web:92707a165d27e2435d9a79") == "web"
+    assert _platform_from_app_id("1:992368032252:ios:53deab3134ce15a55d9a79") == "ios"
+    assert _platform_from_app_id("") is None

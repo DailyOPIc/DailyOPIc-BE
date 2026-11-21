@@ -21,6 +21,17 @@ class CurrentUser:
     legacy_install_id: str | None = None
     # Google 로그인 등으로 확인된 이메일(웹 결제 허용 계정 확인용). 익명·레거시 사용자는 없다.
     email: str | None = None
+    # App Check 토큰(서명됨)의 Firebase 앱 ID로 판별한 요청 출처: "web" | "ios" | None(레거시)
+    platform: str | None = None
+
+
+def _platform_from_app_id(app_id: str) -> str | None:
+    """Firebase 앱 ID(예: 1:992368032252:web:…, 1:992368032252:ios:…)에서 플랫폼을 꺼낸다."""
+    if ":web:" in app_id:
+        return "web"
+    if ":ios:" in app_id:
+        return "ios"
+    return None
 
 
 class AuthService:
@@ -49,7 +60,7 @@ class AuthService:
                 detail={"code": "missing_app_check", "message": "App Check token is required."},
             )
         try:
-            app_check.verify_token(app_check_token)
+            claims = app_check.verify_token(app_check_token)
         except Exception as error:
             logger.warning("Firebase App Check failed: invalid token")
             raise HTTPException(
@@ -57,6 +68,7 @@ class AuthService:
                 detail={"code": "invalid_app_check", "message": "App Check token is invalid."},
             ) from error
         logger.info("Firebase App Check verified")
+        platform = _platform_from_app_id(str((claims or {}).get("app_id") or ""))
 
         legacy_install_id: str | None = None
         if user_id:
@@ -89,6 +101,7 @@ class AuthService:
                     uid=firebase_uid,
                     legacy_install_id=legacy_install_id,
                     email=verified_email,
+                    platform=platform,
                 )
             except auth.InsufficientPermissionError as error:
                 logger.exception(
@@ -176,7 +189,7 @@ class AuthService:
                 },
             )
         logger.warning("Legacy installation UUID authentication accepted outside production")
-        return CurrentUser(uid=legacy_install_id, legacy_install_id=legacy_install_id)
+        return CurrentUser(uid=legacy_install_id, legacy_install_id=legacy_install_id, platform=platform)
 
 
 async def current_user(

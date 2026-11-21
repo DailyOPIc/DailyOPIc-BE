@@ -301,7 +301,7 @@ class StateStore(ABC):
 
     @abstractmethod
     async def reserve_practice(
-        self, uid: str, date_key: str, request_id: str, free_limit: int
+        self, uid: str, date_key: str, request_id: str, free_limit: int, *, allow_purchased: bool = True
     ) -> Reservation: ...
 
     @abstractmethod
@@ -1167,7 +1167,7 @@ class InMemoryStateStore(StateStore):
             return deepcopy(question_set)
 
     async def reserve_practice(
-        self, uid: str, date_key: str, request_id: str, free_limit: int
+        self, uid: str, date_key: str, request_id: str, free_limit: int, *, allow_purchased: bool = True
     ) -> Reservation:
         async with self._lock:
             existing = self._requests.get(request_id)
@@ -1188,7 +1188,7 @@ class InMemoryStateStore(StateStore):
             elif usage["bonusRemaining"] > 0:
                 usage["bonusRemaining"] -= 1
                 source = "bonus"
-            elif int(self._wallets.get(uid, {}).get("purchasedTokens") or 0) > 0:
+            elif allow_purchased and int(self._wallets.get(uid, {}).get("purchasedTokens") or 0) > 0:
                 # 하루 토큰을 다 쓰면 웹에서 산 보유 토큰을 쓴다(매일 사라지지 않음).
                 self._wallets[uid]["purchasedTokens"] -= 1
                 source = "purchased"
@@ -2196,7 +2196,7 @@ class FirestoreStateStore(StateStore):
         return await asyncio.to_thread(run)
 
     async def reserve_practice(
-        self, uid: str, date_key: str, request_id: str, free_limit: int
+        self, uid: str, date_key: str, request_id: str, free_limit: int, *, allow_purchased: bool = True
     ) -> Reservation:
         usage_id = self._usage_id(uid, date_key)
 
@@ -2225,7 +2225,7 @@ class FirestoreStateStore(StateStore):
                 usage = {**_usage_defaults(), **(snapshot.to_dict() or {})}
                 profile_ref = self._client.collection("userProfiles").document(uid)
                 purchased = 0
-                if usage["freeUsed"] >= free_limit and usage["bonusRemaining"] <= 0:
+                if allow_purchased and usage["freeUsed"] >= free_limit and usage["bonusRemaining"] <= 0:
                     # Firestore 트랜잭션은 읽기를 모두 쓰기 전에 해야 한다.
                     profile = profile_ref.get(transaction=transaction).to_dict() or {}
                     purchased = int(profile.get("purchasedTokens") or 0)
