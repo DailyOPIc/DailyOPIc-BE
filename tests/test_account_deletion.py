@@ -54,3 +54,20 @@ def test_delete_account_treats_missing_firebase_user_as_done(monkeypatch) -> Non
 def test_delete_account_requires_app_check() -> None:
     with TestClient(app) as client:
         assert client.delete("/v1/users/me", headers={"X-DailyOPIc-User-ID": USER_ID}).status_code == 403
+
+
+def test_delete_account_removes_web_pass_and_tokens_but_keeps_orders(monkeypatch) -> None:
+    import asyncio
+
+    monkeypatch.setattr("app.services.auth.auth.delete_user", lambda uid: None)
+    with TestClient(app) as client:
+        store = client.app.state.state_store
+        order = {"orderId": "web_del_1", "uid": USER_ID, "productId": "pass_pro_30d", "amount": 9900,
+                 "grant": {"type": "pass", "plan": "pro", "days": 30}, "status": "pending"}
+        asyncio.run(store.create_web_order(order))
+        asyncio.run(store.complete_web_order("web_del_1", payment_key="pk"))
+        assert client.get("/v1/capabilities", headers=_headers(USER_ID)).json()["plan"] == "pro"
+
+        assert client.delete("/v1/users/me", headers=_headers(USER_ID)).status_code == 204
+        assert client.get("/v1/capabilities", headers=_headers(USER_ID)).json()["plan"] == "free"
+        assert asyncio.run(store.get_web_order("web_del_1"))["status"] == "paid"

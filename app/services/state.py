@@ -25,6 +25,7 @@ from app.services.difficulty import (
     initial_level_from_target,
 )
 from app.services.questions import prompt_hash
+from app.services.web_payments import apply_grant, empty_wallet, revoke_grant
 
 _T = TypeVar("_T")
 _FIRESTORE_CONTENTION_ATTEMPTS = 5
@@ -280,7 +281,8 @@ class StateStore(ABC):
     async def delete_user_data(self, uid: str) -> int:
         """계정 삭제: 이 uid의 학습·사용량·프로필 데이터를 지우고 지운 문서 수를 돌려준다.
 
-        결제 감사 기록(iapEvents)은 환불·분쟁 대응을 위해 남긴다."""
+        웹 이용권 · 보유 토큰(지갑)도 함께 지운다. 결제 기록(iapEvents, webOrders)은
+        환불 · 분쟁 대응을 위해 남긴다."""
 
     @abstractmethod
     async def apply_question_set_adjustment(
@@ -352,6 +354,25 @@ class StateStore(ABC):
 
     @abstractmethod
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None: ...
+
+    # --- 웹 결제(토스 일반결제) -------------------------------------------------
+    @abstractmethod
+    async def get_wallet(self, uid: str) -> dict[str, Any]:
+        """웹 이용권(webPass)과 보유 토큰(purchasedTokens)."""
+
+    @abstractmethod
+    async def create_web_order(self, order: dict[str, Any]) -> None: ...
+
+    @abstractmethod
+    async def get_web_order(self, order_id: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def complete_web_order(self, order_id: str, *, payment_key: str) -> dict[str, Any]:
+        """결제 승인된 주문을 지급 처리하고 지갑을 돌려준다. 이미 지급했으면 그대로 돌려준다(멱등)."""
+
+    @abstractmethod
+    async def cancel_web_order(self, order_id: str) -> bool:
+        """환불된 주문의 지급을 되돌린다. 처음 되돌렸을 때만 True."""
 
     @abstractmethod
     async def set_entitlement(
@@ -608,11 +629,48 @@ class InMemoryStateStore(StateStore):
         # 프로필을 통째로 갈아끼우므로 같은 dict에 두면 목표 등급을 바꿀 때마다
         # 학습 계획이 지워진다. Firestore 쪽은 merge=True라 한 문서에 담아도 된다.
         self._study_plans: dict[str, dict[str, Any]] = {}
+        self._wallets: dict[str, dict[str, Any]] = {}
+        self._web_orders: dict[str, dict[str, Any]] = {}
 
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None:
         async with self._lock:
             entitlement = self._entitlements.get(uid)
             return deepcopy(entitlement) if entitlement else None
+
+    async def get_wallet(self, uid: str) -> dict[str, Any]:
+        async with self._lock:
+            return deepcopy(self._wallets.get(uid) or empty_wallet())
+
+    async def create_web_order(self, order: dict[str, Any]) -> None:
+        async with self._lock:
+            self._web_orders[order["orderId"]] = deepcopy(order)
+
+    async def get_web_order(self, order_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            order = self._web_orders.get(order_id)
+            return deepcopy(order) if order else None
+
+    async def complete_web_order(self, order_id: str, *, payment_key: str) -> dict[str, Any]:
+        async with self._lock:
+            order = self._web_orders[order_id]
+            wallet = self._wallets.get(order["uid"]) or empty_wallet()
+            if order["status"] == "pending":
+                now = datetime.now(UTC)
+                wallet = apply_grant(wallet, order["grant"], now)
+                self._wallets[order["uid"]] = wallet
+                order.update(status="paid", paymentKey=payment_key, paidAt=now)
+            return deepcopy(wallet)
+
+    async def cancel_web_order(self, order_id: str) -> bool:
+        async with self._lock:
+            order = self._web_orders.get(order_id)
+            if not order or order["status"] != "paid":
+                return False
+            now = datetime.now(UTC)
+            wallet = self._wallets.get(order["uid"]) or empty_wallet()
+            self._wallets[order["uid"]] = revoke_grant(wallet, order["grant"], now)
+            order.update(status="canceled", canceledAt=now)
+            return True
 
     async def set_entitlement(self, uid: str, *, entitlement: dict[str, Any]) -> None:
         async with self._lock:
@@ -1012,6 +1070,7 @@ class InMemoryStateStore(StateStore):
                 self._usage, self._requests, self._rewards, self._question_sets,
                 self._question_histories, self._profiles, self._operations,
                 self._mock_sessions, self._entitlements, self._study_plans,
+                self._wallets,
             )
             for store in stores:
                 for key in list(store):
@@ -1129,6 +1188,10 @@ class InMemoryStateStore(StateStore):
             elif usage["bonusRemaining"] > 0:
                 usage["bonusRemaining"] -= 1
                 source = "bonus"
+            elif int(self._wallets.get(uid, {}).get("purchasedTokens") or 0) > 0:
+                # 하루 토큰을 다 쓰면 웹에서 산 보유 토큰을 쓴다(매일 사라지지 않음).
+                self._wallets[uid]["purchasedTokens"] -= 1
+                source = "purchased"
             else:
                 raise UsageLimitExceeded("daily practice quota exhausted")
 
@@ -1204,6 +1267,9 @@ class InMemoryStateStore(StateStore):
                 )
             elif source == "bonus":
                 self._usage[request["usageId"]]["bonusRemaining"] += 1
+            elif source == "purchased":
+                wallet = self._wallets.setdefault(request["uid"], empty_wallet())
+                wallet["purchasedTokens"] = int(wallet.get("purchasedTokens") or 0) + 1
             elif isinstance(source, str) and source.startswith("mock:"):
                 nonce = source.split(":", 1)[1]
                 if nonce in self._rewards:
@@ -1754,6 +1820,84 @@ class FirestoreStateStore(StateStore):
 
         return await asyncio.to_thread(read)
 
+    async def get_wallet(self, uid: str) -> dict[str, Any]:
+        def read() -> dict[str, Any]:
+            snapshot = self._client.collection("userProfiles").document(uid).get()
+            data = (snapshot.to_dict() if snapshot.exists else None) or {}
+            return {
+                "webPass": data.get("webPass"),
+                "purchasedTokens": int(data.get("purchasedTokens") or 0),
+            }
+
+        return await asyncio.to_thread(read)
+
+    async def create_web_order(self, order: dict[str, Any]) -> None:
+        await asyncio.to_thread(
+            self._client.collection("webOrders").document(order["orderId"]).set, order
+        )
+
+    async def get_web_order(self, order_id: str) -> dict[str, Any] | None:
+        def read() -> dict[str, Any] | None:
+            snapshot = self._client.collection("webOrders").document(order_id).get()
+            return snapshot.to_dict() if snapshot.exists else None
+
+        return await asyncio.to_thread(read)
+
+    async def complete_web_order(self, order_id: str, *, payment_key: str) -> dict[str, Any]:
+        def run() -> dict[str, Any]:
+            transaction = self._client.transaction(max_attempts=10)
+            order_ref = self._client.collection("webOrders").document(order_id)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                order = order_ref.get(transaction=transaction).to_dict() or {}
+                profile_ref = self._client.collection("userProfiles").document(order["uid"])
+                profile = profile_ref.get(transaction=transaction).to_dict() or {}
+                wallet = {
+                    "webPass": profile.get("webPass"),
+                    "purchasedTokens": int(profile.get("purchasedTokens") or 0),
+                }
+                if order.get("status") != "pending":
+                    return wallet
+                now = datetime.now(UTC)
+                wallet = apply_grant(wallet, order["grant"], now)
+                transaction.set(profile_ref, {"uid": order["uid"], **wallet, "updatedAt": now}, merge=True)
+                transaction.update(
+                    order_ref, {"status": "paid", "paymentKey": payment_key, "paidAt": now}
+                )
+                return wallet
+
+            return apply(transaction)
+
+        return await asyncio.to_thread(run)
+
+    async def cancel_web_order(self, order_id: str) -> bool:
+        def run() -> bool:
+            transaction = self._client.transaction(max_attempts=10)
+            order_ref = self._client.collection("webOrders").document(order_id)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> bool:
+                snapshot = order_ref.get(transaction=transaction)
+                order = snapshot.to_dict() if snapshot.exists else None
+                if not order or order.get("status") != "paid":
+                    return False
+                profile_ref = self._client.collection("userProfiles").document(order["uid"])
+                profile = profile_ref.get(transaction=transaction).to_dict() or {}
+                now = datetime.now(UTC)
+                wallet = revoke_grant(
+                    {"webPass": profile.get("webPass"), "purchasedTokens": int(profile.get("purchasedTokens") or 0)},
+                    order["grant"],
+                    now,
+                )
+                transaction.set(profile_ref, {**wallet, "updatedAt": now}, merge=True)
+                transaction.update(order_ref, {"status": "canceled", "canceledAt": now})
+                return True
+
+            return apply(transaction)
+
+        return await asyncio.to_thread(run)
+
     async def set_entitlement(self, uid: str, *, entitlement: dict[str, Any]) -> None:
         def write() -> None:
             self._client.collection("userProfiles").document(uid).set(
@@ -2079,12 +2223,21 @@ class FirestoreStateStore(StateStore):
 
                 snapshot = usage_ref.get(transaction=transaction)
                 usage = {**_usage_defaults(), **(snapshot.to_dict() or {})}
+                profile_ref = self._client.collection("userProfiles").document(uid)
+                purchased = 0
+                if usage["freeUsed"] >= free_limit and usage["bonusRemaining"] <= 0:
+                    # Firestore 트랜잭션은 읽기를 모두 쓰기 전에 해야 한다.
+                    profile = profile_ref.get(transaction=transaction).to_dict() or {}
+                    purchased = int(profile.get("purchasedTokens") or 0)
                 if usage["freeUsed"] < free_limit:
                     usage["freeUsed"] += 1
                     source = "free"
                 elif usage["bonusRemaining"] > 0:
                     usage["bonusRemaining"] -= 1
                     source = "bonus"
+                elif purchased > 0:
+                    transaction.set(profile_ref, {"purchasedTokens": purchased - 1}, merge=True)
+                    source = "purchased"
                 else:
                     raise UsageLimitExceeded("daily practice quota exhausted")
                 transaction.set(
@@ -2210,6 +2363,11 @@ class FirestoreStateStore(StateStore):
                     else:
                         usage["bonusRemaining"] += 1
                     transaction.set(usage_ref, usage, merge=True)
+                elif source == "purchased":
+                    profile_ref = self._client.collection("userProfiles").document(data["uid"])
+                    transaction.set(
+                        profile_ref, {"purchasedTokens": firestore.Increment(1)}, merge=True
+                    )
                 elif isinstance(source, str) and source.startswith("mock:"):
                     reward_ref = self._client.collection("adRewardIntents").document(
                         source.split(":", 1)[1]

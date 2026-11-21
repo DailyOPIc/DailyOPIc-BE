@@ -467,3 +467,34 @@ async def test_firestore_reserve_practice_removes_legacy_usage_date_key() -> Non
     raw = store._client.collection("dailyUsage").document(usage_id).get().to_dict()
     assert raw["date"] == date_key
     assert "dateKey" not in raw
+
+
+@pytest.mark.asyncio
+async def test_firestore_web_orders_grant_once_revoke_and_spend_purchased_tokens() -> None:
+    uid = f"web-user-{uuid.uuid4()}"
+    store = FirestoreStateStore(os.getenv("GCLOUD_PROJECT", "dailyopic-test"))
+    pass_order = f"web_{uuid.uuid4().hex}"
+    token_order = f"web_{uuid.uuid4().hex}"
+    await store.create_web_order({"orderId": pass_order, "uid": uid, "productId": "pass_plus_30d", "amount": 6900,
+                                  "grant": {"type": "pass", "plan": "plus", "days": 30}, "status": "pending"})
+    await store.create_web_order({"orderId": token_order, "uid": uid, "productId": "tokens_10", "amount": 2900,
+                                  "grant": {"type": "tokens", "amount": 1}, "status": "pending"})
+
+    first = await store.complete_web_order(pass_order, payment_key="pk-pass")
+    again = await store.complete_web_order(pass_order, payment_key="pk-pass")
+    assert first["webPass"]["plan"] == "plus"
+    assert again["webPass"]["expiresAt"] == first["webPass"]["expiresAt"]
+
+    assert await store.cancel_web_order(pass_order)
+    assert not await store.cancel_web_order(pass_order)
+    assert (await store.get_wallet(uid))["webPass"] is None
+
+    await store.complete_web_order(token_order, payment_key="pk-tokens")
+    date_key = "2026-11-21"
+    bought = f"r-{uuid.uuid4()}"
+    assert (await store.reserve_practice(uid, date_key, bought, free_limit=0)).source == "purchased"
+    assert (await store.get_wallet(uid))["purchasedTokens"] == 0
+    with pytest.raises(UsageLimitExceeded):
+        await store.reserve_practice(uid, date_key, f"r-{uuid.uuid4()}", free_limit=0)
+    await store.fail_request(bought)
+    assert (await store.get_wallet(uid))["purchasedTokens"] == 1

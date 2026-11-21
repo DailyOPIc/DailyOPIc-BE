@@ -181,6 +181,10 @@ _ENTITLEMENT_TO_PLAN: dict[str, Plan] = {
 _PLAN_RANK = {Plan.FREE: 0, Plan.BASIC: 1, Plan.PLUS: 2, Plan.PRO: 3}
 
 
+def plan_rank(plan: Plan) -> int:
+    return _PLAN_RANK[plan]
+
+
 def plan_from_entitlement_ids(entitlement_ids: list[str] | None) -> Plan:
     """활성 엔타이틀먼트 목록 중 가장 높은 등급의 플랜을 반환."""
     best = Plan.FREE

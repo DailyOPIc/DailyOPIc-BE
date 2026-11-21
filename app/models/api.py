@@ -463,6 +463,7 @@ class UsageResponse(BaseModel):
     mock_available: bool | None = Field(default=None, alias="mockAvailable")
     mock_remaining: int | None = Field(default=None, alias="mockRemaining", ge=0)
     mock_session_stage: str | None = Field(default=None, alias="mockSessionStage")
+    purchased_tokens: int = Field(default=0, alias="purchasedTokens", ge=0)
 
 
 class RewardPurpose(StrEnum):
@@ -876,3 +877,43 @@ class VocabularySpeakingCoachResult(BaseModel):
     expanded_answer_ko: str = Field(alias="expandedAnswerKo")
     related_expressions: list[str] = Field(alias="relatedExpressions")
     created_at: datetime = Field(alias="createdAt")
+
+
+# --- 웹 결제(토스페이먼츠 일반결제) -------------------------------------------
+
+
+class WebOrderRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    product_id: str = Field(alias="productId", min_length=1, max_length=64)
+
+
+class WebOrderResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    order_id: str = Field(alias="orderId")
+    order_name: str = Field(alias="orderName")
+    amount: int
+
+
+class WebConfirmRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    payment_key: str = Field(alias="paymentKey", min_length=1, max_length=200)
+    order_id: str = Field(alias="orderId", pattern=r"^[A-Za-z0-9_-]{6,64}$")
+    amount: int = Field(ge=1)
+
+
+class WebPass(BaseModel):
+    plan: str
+    expires_at: datetime = Field(alias="expiresAt")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class WalletResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    plan: str
+    web_pass: WebPass | None = Field(default=None, alias="webPass")
+    purchased_tokens: int = Field(default=0, alias="purchasedTokens", ge=0)

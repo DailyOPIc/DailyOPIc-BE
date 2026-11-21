@@ -18,6 +18,7 @@ from app.services.admob import AdMobSSVVerifier
 from app.services.ai import AIService
 from app.services.audio import AudioMetricsService
 from app.services.auth import AuthService
+from app.services.web_payments import TossClient
 from app.services.questions import QuestionPatternRepository
 from app.services.revenuecat import RevenueCatClient
 from app.services.state import FirestoreStateStore
@@ -76,6 +77,7 @@ async def lifespan(app: FastAPI):
             secret_api_key=settings.revenuecat_secret_api_key,
             http_client=http_client,
         )
+        app.state.toss = TossClient(settings.toss_secret_key, http_client)
         yield
 
 
