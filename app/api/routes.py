@@ -25,8 +25,14 @@ from fastapi import (
 )
 from fastapi.responses import PlainTextResponse
 from pydantic import TypeAdapter, ValidationError
+import httpx
 
 from app.models.api import (
+    WalletResponse,
+    WebConfirmRequest,
+    WebOrderRequest,
+    WebOrderResponse,
+    WebPass,
     BackgroundProfile,
     BackgroundSurvey,
     CapabilitiesResponse,
@@ -87,6 +93,7 @@ from app.services.questions import prompt_hash, question_set_hash
 from app.services import plans, vocabulary
 from app.services.plans import Plan
 from app.services.revenuecat import RevenueCatAPIError
+from app.services.web_payments import WEB_PRODUCTS, TossPaymentError, web_pass_plan
 from app.services.state import (
     AdjustmentAlreadyApplied,
     IdempotencyConflict,
@@ -110,9 +117,11 @@ STUDY_PLAN_SCHEMA_VERSION = 1
 
 
 async def _current_plan(request: Request, uid: str) -> Plan:
-    """엔타이틀먼트를 조회해 현재 유효 플랜을 반환(만료/미존재 → free)."""
-    entitlement = await request.app.state.state_store.get_entitlement(uid)
-    return Plan(resolve_plan(entitlement))
+    """현재 유효 플랜: 앱 구독(RevenueCat)과 웹 이용권(토스) 중 높은 쪽(만료/미존재 → free)."""
+    store = request.app.state.state_store
+    entitlement = await store.get_entitlement(uid)
+    wallet = await store.get_wallet(uid)
+    return max(Plan(resolve_plan(entitlement)), web_pass_plan(wallet), key=plans.plan_rank)
 
 
 def _quota_policy_for(plan: Plan) -> CapabilityQuotaPolicy:
@@ -806,6 +815,124 @@ async def update_study_plan(
         },
     )
     return StudyPlanResponse(configured=True, studyPlan=_study_plan_settings(stored))
+
+
+# --- 웹 결제(토스페이먼츠 일반결제) -----------------------------------------------
+
+
+async def _wallet_response(request: Request, uid: str, wallet: dict) -> WalletResponse:
+    web_pass = wallet.get("webPass")
+    active = web_pass_plan(wallet) is not Plan.FREE
+    return WalletResponse(
+        plan=str(await _current_plan(request, uid)),
+        webPass=WebPass(plan=web_pass["plan"], expiresAt=web_pass["expiresAt"]) if active else None,
+        purchasedTokens=int(wallet.get("purchasedTokens") or 0),
+    )
+
+
+@router.get("/v1/web-payments/wallet", response_model=WalletResponse)
+async def web_wallet(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> WalletResponse:
+    wallet = await request.app.state.state_store.get_wallet(user.uid)
+    return await _wallet_response(request, user.uid, wallet)
+
+
+@router.post("/v1/web-payments/orders", response_model=WebOrderResponse)
+async def create_web_order(
+    payload: WebOrderRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> WebOrderResponse:
+    """금액은 서버 상품표에서 정한다. 결제창에는 이 주문의 id·이름·금액을 그대로 넘긴다."""
+    if not request.app.state.toss.configured:
+        raise HTTPException(status_code=503, detail={"code": "toss_not_configured"})
+    product = WEB_PRODUCTS.get(payload.product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail={"code": "unknown_product"})
+    order_id = f"web_{uuid.uuid4().hex}"
+    await request.app.state.state_store.create_web_order(
+        {
+            "orderId": order_id,
+            "uid": user.uid,
+            "productId": product.id,
+            "orderName": product.name,
+            "amount": product.amount,
+            "grant": product.grant,
+            "status": "pending",
+            "createdAt": datetime.now(UTC),
+        }
+    )
+    return WebOrderResponse(orderId=order_id, orderName=product.name, amount=product.amount)
+
+
+@router.post("/v1/web-payments/confirm", response_model=WalletResponse)
+async def confirm_web_payment(
+    payload: WebConfirmRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> WalletResponse:
+    """결제창에서 돌아온 결제를 토스에 승인 요청하고, 성공하면 바로 지급한다(재시도 안전)."""
+    store = request.app.state.state_store
+    order = await store.get_web_order(payload.order_id)
+    if not order or order["uid"] != user.uid:
+        raise HTTPException(status_code=404, detail={"code": "order_not_found"})
+    if order["amount"] != payload.amount:
+        raise HTTPException(status_code=400, detail={"code": "amount_mismatch"})
+    if order["status"] == "canceled":
+        raise HTTPException(status_code=409, detail={"code": "order_canceled"})
+    if order["status"] == "pending":
+        toss = request.app.state.toss
+        try:
+            try:
+                payment = await toss.confirm(
+                    payment_key=payload.payment_key, order_id=payload.order_id, amount=order["amount"]
+                )
+            except TossPaymentError as error:
+                if error.code != "ALREADY_PROCESSED_PAYMENT":
+                    raise
+                payment = await toss.get_payment(payload.payment_key)
+        except TossPaymentError as error:
+            logger.warning("toss confirm failed code=%s uidHash=%s", error.code, _uid_hash(user.uid))
+            raise HTTPException(
+                status_code=error.status if 400 <= error.status < 500 else 502,
+                detail={"code": error.code, "message": error.message},
+            ) from error
+        except httpx.HTTPError as error:
+            raise HTTPException(status_code=502, detail={"code": "toss_unreachable"}) from error
+        if (
+            payment.get("status") != "DONE"
+            or payment.get("orderId") != payload.order_id
+            or int(payment.get("totalAmount") or 0) != order["amount"]
+        ):
+            raise HTTPException(status_code=400, detail={"code": "payment_not_done"})
+    wallet = await store.complete_web_order(payload.order_id, payment_key=payload.payment_key)
+    logger.info("web payment granted product=%s uidHash=%s", order["productId"], _uid_hash(user.uid))
+    return await _wallet_response(request, user.uid, wallet)
+
+
+@router.post("/v1/web-payments/toss-webhook")
+async def toss_webhook(request: Request) -> dict[str, str]:
+    """토스 결제 상태 변경 알림. 본문은 믿지 않고 paymentKey로 토스에 다시 조회해 확인한다.
+    환불(취소)이면 지급을 되돌린다.
+    ponytail: 부분 취소도 전체 회수로 처리한다. 이용권·토큰 팩은 부분 환불할 일이 거의 없다."""
+    try:
+        body = await request.json()
+        payment_key = str(((body or {}).get("data") or {}).get("paymentKey") or "")
+    except ValueError:
+        payment_key = ""
+    if not payment_key or not request.app.state.toss.configured:
+        return {"status": "ignored"}
+    try:
+        payment = await request.app.state.toss.get_payment(payment_key)
+    except (TossPaymentError, httpx.HTTPError) as error:
+        logger.warning("toss webhook lookup failed: %s", type(error).__name__)
+        raise HTTPException(status_code=502, detail={"code": "toss_lookup_failed"}) from error
+    if payment.get("status") in {"CANCELED", "PARTIAL_CANCELED"}:
+        revoked = await request.app.state.state_store.cancel_web_order(str(payment.get("orderId") or ""))
+        return {"status": "revoked" if revoked else "unchanged"}
+    return {"status": "ok"}
 
 
 @router.post("/v1/question-sets/practice", response_model=QuestionSetResponse)
@@ -2064,6 +2191,9 @@ async def usage(
         mockAvailable=mock_available,
         mockRemaining=mock_remaining,
         mockSessionStage=(str(active_mock["stage"]) if active_mock else None),
+        purchasedTokens=int(
+            (await request.app.state.state_store.get_wallet(user.uid)).get("purchasedTokens") or 0
+        ),
     )
 
 
