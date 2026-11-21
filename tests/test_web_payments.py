@@ -298,3 +298,16 @@ def test_cors_allows_delete_and_client_header() -> None:
             },
         )
         assert r.status_code == 200, r.text
+
+
+def test_activity_rewards_grant_bonus_tokens_up_to_daily_limit() -> None:
+    # 보물상자는 하루 2번, 게임 · 목표는 1번씩 보너스 토큰을 준다. 한도를 넘으면 granted=false.
+    with TestClient(app) as client:
+        chest = [client.post("/v1/activity-rewards", json={"kind": "chest"}, headers=_headers()).json() for _ in range(3)]
+        assert [c["granted"] for c in chest] == [True, True, False]
+        game = [client.post("/v1/activity-rewards", json={"kind": "game"}, headers=_headers()).json() for _ in range(2)]
+        assert [g["granted"] for g in game] == [True, False]
+        assert game[-1]["bonusRemaining"] == 3
+        assert client.get("/v1/usage", headers=_headers()).json()["bonusRemaining"] == 3
+        bad = client.post("/v1/activity-rewards", json={"kind": "free_money"}, headers=_headers())
+        assert bad.status_code == 422

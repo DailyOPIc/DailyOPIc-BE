@@ -28,6 +28,8 @@ from pydantic import TypeAdapter, ValidationError
 import httpx
 
 from app.models.api import (
+    ActivityRewardRequest,
+    ActivityRewardResponse,
     WalletResponse,
     WebConfirmRequest,
     WebOrderRequest,
@@ -2282,6 +2284,24 @@ _MOCK_REWARD_PURPOSES = {
     RewardPurpose.MOCK_ADJUSTMENT,
     RewardPurpose.MOCK_RESULT,
 }
+
+
+# 활동 보상 하루 한도(종류별 보너스 토큰 수). 화면이 "했다"고 알리는 것을 믿는 구조라
+# 한도가 곧 악용 상한이다: 하루 최대 +4개.
+# ponytail: 서버가 활동을 직접 확인하지 않는다 — 악용이 보이면 상자는 분석 기록 수, 게임은 서버 기록으로 확인한다.
+ACTIVITY_REWARD_LIMITS = {"chest": 2, "game": 1, "goal": 1}
+
+
+@router.post("/v1/activity-rewards", response_model=ActivityRewardResponse)
+async def claim_activity_reward(
+    payload: ActivityRewardRequest,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> ActivityRewardResponse:
+    result = await request.app.state.state_store.grant_activity_bonus(
+        user.uid, _date_key(), payload.kind, ACTIVITY_REWARD_LIMITS[payload.kind]
+    )
+    return ActivityRewardResponse(granted=result["granted"], bonusRemaining=result["bonusRemaining"])
 
 
 @router.post("/v1/ad-rewards/intents", response_model=RewardIntentResponse)

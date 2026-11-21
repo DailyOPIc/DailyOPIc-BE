@@ -355,6 +355,14 @@ class StateStore(ABC):
     @abstractmethod
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None: ...
 
+    # --- 활동 보상(보물상자 · 게임 · 하루 목표) ------------------------------------
+    @abstractmethod
+    async def grant_activity_bonus(
+        self, uid: str, date_key: str, kind: str, daily_limit: int
+    ) -> dict[str, Any]:
+        """오늘 이 종류 보상을 아직 한도만큼 받지 않았으면 보너스 토큰 1개를 준다.
+        반환: {"granted": bool, "bonusRemaining": int}. 보너스는 광고 보너스와 같이 그날 자정에 사라진다."""
+
     # --- 웹 결제(토스 일반결제) -------------------------------------------------
     @abstractmethod
     async def get_wallet(self, uid: str) -> dict[str, Any]:
@@ -441,6 +449,11 @@ def _normalize_legacy_question_set(record: dict[str, Any]) -> dict[str, Any]:
             for item in questions
         ]
     return normalized
+
+
+def _activity_count_key(kind: str) -> str:
+    """dailyUsage 문서의 활동 보상 횟수 필드(예: activityReward_chest)."""
+    return f"activityReward_{kind}"
 
 
 def _usage_defaults() -> dict[str, int]:
@@ -636,6 +649,19 @@ class InMemoryStateStore(StateStore):
         async with self._lock:
             entitlement = self._entitlements.get(uid)
             return deepcopy(entitlement) if entitlement else None
+
+    async def grant_activity_bonus(
+        self, uid: str, date_key: str, kind: str, daily_limit: int
+    ) -> dict[str, Any]:
+        async with self._lock:
+            usage = self._usage.setdefault(self._usage_id(uid, date_key), _usage_defaults())
+            usage["date"] = date_key
+            key = _activity_count_key(kind)
+            granted = int(usage.get(key, 0)) < daily_limit
+            if granted:
+                usage[key] = int(usage.get(key, 0)) + 1
+                usage["bonusRemaining"] += 1
+            return {"granted": granted, "bonusRemaining": usage["bonusRemaining"]}
 
     async def get_wallet(self, uid: str) -> dict[str, Any]:
         async with self._lock:
@@ -1819,6 +1845,32 @@ class FirestoreStateStore(StateStore):
             return dict(entitlement) if entitlement else None
 
         return await asyncio.to_thread(read)
+
+    async def grant_activity_bonus(
+        self, uid: str, date_key: str, kind: str, daily_limit: int
+    ) -> dict[str, Any]:
+        def run() -> dict[str, Any]:
+            usage_ref = self._client.collection("dailyUsage").document(self._usage_id(uid, date_key))
+            key = _activity_count_key(kind)
+
+            @firestore.transactional
+            def apply(transaction: firestore.Transaction) -> dict[str, Any]:
+                snapshot = usage_ref.get(transaction=transaction)
+                usage = {**_usage_defaults(), **(snapshot.to_dict() or {})}
+                granted = int(usage.get(key, 0)) < daily_limit
+                if granted:
+                    usage[key] = int(usage.get(key, 0)) + 1
+                    usage["bonusRemaining"] = int(usage["bonusRemaining"]) + 1
+                    transaction.set(
+                        usage_ref,
+                        {"uid": uid, "date": date_key, key: usage[key], "bonusRemaining": usage["bonusRemaining"]},
+                        merge=True,
+                    )
+                return {"granted": granted, "bonusRemaining": int(usage["bonusRemaining"])}
+
+            return apply(self._client.transaction(max_attempts=20))
+
+        return await asyncio.to_thread(run)
 
     async def get_wallet(self, uid: str) -> dict[str, Any]:
         def read() -> dict[str, Any]:

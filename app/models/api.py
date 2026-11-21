@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from enum import StrEnum
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -473,6 +474,21 @@ class RewardPurpose(StrEnum):
     MOCK_ADJUSTMENT = "mock_adjustment"
     MOCK_RESULT = "mock_result"
     TARGET_LEVEL_CHANGE = "target_level_change"
+
+
+class ActivityRewardRequest(BaseModel):
+    """활동 보상: 보물상자를 열었거나(chest) 게임을 한 판 끝냈거나(game) 하루 목표를 채웠을 때(goal)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["chest", "game", "goal"]
+
+
+class ActivityRewardResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    granted: bool
+    bonus_remaining: int = Field(alias="bonusRemaining")
 
 
 class RewardIntentRequest(BaseModel):
