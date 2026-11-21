@@ -311,3 +311,25 @@ def test_activity_rewards_grant_bonus_tokens_up_to_daily_limit() -> None:
         assert client.get("/v1/usage", headers=_headers()).json()["bonusRemaining"] == 3
         bad = client.post("/v1/activity-rewards", json={"kind": "free_money"}, headers=_headers())
         assert bad.status_code == 422
+
+
+def test_daily_game_sets_are_generated_once_and_shared() -> None:
+    # 오픽게임 하루 세트: 첫 요청이 5세트를 만들고, 다음 요청은 같은 세트를 받는다(사용자 공용).
+    with TestClient(app) as client:
+        first = client.get("/v1/games/daily-sets", headers=_headers())
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert len(body["sets"]) == 5
+        assert len(body["sets"][0]["expressions"]) == 12 and len(body["sets"][0]["sentences"]) == 8
+        assert body["sets"][0]["sentences"][0]["blank"] in body["sets"][0]["sentences"][0]["en"]
+        again = client.get("/v1/games/daily-sets", headers=_headers()).json()
+        assert again == body
+
+
+def test_game_sentence_blank_must_be_in_sentence() -> None:
+    from pydantic import ValidationError
+
+    from app.services.games import GameSentence
+
+    with pytest.raises(ValidationError):
+        GameSentence(en="I like coffee a lot.", ko="커피 좋아요.", blank="because", options=["so", "but", "and"])

@@ -2286,6 +2286,35 @@ _MOCK_REWARD_PURPOSES = {
 }
 
 
+# 오픽게임 하루 세트: 그날 첫 요청이 만들고(AI, 세트 5개 동시), 이후엔 저장본을 준다.
+# ponytail: 인스턴스 안에서만 잠근다 — 여러 인스턴스가 동시에 첫 요청을 받으면 한두 번 더 만들 수 있다(마지막 저장본이 남음).
+_game_pool_locks: dict[str, asyncio.Lock] = {}
+
+
+@router.get("/v1/games/daily-sets")
+async def daily_game_sets(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(current_user)],
+) -> dict[str, object]:
+    date_key = _date_key()
+    store = request.app.state.state_store
+    sets = await store.get_game_pool(date_key)
+    if sets is None:
+        lock = _game_pool_locks.setdefault(date_key, asyncio.Lock())
+        async with lock:
+            sets = await store.get_game_pool(date_key)
+            if sets is None:
+                try:
+                    generated = await request.app.state.ai_service.generate_game_sets()
+                except AIServiceError as error:
+                    raise HTTPException(
+                        status_code=503, detail={"code": "game_sets_unavailable", "message": str(error)}
+                    ) from error
+                sets = [s.model_dump(mode="json", exclude_none=True) for s in generated]
+                await store.save_game_pool(date_key, sets)
+    return {"dateKey": date_key, "sets": sets}
+
+
 # 활동 보상 하루 한도(종류별 보너스 토큰 수). 화면이 "했다"고 알리는 것을 믿는 구조라
 # 한도가 곧 악용 상한이다: 하루 최대 +4개.
 # ponytail: 서버가 활동을 직접 확인하지 않는다 — 악용이 보이면 상자는 분석 기록 수, 게임은 서버 기록으로 확인한다.

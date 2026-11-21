@@ -355,6 +355,13 @@ class StateStore(ABC):
     @abstractmethod
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None: ...
 
+    # --- 오픽게임 하루 세트(모든 사용자 공용) ------------------------------------
+    @abstractmethod
+    async def get_game_pool(self, date_key: str) -> list[dict[str, Any]] | None: ...
+
+    @abstractmethod
+    async def save_game_pool(self, date_key: str, sets: list[dict[str, Any]]) -> None: ...
+
     # --- 활동 보상(보물상자 · 게임 · 하루 목표) ------------------------------------
     @abstractmethod
     async def grant_activity_bonus(
@@ -643,12 +650,22 @@ class InMemoryStateStore(StateStore):
         # 학습 계획이 지워진다. Firestore 쪽은 merge=True라 한 문서에 담아도 된다.
         self._study_plans: dict[str, dict[str, Any]] = {}
         self._wallets: dict[str, dict[str, Any]] = {}
+        self._game_pools: dict[str, list[dict[str, Any]]] = {}
         self._web_orders: dict[str, dict[str, Any]] = {}
 
     async def get_entitlement(self, uid: str) -> dict[str, Any] | None:
         async with self._lock:
             entitlement = self._entitlements.get(uid)
             return deepcopy(entitlement) if entitlement else None
+
+    async def get_game_pool(self, date_key: str) -> list[dict[str, Any]] | None:
+        async with self._lock:
+            sets = self._game_pools.get(date_key)
+            return deepcopy(sets) if sets is not None else None
+
+    async def save_game_pool(self, date_key: str, sets: list[dict[str, Any]]) -> None:
+        async with self._lock:
+            self._game_pools[date_key] = deepcopy(sets)
 
     async def grant_activity_bonus(
         self, uid: str, date_key: str, kind: str, daily_limit: int
@@ -1845,6 +1862,22 @@ class FirestoreStateStore(StateStore):
             return dict(entitlement) if entitlement else None
 
         return await asyncio.to_thread(read)
+
+    async def get_game_pool(self, date_key: str) -> list[dict[str, Any]] | None:
+        def read() -> list[dict[str, Any]] | None:
+            snapshot = self._client.collection("gamePools").document(date_key).get()
+            data = snapshot.to_dict() if snapshot.exists else None
+            return list(data["sets"]) if data and data.get("sets") else None
+
+        return await asyncio.to_thread(read)
+
+    async def save_game_pool(self, date_key: str, sets: list[dict[str, Any]]) -> None:
+        def write() -> None:
+            self._client.collection("gamePools").document(date_key).set(
+                {"sets": sets, "createdAt": datetime.now(UTC)}
+            )
+
+        await asyncio.to_thread(write)
 
     async def grant_activity_bonus(
         self, uid: str, date_key: str, kind: str, daily_limit: int
