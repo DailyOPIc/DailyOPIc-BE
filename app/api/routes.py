@@ -848,8 +848,19 @@ async def create_web_order(
     """금액은 서버 상품표에서 정한다. 결제창에는 이 주문의 id·이름·금액을 그대로 넘긴다."""
     if not request.app.state.toss.configured:
         raise HTTPException(status_code=503, detail={"code": "toss_not_configured"})
+    settings = request.app.state.settings
+    allowlist = {
+        email.strip().lower()
+        for email in (settings.web_payments_allowlist or "").split(",")
+        if email.strip()
+    }
+    if allowlist and (user.email or "") not in allowlist:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "web_payments_not_open", "message": "웹 결제는 곧 열려요."},
+        )
     product = WEB_PRODUCTS.get(payload.product_id)
-    if product is None:
+    if product is None or (product.grant["type"] == "tokens" and not settings.web_token_packs_enabled):
         raise HTTPException(status_code=404, detail={"code": "unknown_product"})
     order_id = f"web_{uuid.uuid4().hex}"
     await request.app.state.state_store.create_web_order(

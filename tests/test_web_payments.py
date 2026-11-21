@@ -39,6 +39,16 @@ class _FakeToss:
         return self.payments[payment_key]
 
 
+@pytest.fixture(autouse=True)
+def _token_packs_on(monkeypatch: pytest.MonkeyPatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("WEB_TOKEN_PACKS_ENABLED", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 def _buy(client: TestClient, product_id: str, uid: str = USER_ID) -> tuple[str, int]:
     order = client.post("/v1/web-payments/orders", json={"productId": product_id}, headers=_headers(uid))
     assert order.status_code == 200, order.text
@@ -142,3 +152,43 @@ async def test_purchased_tokens_are_used_after_daily_quota_and_refunded_on_failu
 
     await store.fail_request("req-bought")
     assert (await store.get_wallet(USER_ID))["purchasedTokens"] == 1
+
+
+def test_token_packs_are_hidden_until_switched_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setenv("WEB_TOKEN_PACKS_ENABLED", "false")
+    get_settings.cache_clear()
+    with TestClient(app) as client:
+        client.app.state.toss = _FakeToss()
+        response = client.post("/v1/web-payments/orders", json={"productId": "tokens_10"}, headers=_headers())
+        assert response.status_code == 404
+        assert _buy(client, "pass_basic_30d")[1] == 3900
+
+
+def test_allowlist_limits_orders_to_listed_verified_emails(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setenv("WEB_PAYMENTS_ALLOWLIST", "Review@Example.com")
+    get_settings.cache_clear()
+    tokens = {
+        "token-review": {"uid": "uid-review", "email": "review@example.com", "email_verified": True},
+        "token-other": {"uid": "uid-other", "email": "other@example.com", "email_verified": True},
+        "token-unverified": {"uid": "uid-x", "email": "review@example.com", "email_verified": False},
+    }
+    monkeypatch.setattr("app.services.auth.auth.verify_id_token", lambda token, check_revoked=True: tokens[token])
+    with TestClient(app) as client:
+        client.app.state.toss = _FakeToss()
+
+        def order(token: str):
+            return client.post(
+                "/v1/web-payments/orders",
+                json={"productId": "pass_basic_30d"},
+                headers={"X-Firebase-AppCheck": "test-app-check-token", "Authorization": f"Bearer {token}"},
+            )
+
+        assert order("token-review").status_code == 200
+        assert order("token-other").status_code == 403
+        assert order("token-unverified").status_code == 403
+        # 익명·레거시 사용자(이메일 없음)도 막힌다
+        assert client.post("/v1/web-payments/orders", json={"productId": "pass_basic_30d"}, headers=_headers()).status_code == 403

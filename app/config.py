@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     revenuecat_secret_api_key: SecretStr | None = None
     # 토스페이먼츠 시크릿 키(test_sk_… / live_sk_…). 없으면 웹 결제 API가 503을 돌려준다.
     toss_secret_key: SecretStr | None = None
+    # 웹 결제를 허용할 이메일(쉼표 구분). 비어 있으면 모두에게 열린다.
+    # 통신판매업 신고 전에는 토스 심사용 계정만 넣어 둔다.
+    web_payments_allowlist: str | None = None
+    # 토큰 팩 판매 스위치. 퀵오픈 심사가 확정되기 전까지는 끈다.
+    web_token_packs_enabled: bool = False
     minimum_supported_app_version: str = "1.0.0"
     guide_schema_version: int = 2
     question_generation_v2_enabled: bool = True
