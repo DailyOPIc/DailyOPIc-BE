@@ -244,3 +244,17 @@ def test_mock_gates_pass_without_ads_only_on_web_for_free_users(monkeypatch: pyt
         )
         assert intent.status_code == 200, intent.text
         assert intent.json()["status"] == status
+
+
+@pytest.mark.parametrize(("app_id", "code"), [("1:1:web:x", 200), ("1:1:ios:x", 402)])
+def test_web_level_mismatch_updates_level_instead_of_blocking(monkeypatch: pytest.MonkeyPatch, app_id, code) -> None:
+    # 웹에는 광고가 없으므로 단계가 서버와 달라도 문제 생성이 막히면 안 된다(iOS는 기존대로 광고 필요).
+    monkeypatch.setattr("app.services.auth.app_check.verify_token", lambda token: {"app_id": app_id})
+    with TestClient(app) as client:
+        assert client.put("/v1/users/me/target-level", headers=_headers(), json={"targetLevel": "IH"}).status_code == 200
+        r = client.post(
+            "/v1/question-sets/practice",
+            headers=_headers(),
+            json={"targetLevel": "AL", "background": {"interests": ["news"]}},
+        )
+        assert r.status_code == code, r.text

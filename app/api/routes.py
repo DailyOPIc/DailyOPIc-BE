@@ -408,6 +408,9 @@ def _question_set_response_from_record(
     )
 
 
+_WEB_LEVEL_CHANGES_PER_DAY = 20
+
+
 async def _ensure_initial_level(
     request: Request, user: CurrentUser, initial_level: int
 ) -> None:
@@ -422,10 +425,36 @@ async def _ensure_initial_level(
         except RewardNotVerified as error:
             _target_level_change_required(str(error))
         return
-    if int(profile["beforeAdjust"]) != initial_level:
+    if int(profile["beforeAdjust"]) == initial_level:
+        return
+    if user.platform != "web":
         _target_level_change_required(
             "Self Assessment 단계를 변경하려면 보상형 광고를 끝까지 시청해야 합니다."
         )
+    # 웹에는 리워드 광고가 없다. 웹 설정(브라우저에 저장된 단계)과 서버 단계가 다르면
+    # 문제 생성을 막지 않고 웹 설정으로 바로 맞춘다(자동 검증된 리워드로 기존 경로를 탄다).
+    nonce = secrets.token_urlsafe(32)
+    try:
+        await request.app.state.state_store.create_reward_intent(
+            nonce=nonce,
+            uid=user.uid,
+            purpose=RewardPurpose.TARGET_LEVEL_CHANGE,
+            session_hash=None,
+            date_key=_date_key(),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            auto_verify=True,
+            practice_credit_amount=0,
+            # ponytail: 웹 단계 변경 하루 상한을 넉넉히 둔다(설정 화면에서만 바뀜)
+            max_daily_reward_count=_WEB_LEVEL_CHANGES_PER_DAY,
+        )
+    except UsageLimitExceeded:
+        _target_level_change_required("오늘은 단계를 더 바꿀 수 없어요. 내일 다시 바꿔 주세요.")
+    try:
+        await request.app.state.state_store.set_initial_level(
+            uid=user.uid, initial_level=initial_level, reward_nonce=nonce
+        )
+    except RewardNotVerified as error:
+        _target_level_change_required(str(error))
 
 
 def _daily_record_matches(
