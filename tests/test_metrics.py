@@ -113,7 +113,8 @@ def test_ai_api_duration_recorded_on_structured_call():
         class DummySchema(BaseModel):
             predicted_level: str
 
-        result = asyncio.get_event_loop().run_until_complete(
+        # Python 3.14부터 get_event_loop()가 루프를 자동으로 만들지 않는다 → asyncio.run
+        result = asyncio.run(
             svc._structured(instructions="test", input_text="test", schema=DummySchema)
         )
         assert result.payload.predicted_level == "IL"
@@ -184,7 +185,7 @@ def test_ai_api_error_records_duration_and_error():
             value: str
 
         with pytest.raises(AIServiceUnavailable):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 svc._structured(instructions="test", input_text="test", schema=DummySchema)
             )
 
